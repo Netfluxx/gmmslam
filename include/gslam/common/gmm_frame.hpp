@@ -1,0 +1,1 @@
+// to define the sogmm type
