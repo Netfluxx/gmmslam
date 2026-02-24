@@ -5,10 +5,10 @@ list(APPEND CMAKE_PREFIX_PATH
   /root/gira_ws/gira3d-registration/dry/install
 )
 
-find_package(self_organizing_gmm REQUIRED)  # → sogmm_INCLUDE_DIR
-find_package(gmm REQUIRED)                  # → gmm_INCLUDE_DIR
-find_package(gmm_d2d_registration REQUIRED) # → gmm_d2d_registration_INCLUDE_DIR
-find_package(dlib REQUIRED)                 # → dlib::dlib
+find_package(self_organizing_gmm REQUIRED)
+find_package(gmm REQUIRED)
+find_package(gmm_d2d_registration REQUIRED)
+find_package(dlib REQUIRED)
 
 target_include_directories(gslam PUBLIC
   ...
@@ -17,8 +17,8 @@ target_include_directories(gslam PUBLIC
     ${gmm_INCLUDE_DIR}
 )
 
-# dlib is a link-time dep for the optimizer inside d2d registration:
 target_link_libraries(gslam
   ...
   dlib::dlib
 )
+
