@@ -133,11 +133,14 @@ RUN chmod +x /opt/gmmslam/python/gmmslam.py
 # python3 (which has sogmm_py) while still importing rospy.
 RUN ${GIRA_WS}/gira3d-reconstruction/.venv/bin/pip install rospkg catkin-pkg
 
-# Source the workon script to activate venv + add sogmm_py to PYTHONPATH.
-# rospkg/catkin-pkg are installed in the venv, so don't need /usr/lib/python3/dist-packages
-# (which has old numpy and would shadow the venv's newer numpy).
-RUN printf '#!/usr/bin/env bash\nsource /opt/ros/%s/setup.bash\ncd %s/gira3d-reconstruction && source ./workon\nexport PYTHONPATH="${PYTHONPATH}:/opt/gmmslam/python"\nexec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' \
-      "${ROS_DISTRO}" "${GIRA_WS}" > /usr/local/bin/run_gmmslam && \
+# Source the reconstruction workon (activates venv + adds sogmm_py).
+# Manually add registration wet/install paths + examples/python to PYTHONPATH (don't activate its venv).
+RUN printf '#!/usr/bin/env bash\n'\
+'source /opt/ros/%s/setup.bash\n'\
+'cd %s/gira3d-reconstruction && source ./workon\n'\
+'export PYTHONPATH="%s/gira3d-registration/wet/install/gmm_d2d_registration_py:%s/gira3d-registration/wet/install/gmm:%s/gira3d-registration/wet/install/gmm_d2d_registration:%s/gira3d-registration/wet/src/gmm_d2d_registration_examples/python:${PYTHONPATH}:/opt/gmmslam/python"\n'\
+'exec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' \
+      "${ROS_DISTRO}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" > /usr/local/bin/run_gmmslam && \
     chmod +x /usr/local/bin/run_gmmslam
 
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /etc/bash.bashrc && \
