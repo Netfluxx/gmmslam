@@ -1,4 +1,10 @@
 # --- Base: NVIDIA CUDA + Ubuntu 20.04 ---
+
+# rebuild no cache: docker compose build --no-cache
+# rebuild with cache: docker compose build  OR docker compose build slam && docker compose down slam && docker compose up -d slam
+
+# run: docker compose run --rm disal_slam
+
 FROM nvidia/cuda:12.1.0-devel-ubuntu20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -26,10 +32,7 @@ RUN rosdep init && rosdep update
 # Rewrite SSH git URLs to HTTPS so submodules clone without an SSH key
 RUN git config --global url."https://github.com/".insteadOf "git@github.com:"
 
-
-RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /root/.bashrc
-
-RUN pip3 install colcon-common-extensions
+RUN pip3 install colcon-common-extensions scipy open3d
 
 RUN mkdir -p ${CATKIN_WS}/src && mkdir -p ${GIRA_WS}
 
@@ -49,7 +52,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libboost-all-dev libblas-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# --- Eigen 3.4.0 from source (Ubuntu 20.04 ships 3.3.7, gira3d-reconstruction needs 3.4) ---
+# --- Eigen 3.4.0 from source (gira3d-reconstruction needs 3.4) ---
 RUN git clone --branch 3.4.0 https://gitlab.com/libeigen/eigen.git /tmp/eigen && \
     mkdir /tmp/eigen/build && cd /tmp/eigen/build && \
     cmake .. && make install && ldconfig && \
@@ -72,7 +75,7 @@ RUN git clone https://github.com/gira3d/gira3d-reconstruction.git ${GIRA_WS}/gir
     git submodule update --recursive --init
 
 # Patch Open3D CMakeLists files to control CUDA architectures
-COPY patch_open3d_colcon.py patch_open3d.py /tmp/
+COPY docker/patch_open3d_colcon.py docker/patch_open3d.py /tmp/
 RUN python3 /tmp/patch_open3d_colcon.py && python3 /tmp/patch_open3d.py
 
 # Install Python deps and build
@@ -83,13 +86,57 @@ RUN cd ${GIRA_WS}/gira3d-reconstruction && \
     .venv/bin/pip install numpy scikit-learn opencv-python scikit-image future matplotlib termcolor && \
     bash -c "source .venv/bin/activate && CMAKE_POLICY_VERSION_MINIMUM=3.5 ./build"
 
-# --- X11 Forwarding ---
+# --- X11 / display libs ---
 ENV DISPLAY=:0
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libgl1-mesa-glx libegl1-mesa && rm -rf /var/lib/apt/lists/*
+    libgl1-mesa-glx libegl1-mesa \
+    libx11-6 libxext6 libxrender1 libsm6 libglib2.0-0 \
+    libsndio7.0 libasound2 libpulse0 && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /root/.bashrc && \
-    echo "source ${CATKIN_WS}/devel/setup.bash" >> /root/.bashrc && \
-    echo "source ${GIRA_WS}/gira3d-reconstruction/workon" >> /root/.bashrc
+# libsndio.so.7 symlink expected by Webots
+RUN set -eux; \
+    if [ -f /usr/lib/x86_64-linux-gnu/libsndio.so.7.0 ]; then \
+      ln -sf /usr/lib/x86_64-linux-gnu/libsndio.so.7.0 /usr/lib/x86_64-linux-gnu/libsndio.so.7; \
+    elif [ -f /lib/x86_64-linux-gnu/libsndio.so.7.0 ]; then \
+      ln -sf /lib/x86_64-linux-gnu/libsndio.so.7.0 /lib/x86_64-linux-gnu/libsndio.so.7; \
+    else \
+      echo "ERROR: libsndio.so.7.0 not found"; exit 1; \
+    fi; \
+    ldconfig
+
+# --- Webots (Cyberbotics apt repo) ---
+RUN apt-get update && apt-get install -y --no-install-recommends curl gnupg && \
+    curl -fsSL https://cyberbotics.com/Cyberbotics.asc | gpg --dearmor -o /usr/share/keyrings/cyberbotics.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/cyberbotics.gpg] https://cyberbotics.com/debian/ binary-amd64/" > /etc/apt/sources.list.d/cyberbotics.list && \
+    apt-get update && apt-get install -y --no-install-recommends webots && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- ROS1 Noetic Webots bridge ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ros-noetic-webots-ros && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- Webots environment variables ---
+ENV WEBOTS_HOME=/usr/local/webots
+ENV PYTHONPATH=${PYTHONPATH}:${WEBOTS_HOME}/lib/controller/python
+ENV LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${WEBOTS_HOME}/lib/webots:${WEBOTS_HOME}/lib/controller
+ENV ROS_PACKAGE_PATH=${WEBOTS_HOME}/projects/default/controllers/ros:${ROS_PACKAGE_PATH}
+
+# --- GMM-SLAM Python node ---
+# Install to /opt (not /root) so the disal_slam:/root volume doesn't shadow it
+COPY python/ /opt/gmmslam/python/
+COPY config/ /opt/gmmslam/config/
+RUN chmod +x /opt/gmmslam/python/gmmslam.py
+
+# run_gmmslam wrapper – available as a real command in any shell
+RUN printf '#!/usr/bin/env bash\nsource /opt/ros/%s/setup.bash\nexport PYTHONPATH="${PYTHONPATH}:/opt/gmmslam/python"\nexec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' \
+      "${ROS_DISTRO}" > /usr/local/bin/run_gmmslam && \
+    chmod +x /usr/local/bin/run_gmmslam
+
+RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /etc/bash.bashrc && \
+    echo "source ${CATKIN_WS}/devel/setup.bash" >> /etc/bash.bashrc && \
+    echo "source ${GIRA_WS}/gira3d-reconstruction/workon" >> /etc/bash.bashrc && \
+    echo "export PYTHONPATH=\${PYTHONPATH}:/opt/gmmslam/python" >> /etc/bash.bashrc
 
 CMD ["bash"]

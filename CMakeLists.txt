@@ -10,14 +10,14 @@ find_package(gmm REQUIRED)
 find_package(gmm_d2d_registration REQUIRED)
 find_package(dlib REQUIRED)
 
-target_include_directories(gslam PUBLIC
+target_include_directories(gmmslam PUBLIC
   ...
     ${sogmm_INCLUDE_DIR}
     ${gmm_d2d_registration_INCLUDE_DIR}
     ${gmm_INCLUDE_DIR}
 )
 
-target_link_libraries(gslam
+target_link_libraries(gmmslam
   ...
   dlib::dlib
 )

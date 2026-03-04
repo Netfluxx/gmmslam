@@ -1,8 +1,8 @@
 services:
   slam:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: docker/Dockerfile
     container_name: disal_slam
     stdin_open: true
     tty: true

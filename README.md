@@ -1,6 +1,6 @@
 Installation:
 
-step 1: go to the gslam/docker folder then build the docker container with:
+step 1: go to the gmmslam/docker folder then build the docker container with:
 `docker compose up -d --build`
 then go inside the container with :
 `docker exec -it disal_slam bash`
@@ -14,6 +14,6 @@ ROS2 Humble Wrapper:
 
 
 State of the art Lidar-Inertial Odometry and SLAM packages used for inspiration:
-- https://github.com/TixiaoShan/LIO-SAM
 - https://github.com/koide3/glim
 - https://github.com/superxslam/SuperOdom
+- https://github.com/TixiaoShan/LIO-SAM

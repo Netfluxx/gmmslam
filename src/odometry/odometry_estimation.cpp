@@ -3,12 +3,15 @@
 // wrapper for gmm_d2d_registration from gira
 
 
-#include <gslam/odometry/odometry_estimation.hpp>
+#include <gmmslam/odometry/odometry_estimation.hpp>
 #include <gtsam/geometry/Pose3.h>
 //iSAM2 Fixed Lag Smoother : https://gitlab.sintef.no/nix-flakes/gtsam/-/blob/46f3a48a5b1e6b57bc5da5374c74a8f5248b6fec/gtsam_unstable/examples/FixedLagSmootherExample.cpp
 
 #include <gtsam/nonlinear/ISAM2.h>
 #include <gtsam_unstable/nonlinear/IncrementalFixedLagSmoother.h>
+#include <gtsam/inference/Symbol.h>
+#include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/nonlinear/LinearContainerFactor.h>
 
 
 // gtsam::Pose3 estimate(const GmmFrame& source, const GmmFrame& target, 
@@ -16,6 +19,7 @@
 
 using namespace gtsam;
 // using namespace std;
+
 
 // Configure iSAM2
 ISAM2Params isam2_params;
@@ -37,7 +41,7 @@ double t = current_time_seconds; // e.g. from header stamp
 Key pose_key = symbol_shorthand::X(frame_id);
 
 
-current_pose_estimate = Pose3::Identity(); // TODO: use odometry input
+current_pose_estimate = Pose3::Identity(); // TODO: later use odometry input from ROS1 topic
 new_values.insert(pose_key, current_pose_estimate);
 new_timestamps[pose_key] = t;
 

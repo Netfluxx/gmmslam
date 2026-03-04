@@ -1,0 +1,124 @@
+# =============================================================================
+# GMM-SLAM parameters
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Hardware / runtime
+# -----------------------------------------------------------------------------
+use_gpu: false          # true → GPU SOGMM + sogmm_to_gmm3f() path; false → CPU
+
+# -----------------------------------------------------------------------------
+# ROS interface
+# -----------------------------------------------------------------------------
+ros:
+  lidar_topic:  "/m500_1/mpa/depth/points"   # ← drone depth point cloud
+  imu_topic:    ""                             # no IMU on m500 currently
+  sensor_frame: "depth_camera_1"
+  odom_frame:   "world"
+  base_frame:   "m500_1_base_link"
+
+# -----------------------------------------------------------------------------
+# Point-cloud pre-processing
+# -----------------------------------------------------------------------------
+preprocess:
+  min_range:          0.1    # [m]  points closer than this are discarded
+  max_range:          10.0   # [m]  points farther than this are discarded
+  voxel_leaf_size:    0.05    # [m]  voxel-grid downsampling leaf size (0 = off)
+  deskew:             false  # motion-undistortion using IMU (not yet implemented)
+
+# -----------------------------------------------------------------------------
+# SOGMM fitting  (sogmm_fitting.cpp)
+# Fits one SOGMM per pre-processed scan.
+# The 4-D feature vector is [x, y, z, range].
+# -----------------------------------------------------------------------------
+sogmm:
+  # Mean-shift bandwidth used by SOGMMLearner to estimate the number of
+  # Gaussian components automatically (Option A).
+  bandwidth:        0.1     # [m]  smaller → more components
+
+  # Fixed number of components used when bypassing mean-shift (Option B).
+  # Ignored when use_fixed_k is false.
+  use_fixed_k:      false
+  n_components:     50
+
+  # 4th feature column:  "range" (L2 norm of xyz) or "intensity"
+  feature_4th:      "range"
+
+# -----------------------------------------------------------------------------
+# D2D GMM Registration  (gmm_d2d_registration.cpp)
+# Wraps gira3d MatcherD2D (dlib trust-region optimizer).
+# -----------------------------------------------------------------------------
+registration:
+  # Covariance mode fed to MatcherD2D
+  #   "anisotropic"  – use full 3×3 covariance (default)
+  #   "isoplanar"    – call makeCovsIsoplanar() before matching (better for flat surfaces)
+  covariance_mode:  "anisotropic"
+
+  # dlib trust-region stopping criterion (objective delta)
+  optimizer_stop_delta:   1.0e-7
+  # Initial trust-region radius
+  optimizer_trust_radius: 5.0
+
+  # If the registration score (negative log-likelihood) is worse than this
+  # value, the result is rejected as a failed match.
+  score_reject_threshold: -1.0e6   # set to a very negative number to never reject
+
+# -----------------------------------------------------------------------------
+# Odometry estimation  (odometry_estimation.cpp)
+# Frame-to-frame relative-pose estimation and iSAM Fixed-Lag Smoothing
+# -----------------------------------------------------------------------------
+odometry:
+  # Use a constant-velocity motion model to seed the initial guess when no
+  # external prior (e.g. IMU) is available.
+  use_constant_velocity_prior: true
+
+# Fixed-lag smoother iSAM2, in odometry_estimation.cpp
+fixed_lag_smoother:
+  lag:      5.0   # [s]  keep this many seconds of history in the smoother
+
+
+# -----------------------------------------------------------------------------
+# Sub-mapping  (sub_mapping.cpp)
+# Builds a short local factor graph over a sliding window of keyframes,
+# optimizes it with LM, then exports a SubMap.
+# -----------------------------------------------------------------------------
+submap:
+  # A new keyframe is created when the odometry displacement exceeds either
+  # of these thresholds since the last keyframe.
+  keyframe_delta_trans:   0.5    # [m]    TODO: tune based on perf and map quality
+  keyframe_delta_rot:     0.15    # [rad] TODO: tune based on perf and map quality
+
+  # Number of keyframes accumulated before a SubMap is exported.
+  window_size:            10     # [frames]  #TODO: tune based on submap quality vs. runtime
+
+  # Levenberg-Marquardt optimizer settings for local submap optimization
+  lm_max_iterations:      20      #TODO: tune value based on runtime vs. convergence
+  lm_lambda_initial:      1.0e-5
+  lm_lambda_factor:       10.0
+
+# -----------------------------------------------------------------------------
+# Global mapping  (global_mapping.cpp)
+# Maintains a global factor graph of SubMaps, optimized incrementally with ISAM2.
+# -----------------------------------------------------------------------------
+global_mapping:
+  # ISAM2 incremental optimizer
+  isam2_relinearize_threshold: 0.1
+  isam2_relinearize_skip:      1
+  isam2_cache_linearized:      false
+
+  # Prior noise on the first pose  [rad, rad, rad, m, m, m]
+  prior_noise_rot:    [1.0e-3, 1.0e-3, 1.0e-3]   # [rad] TODO: tune values
+  prior_noise_trans:  [1.0e-2, 1.0e-2, 1.0e-2]   # [m] TODO: tune values
+
+  # Noise model applied to odometry BetweenFactors
+  odom_noise_rot:     [1.0e-2, 1.0e-2, 1.0e-2]   # [rad]
+  odom_noise_trans:   [0.08,   0.08,   0.08  ]    # [m]
+
+  # Loop closure
+  loop_closure_enabled:         true
+  # Minimum Euclidean distance between submap origins to be considered as a
+  # loop-closure candidate.
+  loop_candidate_max_dist:      2.0  # [m]
+  # Registration score must be better (higher) than this to accept a loop.
+  loop_accept_score_threshold:  0.5 #TODO: tune value
+
