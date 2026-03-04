@@ -130,8 +130,8 @@ COPY config/ /opt/gmmslam/config/
 RUN chmod +x /opt/gmmslam/python/gmmslam.py
 
 # run_gmmslam wrapper – available as a real command in any shell
-RUN printf '#!/usr/bin/env bash\nsource /opt/ros/%s/setup.bash\nexport PYTHONPATH="${PYTHONPATH}:/opt/gmmslam/python"\nexec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' \
-      "${ROS_DISTRO}" > /usr/local/bin/run_gmmslam && \
+RUN printf '#!/usr/bin/env bash\nsource /opt/ros/%s/setup.bash\nsource %s/gira3d-reconstruction/workon\nexport PYTHONPATH="${PYTHONPATH}:/opt/gmmslam/python"\nexec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' \
+      "${ROS_DISTRO}" "${GIRA_WS}" > /usr/local/bin/run_gmmslam && \
     chmod +x /usr/local/bin/run_gmmslam
 
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /etc/bash.bashrc && \

@@ -42,6 +42,32 @@ except ImportError:
     rospy.logwarn_once("open3d not found - running in passthrough/no-registration mode")
 
 
+# ---------------------------------------------------------------------------
+# SOGMM import  (requires gira3d-reconstruction venv)
+# ---------------------------------------------------------------------------
+import sys, os, glob
+
+def _inject_venv(venv_root: str):
+    """Add site-packages from a venv into sys.path (idempotent)."""
+    pattern = os.path.join(venv_root, "lib", "python3*", "site-packages")
+    for sp in glob.glob(pattern):
+        if sp not in sys.path:
+            sys.path.insert(0, sp)
+
+_RECONSTRUCTION_VENV = "/root/gira_ws/gira3d-reconstruction/.venv"
+_inject_venv(_RECONSTRUCTION_VENV)
+
+try:
+    from sogmm_py.sogmm import SOGMM
+    HAS_SOGMM = True
+except ImportError:
+    HAS_SOGMM = False
+    rospy.logwarn_once(
+        f"sogmm_py not found - SOGMM fitting disabled. "
+        f"Expected venv at {_RECONSTRUCTION_VENV}"
+    )
+
+
 # ===========================================================================
 # Helpers
 # ===========================================================================
@@ -99,6 +125,21 @@ def numpy_to_pc2(pts: np.ndarray, stamp, frame_id: str) -> PointCloud2:
     return pc2.create_cloud_xyz32(header, pts.tolist())
 
 
+def make_pcld_4d(pts: np.ndarray) -> np.ndarray:
+    """Append L2-norm range as 4th feature column expected by SOGMM.
+
+    Parameters
+    ----------
+    pts : (N, 3) float32  –  XYZ in sensor frame
+
+    Returns
+    -------
+    pcld_4d : (N, 4) float64  –  [x, y, z, range]
+    """
+    ranges = np.linalg.norm(pts, axis=1, keepdims=True)  # (N, 1)
+    return np.hstack([pts, ranges]).astype(np.float64)
+
+
 # ===========================================================================
 # Pre-processing
 # ===========================================================================
@@ -150,12 +191,22 @@ class GMMSLAMNode:
         self.icp_max_dist  = rospy.get_param("~icp_max_dist",   0.3)   # [m]
         self.icp_max_iter  = rospy.get_param("~icp_max_iter",   50)
 
+        # SOGMM parameters
+        self.sogmm_bandwidth = rospy.get_param("~sogmm_bandwidth", 0.1)
+        self.sogmm_compute   = rospy.get_param("~sogmm_compute",   "CPU")  # "CPU" or "GPU"
+
         rospy.loginfo(f"[gmmslam] lidar_topic  : {self.lidar_topic}")
         rospy.loginfo(f"[gmmslam] sensor_frame : {self.sensor_frame}")
         rospy.loginfo(f"[gmmslam] odom_frame   : {self.odom_frame}")
         rospy.loginfo(f"[gmmslam] base_frame   : {self.base_frame}")
         rospy.loginfo(f"[gmmslam] range        : [{self.min_range}, {self.max_range}] m")
         rospy.loginfo(f"[gmmslam] voxel_size   : {self.voxel_size} m")
+
+        if HAS_SOGMM:
+            rospy.loginfo(f"[gmmslam] SOGMM bandwidth : {self.sogmm_bandwidth}")
+            rospy.loginfo(f"[gmmslam] SOGMM compute   : {self.sogmm_compute}")
+        else:
+            rospy.logwarn("[gmmslam] SOGMM unavailable – fitting will be skipped")
 
         # ------------------------------------------------------------------
         # State
@@ -167,6 +218,16 @@ class GMMSLAMNode:
         self.map_decimate  = 5                             # add 1 out of N frames to map
 
         self._frame_count  = 0
+
+        # SOGMM state
+        # sg         – incremental global SOGMM (builds up over all scans)
+        # local_gmms – list of per-scan local GMMf4 models (for D2D registration)
+        if HAS_SOGMM:
+            self.sg         = SOGMM(self.sogmm_bandwidth, compute=self.sogmm_compute)
+            self.local_gmms = []   # list[(stamp, GMMf4)]
+        else:
+            self.sg         = None
+            self.local_gmms = []
 
         # ------------------------------------------------------------------
         # TF broadcaster
@@ -226,6 +287,8 @@ class GMMSLAMNode:
         stamp = msg.header.stamp
 
         # 1. Convert to numpy
+        rospy.loginfo("[gmmslam]convert to numpy")
+
         pts = pc2_to_numpy(msg)
         rospy.logdebug(f"[gmmslam] raw pts: {pts.shape[0]}")
         if pts.shape[0] == 0:
@@ -233,6 +296,8 @@ class GMMSLAMNode:
             return
 
         # 2. Pre-process
+        rospy.loginfo("[gmmslam] preprocess") 
+
         pts = preprocess(pts, self.min_range, self.max_range, self.voxel_size)
         if pts.shape[0] < self.min_points:
             rospy.logwarn_throttle(5.0,
@@ -253,10 +318,54 @@ class GMMSLAMNode:
 
         ############## GMM D2D REGISTRATION END ##############
 
+        # --- SOGMM fitting ---
+        self._fit_sogmm(stamp, pts)
 
-        # 6. Publish
+        # Publish
         self._publish(stamp, pts)
         self._frame_count += 1
+
+    # ------------------------------------------------------------------
+    # SOGMM fitting
+    # ------------------------------------------------------------------
+
+    def _fit_sogmm(self, stamp, pts: np.ndarray):
+        """Fit a SOGMM to the current preprocessed scan.
+
+        Builds the 4D point cloud [x, y, z, range], runs SOGMM.fit() which:
+          1. Uses MeanShift (bandwidth) to estimate the number of components.
+          2. Initialises responsibilities with K-Means++.
+          3. Runs EM to obtain the local GMMf4 model.
+          4. Merges the local model into the global incremental model (sg.model).
+
+        The local model is stored in self.local_gmms for later D2D registration.
+        """
+        rospy.logdebug(f"[gmmslam] _fit_sogmm called, HAS_SOGMM={HAS_SOGMM}")
+
+        if not HAS_SOGMM:
+            return
+
+        pcld_4d = make_pcld_4d(pts)   # (N, 4)  [x, y, z, range]
+
+        try:
+            local_model = self.sg.fit(pcld_4d)
+        except Exception as e:
+            rospy.logerr(f"[gmmslam] SOGMM fit failed on frame {self._frame_count}: {e}")
+            import traceback; rospy.logerr(traceback.format_exc())
+            return
+
+        if local_model is None:
+            rospy.logwarn_throttle(5.0,
+                f"[gmmslam] SOGMM fit returned None on frame {self._frame_count}")
+            return
+
+        self.local_gmms.append((stamp, local_model))
+        n_local  = local_model.n_components_
+        n_global = self.sg.model.n_components_ if self.sg.model is not None else 0
+        rospy.loginfo(
+            f"[gmmslam] frame {self._frame_count:4d} | "
+            f"local GMM: {n_local:3d} components | "
+            f"global GMM: {n_global:4d} components")
 
     # ------------------------------------------------------------------
     # Publishing

@@ -1,0 +1,55 @@
+
+<launch>
+  <!-- ===== arguments (can be overridden on the command line) ===== -->
+  <arg name="lidar_topic"      default="/m500_1/mpa/depth/points"/>
+  <arg name="sensor_frame"     default="depth_camera_1"/>
+  <arg name="odom_frame"       default="world"/>
+  <arg name="base_frame"       default="m500_1_base_link"/>
+
+  <!-- Preprocessing -->
+  <arg name="min_range"        default="0.1"/>
+  <arg name="max_range"        default="10.0"/>
+  <arg name="voxel_leaf_size"  default="0.05"/>
+
+  <!-- GMM -->
+  <arg name="n_components"     default="50"/>
+  <arg name="covariance_mode"  default="isoplanar"/>
+
+  <!-- iSAM2 -->
+  <arg name="lag"              default="5.0"/>
+  <arg name="odom_noise_rot"   default="0.01"/>
+  <arg name="odom_noise_trans" default="0.08"/>
+
+  <!-- Minimum valid points per cloud (below this the frame is skipped) -->
+  <arg name="min_points"       default="50"/>
+
+  <!-- ===== static TF: drone body → depth camera ===== -->
+  <!-- Translation matches the RangeFinder position in voxl_m500.proto -->
+  <node pkg="tf2_ros" type="static_transform_publisher"
+        name="depth_camera_tf"
+        args="0.083 0 0.0315  0 0 0  $(arg base_frame)  $(arg sensor_frame)"/>
+
+  <!-- ===== GMM-SLAM node ===== -->
+  <node pkg="gslam_ros1" type="gmmslam_node.py"
+        name="gmmslam_node" output="screen" respawn="true">
+
+    <param name="lidar_topic"      value="$(arg lidar_topic)"/>
+    <param name="sensor_frame"     value="$(arg sensor_frame)"/>
+    <param name="odom_frame"       value="$(arg odom_frame)"/>
+    <param name="base_frame"       value="$(arg base_frame)"/>
+
+    <param name="min_range"        value="$(arg min_range)"/>
+    <param name="max_range"        value="$(arg max_range)"/>
+    <param name="voxel_leaf_size"  value="$(arg voxel_leaf_size)"/>
+
+    <param name="n_components"     value="$(arg n_components)"/>
+    <param name="covariance_mode"  value="$(arg covariance_mode)"/>
+
+    <param name="lag"              value="$(arg lag)"/>
+    <param name="odom_noise_rot"   value="$(arg odom_noise_rot)"/>
+    <param name="odom_noise_trans" value="$(arg odom_noise_trans)"/>
+
+    <param name="min_points"       value="$(arg min_points)"/>
+  </node>
+
+</launch>
