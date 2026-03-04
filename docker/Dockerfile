@@ -3,7 +3,7 @@
 # rebuild no cache: docker compose build --no-cache
 # rebuild with cache: docker compose build  OR docker compose build slam && docker compose down slam && docker compose up -d slam
 
-# run: docker compose run --rm disal_slam
+# run: docker compose run --rm disal_slam OR docker compose up -d disal_slam && docker exec -it disal_slam bash
 
 FROM nvidia/cuda:12.1.0-devel-ubuntu20.04
 
@@ -83,7 +83,7 @@ RUN cd ${GIRA_WS}/gira3d-reconstruction && \
     python3.8 -m venv .venv && \
     .venv/bin/pip install --upgrade pip && \
     .venv/bin/pip install colcon-common-extensions wheel && \
-    .venv/bin/pip install numpy scikit-learn opencv-python scikit-image future matplotlib termcolor && \
+    .venv/bin/pip install 'numpy>=1.19,<2.0' 'scipy>=1.5' scikit-learn opencv-python scikit-image future matplotlib termcolor 'open3d>=0.13' && \
     bash -c "source .venv/bin/activate && CMAKE_POLICY_VERSION_MINIMUM=3.5 ./build"
 
 # --- X11 / display libs ---
@@ -129,8 +129,14 @@ COPY python/ /opt/gmmslam/python/
 COPY config/ /opt/gmmslam/config/
 RUN chmod +x /opt/gmmslam/python/gmmslam.py
 
-# run_gmmslam wrapper – available as a real command in any shell
-RUN printf '#!/usr/bin/env bash\nsource /opt/ros/%s/setup.bash\nsource %s/gira3d-reconstruction/workon\nexport PYTHONPATH="${PYTHONPATH}:/opt/gmmslam/python"\nexec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' \
+# Install ROS python bindings into the reconstruction venv so we can use its
+# python3 (which has sogmm_py) while still importing rospy.
+RUN ${GIRA_WS}/gira3d-reconstruction/.venv/bin/pip install rospkg catkin-pkg
+
+# Source the workon script to activate venv + add sogmm_py to PYTHONPATH.
+# rospkg/catkin-pkg are installed in the venv, so don't need /usr/lib/python3/dist-packages
+# (which has old numpy and would shadow the venv's newer numpy).
+RUN printf '#!/usr/bin/env bash\nsource /opt/ros/%s/setup.bash\ncd %s/gira3d-reconstruction && source ./workon\nexport PYTHONPATH="${PYTHONPATH}:/opt/gmmslam/python"\nexec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' \
       "${ROS_DISTRO}" "${GIRA_WS}" > /usr/local/bin/run_gmmslam && \
     chmod +x /usr/local/bin/run_gmmslam
 

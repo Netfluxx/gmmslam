@@ -30,20 +30,13 @@ from sensor_msgs.msg import PointCloud2, Image, CameraInfo
 import sensor_msgs.point_cloud2 as pc2
 from scipy.spatial.transform import Rotation
 
-
-# ---------------------------------------------------------------------------
-# Optional open3d import (used for ICP registration)
-# ---------------------------------------------------------------------------
-try:
-    import open3d as o3d
-    HAS_OPEN3D = True
-except ImportError:
-    HAS_OPEN3D = False
-    rospy.logwarn_once("open3d not found - running in passthrough/no-registration mode")
+# scipy < 1.4 uses from_dcm; >= 1.4 uses from_matrix
+if not hasattr(Rotation, "from_matrix"):
+    Rotation.from_matrix = Rotation.from_dcm
 
 
 # ---------------------------------------------------------------------------
-# SOGMM import  (requires gira3d-reconstruction venv)
+# SOGMM import and venv injection (expects gira3d-reconstruction/.venv with sogmm_py installed)
 # ---------------------------------------------------------------------------
 import sys, os, glob
 
@@ -54,7 +47,8 @@ def _inject_venv(venv_root: str):
         if sp not in sys.path:
             sys.path.insert(0, sp)
 
-_RECONSTRUCTION_VENV = "/root/gira_ws/gira3d-reconstruction/.venv"
+_GIRA_WS = os.environ.get("GIRA_WS", "/root/gira_ws")
+_RECONSTRUCTION_VENV = os.path.join(_GIRA_WS, "gira3d-reconstruction", ".venv")
 _inject_venv(_RECONSTRUCTION_VENV)
 
 try:
@@ -62,7 +56,8 @@ try:
     HAS_SOGMM = True
 except ImportError:
     HAS_SOGMM = False
-    rospy.logwarn_once(
+    import logging as _logging
+    _logging.warning(
         f"sogmm_py not found - SOGMM fitting disabled. "
         f"Expected venv at {_RECONSTRUCTION_VENV}"
     )
@@ -156,11 +151,11 @@ def preprocess(pts: np.ndarray,
     if pts.shape[0] == 0:
         return pts
 
-    if voxel_size > 0.0 and HAS_OPEN3D:
-        pcd = o3d.geometry.PointCloud()
-        pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-        pcd = pcd.voxel_down_sample(voxel_size)
-        pts = np.asarray(pcd.points, dtype=np.float32)
+    # if voxel_size > 0.0 and HAS_OPEN3D:
+    #     pcd = o3d.geometry.PointCloud()
+    #     pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+    #     pcd = pcd.voxel_down_sample(voxel_size)
+    #     pts = np.asarray(pcd.points, dtype=np.float32)
 
     return pts
 
@@ -287,8 +282,6 @@ class GMMSLAMNode:
         stamp = msg.header.stamp
 
         # 1. Convert to numpy
-        rospy.loginfo("[gmmslam]convert to numpy")
-
         pts = pc2_to_numpy(msg)
         rospy.logdebug(f"[gmmslam] raw pts: {pts.shape[0]}")
         if pts.shape[0] == 0:
@@ -296,8 +289,6 @@ class GMMSLAMNode:
             return
 
         # 2. Pre-process
-        rospy.loginfo("[gmmslam] preprocess") 
-
         pts = preprocess(pts, self.min_range, self.max_range, self.voxel_size)
         if pts.shape[0] < self.min_points:
             rospy.logwarn_throttle(5.0,
