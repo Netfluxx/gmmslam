@@ -372,7 +372,7 @@ class GMMSLAMNode:
         self.min_points    = rospy.get_param("~min_points",     50)
 
         # SOGMM parameters
-        self.sogmm_bandwidth = rospy.get_param("~sogmm_bandwidth", 0.1)
+        self.sogmm_bandwidth = rospy.get_param("~sogmm_bandwidth", 0.2)  # ??????
         self.sogmm_compute   = rospy.get_param("~sogmm_compute",   "CPU")  # "CPU" or "GPU"
 
         rospy.loginfo(f"[gmmslam] lidar_topic  : {self.lidar_topic}")

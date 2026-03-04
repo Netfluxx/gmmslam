@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip python3-vcstool \
     python3-rosdep python3-catkin-tools \
     ros-noetic-ros-base ros-noetic-catkin \
+    ros-noetic-rviz \
     apt-utils x11-apps && \
     rm -rf /var/lib/apt/lists/*
 
@@ -129,6 +130,10 @@ COPY python/ /opt/gmmslam/python/
 COPY config/ /opt/gmmslam/config/
 RUN chmod +x /opt/gmmslam/python/gmmslam.py
 
+# --- RViz visualization ---
+RUN mkdir -p /opt/gmmslam/rviz
+COPY config/gmmslam.rviz /opt/gmmslam/rviz/gmmslam.rviz
+
 # Install ROS python bindings into the reconstruction venv so we can use its
 # python3 (which has sogmm_py) while still importing rospy.
 RUN ${GIRA_WS}/gira3d-reconstruction/.venv/bin/pip install rospkg catkin-pkg
@@ -142,6 +147,13 @@ RUN printf '#!/usr/bin/env bash\n'\
 'exec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' \
       "${ROS_DISTRO}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" > /usr/local/bin/run_gmmslam && \
     chmod +x /usr/local/bin/run_gmmslam
+
+# RViz launch script
+RUN printf '#!/usr/bin/env bash\n'\
+'source /opt/ros/%s/setup.bash\n'\
+'exec rosrun rviz rviz -d /opt/gmmslam/rviz/gmmslam.rviz "$@"\n' \
+      "${ROS_DISTRO}" > /usr/local/bin/run_rviz && \
+    chmod +x /usr/local/bin/run_rviz
 
 RUN echo "source /opt/ros/${ROS_DISTRO}/setup.bash" >> /etc/bash.bashrc && \
     echo "source ${CATKIN_WS}/devel/setup.bash" >> /etc/bash.bashrc && \
