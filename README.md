@@ -1,5 +1,6 @@
 
-Installation:![Uploading slam_architecture.jpg…]()
+Installation: ![slam_architecture](https://github.com/user-attachments/assets/a036ef1a-17e7-49a4-bdb6-ec223bd4a179)
+
 
 
 step 1: go to the gmmslam/docker folder then build the docker container with:
