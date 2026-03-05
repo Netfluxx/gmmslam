@@ -324,6 +324,142 @@ def save_gmm_to_file(gmm, filepath: str):
     rospy.loginfo(f"[save_gmm] Saved {gmm_3d.n_components_} components to {os.path.basename(filepath)}")
 
 
+def plot_gmm_3d(gmm, pts: np.ndarray = None, sigma: float = 1.0,
+                max_ellipsoids: int = 50, title: str = "GMM 3D Gaussians"):
+    """Visualize a 3D GMM as ellipsoids using Plotly.
+
+    Each Gaussian is rendered as a surface ellipsoid whose axes are the
+    eigenvectors of the covariance matrix scaled by ``sigma * sqrt(eigenvalue)``.
+    Opacity is proportional to the component weight.
+
+    Parameters
+    ----------
+    gmm : sklearn.mixture.GaussianMixture
+        Fitted 3D GMM (means_: (K,3), covariances_: (K,3,3), weights_: (K,)).
+        A 4D GMM (from SOGMM) is automatically projected to 3D first.
+    pts : (N, 3) np.ndarray, optional
+        Point cloud to overlay as grey dots.
+    sigma : float
+        Ellipsoid half-axis scale in standard deviations (default: 1.0).
+    max_ellipsoids : int
+        Draw only the top-N components by weight to keep the plot responsive
+        (default: 50).
+    title : str
+        Figure title.
+
+    Returns
+    -------
+    fig : plotly.graph_objects.Figure
+        The Plotly figure (also calls fig.show()).
+
+    Example
+    -------
+    >>> from gmmslam import plot_gmm_3d
+    >>> plot_gmm_3d(node.local_gmms[-1][1], pts=pts, sigma=2.0)
+    """
+    import plotly.graph_objects as go
+
+    # Auto-project 4D → 3D (SOGMM output)
+    if gmm.means_.shape[1] == 4:
+        gmm = project_gmm_4d_to_3d(gmm)
+
+    K = gmm.n_components_
+
+    # Unit sphere grid (n_u × n_v points)
+    n_u, n_v = 24, 16
+    u = np.linspace(0, 2 * np.pi, n_u)
+    v = np.linspace(0,     np.pi, n_v)
+    sx = np.outer(np.cos(u), np.sin(v))   # (n_u, n_v)
+    sy = np.outer(np.sin(u), np.sin(v))
+    sz = np.outer(np.ones(n_u), np.cos(v))
+    sphere = np.stack([sx.ravel(), sy.ravel(), sz.ravel()], axis=1)  # (n_u*n_v, 3)
+
+    # Draw top-N components by weight
+    top_idx  = np.argsort(gmm.weights_)[::-1][:max_ellipsoids]
+    max_w    = gmm.weights_[top_idx[0]]
+    traces   = []
+
+    for k in top_idx:
+        mu  = gmm.means_[k]         # (3,)
+        cov = gmm.covariances_[k]   # (3, 3)
+        w   = gmm.weights_[k]
+
+        eigvals, eigvecs = np.linalg.eigh(cov)
+        eigvals = np.maximum(eigvals, 0.0)   # guard against tiny negatives
+
+        # Transform unit sphere → ellipsoid:
+        # axes[:,j] = sqrt(eigvals[j]) * sigma * eigvecs[:,j]
+        # epts = sphere @ axes.T + mu
+        axes = eigvecs * (np.sqrt(eigvals) * sigma)   # (3, 3), columns scaled
+        epts = (axes @ sphere.T).T + mu               # (n_u*n_v, 3)
+
+        ex = epts[:, 0].reshape(n_u, n_v)
+        ey = epts[:, 1].reshape(n_u, n_v)
+        ez = epts[:, 2].reshape(n_u, n_v)
+
+        alpha = 0.15 + 0.55 * (w / max_w)
+        color = f"rgba(30,110,255,{alpha:.2f})"
+
+        traces.append(go.Surface(
+            x=ex, y=ey, z=ez,
+            colorscale=[[0, color], [1, color]],
+            showscale=False,
+            opacity=alpha,
+            name=f"G{k} (w={w:.3f})",
+            showlegend=False,
+            hovertemplate=(
+                f"<b>Component {k}</b><br>"
+                f"weight: {w:.4f}<br>"
+                f"μ: ({mu[0]:.2f}, {mu[1]:.2f}, {mu[2]:.2f})<extra></extra>"
+            ),
+        ))
+
+    # Means as red markers (all components, not just top-N)
+    traces.append(go.Scatter3d(
+        x=gmm.means_[:, 0],
+        y=gmm.means_[:, 1],
+        z=gmm.means_[:, 2],
+        mode='markers',
+        marker=dict(
+            size=3,
+            color=gmm.weights_,
+            colorscale='Reds',
+            colorbar=dict(title='Weight', thickness=10),
+            opacity=0.9,
+        ),
+        name='Means',
+    ))
+
+    # Optional point cloud overlay
+    if pts is not None and len(pts) > 0:
+        # Subsample large clouds for performance
+        max_pts = 20_000
+        disp_pts = pts if len(pts) <= max_pts else pts[np.random.choice(len(pts), max_pts, replace=False)]
+        traces.append(go.Scatter3d(
+            x=disp_pts[:, 0],
+            y=disp_pts[:, 1],
+            z=disp_pts[:, 2],
+            mode='markers',
+            marker=dict(size=1.2, color='gray', opacity=0.35),
+            name='Point cloud',
+        ))
+
+    fig = go.Figure(data=traces)
+    fig.update_layout(
+        title=dict(text=f"{title}  (K={K}, showing top-{min(max_ellipsoids, K)})", x=0.5),
+        scene=dict(
+            xaxis_title='X (m)',
+            yaxis_title='Y (m)',
+            zaxis_title='Z (m)',
+            aspectmode='data',
+        ),
+        legend=dict(yanchor='top', y=0.99, xanchor='left', x=0.01),
+        margin=dict(l=0, r=0, t=50, b=0),
+    )
+    fig.show()
+    return fig
+
+
 # ===========================================================================
 # Pre-processing
 # ===========================================================================

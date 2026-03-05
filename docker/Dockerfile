@@ -92,7 +92,8 @@ ENV DISPLAY=:0
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1-mesa-glx libegl1-mesa \
     libx11-6 libxext6 libxrender1 libsm6 libglib2.0-0 \
-    libsndio7.0 libasound2 libpulse0 && \
+    libsndio7.0 libasound2 libpulse0 \
+    python3.8-tk && \
     rm -rf /var/lib/apt/lists/*
 
 # libsndio.so.7 symlink expected by Webots
@@ -125,10 +126,9 @@ ENV LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${WEBOTS_HOME}/lib/webots:${WEBOTS_HOME}/
 ENV ROS_PACKAGE_PATH=${WEBOTS_HOME}/projects/default/controllers/ros:${ROS_PACKAGE_PATH}
 
 # --- GMM-SLAM Python node ---
-# Install to /opt (not /root) so the disal_slam:/root volume doesn't shadow it
-COPY python/ /opt/gmmslam/python/
+# python/ is bind-mounted at runtime via compose.yaml → /opt/gmmslam/python
+# Only config files (not edited at runtime) are baked into the image.
 COPY config/ /opt/gmmslam/config/
-RUN chmod +x /opt/gmmslam/python/gmmslam.py
 
 # --- RViz visualization ---
 RUN mkdir -p /opt/gmmslam/rviz
@@ -136,7 +136,7 @@ COPY config/gmmslam.rviz /opt/gmmslam/rviz/gmmslam.rviz
 
 # Install ROS python bindings into the reconstruction venv so we can use its
 # python3 (which has sogmm_py) while still importing rospy.
-RUN ${GIRA_WS}/gira3d-reconstruction/.venv/bin/pip install rospkg catkin-pkg
+RUN ${GIRA_WS}/gira3d-reconstruction/.venv/bin/pip install rospkg catkin-pkg plotly
 
 # Source the reconstruction workon (activates venv + adds sogmm_py).
 # Manually add registration wet/install paths + examples/python to PYTHONPATH (don't activate its venv).
@@ -147,6 +147,15 @@ RUN printf '#!/usr/bin/env bash\n'\
 'exec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' \
       "${ROS_DISTRO}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" > /usr/local/bin/run_gmmslam && \
     chmod +x /usr/local/bin/run_gmmslam
+
+# Test simple GMM registration script
+RUN printf '#!/usr/bin/env bash\n'\
+'source /opt/ros/%s/setup.bash\n'\
+'cd %s/gira3d-reconstruction && source ./workon\n'\
+'export PYTHONPATH="%s/gira3d-registration/wet/install/gmm_d2d_registration_py:%s/gira3d-registration/wet/install/gmm:%s/gira3d-registration/wet/install/gmm_d2d_registration:%s/gira3d-registration/wet/src/gmm_d2d_registration_examples/python:${PYTHONPATH}:/opt/gmmslam/python"\n'\
+'exec python3 /opt/gmmslam/python/test_simple_gmm_reg.py "$@"\n' \
+      "${ROS_DISTRO}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" > /usr/local/bin/run_gmm_test && \
+    chmod +x /usr/local/bin/run_gmm_test
 
 # RViz launch script
 RUN printf '#!/usr/bin/env bash\n'\
