@@ -94,7 +94,15 @@ except ImportError:
     X = None
     import logging as _logging
 
-    _logging.warning("gtsam not found - iSAM2 backend disabled.")
+    _logging.warning("gtsam not found - fixed-lag backend disabled.")
+
+try:
+    import gtsam_unstable
+
+    HAS_GTSAM_UNSTABLE = True
+except ImportError:
+    gtsam_unstable = None
+    HAS_GTSAM_UNSTABLE = False
 
 
 # ===========================================================================
@@ -221,116 +229,103 @@ def project_gmm_4d_to_3d(gmm_4d):
     else:
         raise ValueError(f"Unexpected covariance shape: {gmm_4d.covariances_.shape}")
 
-    # Regularize covariances to ensure positive definiteness
-    # Taking a 3x3 sub-block from a 4x4 PD matrix doesn't guarantee the sub-block is PD
-    reg = 1e-6
-    max_condition_number = (
-        1e3  # Maximum acceptable ratio between largest and smallest eigenvalue
-    )
-    min_det = 1e-5  # Minimum acceptable determinant
-
-    reg_count = 0
-    bad_components = []
-    ill_conditioned_components = []
-    singular_components = []
-
-    for k in range(K):
-        # First check for NaN/Inf after projection
-        if np.any(np.isnan(gmm_3d.covariances_[k])) or np.any(
-            np.isinf(gmm_3d.covariances_[k])
-        ):
-            rospy.logerr(f"[project_gmm] Component {k} has NaN/Inf after projection!")
-            bad_components.append(k)
-            continue
-
-        # Ensure symmetry (numerical errors can break it)
-        gmm_3d.covariances_[k] = 0.5 * (
-            gmm_3d.covariances_[k] + gmm_3d.covariances_[k].T
-        )
-
-        # Check if covariance is positive definite via eigenvalues
-        try:
-            eigvals = np.linalg.eigvalsh(gmm_3d.covariances_[k])
-            min_eigval = eigvals.min()
-            max_eigval = eigvals.max()
-
-            # Check determinant (product of eigenvalues)
-            det = np.prod(eigvals)
-            if det <= min_det:
-                singular_components.append(k)
-
-            # Check condition number (ratio of largest to smallest eigenvalue)
-            if max_eigval > 0 and min_eigval > 0:
-                condition_number = max_eigval / min_eigval
-                if condition_number > max_condition_number:
-                    ill_conditioned_components.append(k)
-
-            # Only add minimal regularization for numerical stability
-            if min_eigval <= reg:
-                gmm_3d.covariances_[k] += (abs(min_eigval) + reg) * np.eye(3)
-                reg_count += 1
-            else:
-                gmm_3d.covariances_[k] += reg * np.eye(3)
-        except np.linalg.LinAlgError as e:
-            rospy.logerr(
-                f"[project_gmm] Component {k} eigenvalue decomposition failed: {e}"
-            )
-            bad_components.append(k)
-            continue
-
-    # Report issues with covariance matrices
-    if singular_components:
-        rospy.logwarn(
-            f"[project_gmm] {len(singular_components)}/{K} components have det <= {min_det} (nearly singular)"
-        )
-        rospy.logwarn(f"[project_gmm] Singular components: {singular_components[:10]}")
-
-    if ill_conditioned_components:
-        rospy.logwarn(
-            f"[project_gmm] {len(ill_conditioned_components)}/{K} components are ill-conditioned (cond > {max_condition_number})"
-        )
-        rospy.logwarn(
-            f"[project_gmm] Ill-conditioned components: {ill_conditioned_components[:10]}"
-        )
-
-    if bad_components:
-        rospy.logerr(
-            f"[project_gmm] {len(bad_components)} bad components found: {bad_components[:10]}"
-        )
-        raise ValueError(
-            f"GMM has {len(bad_components)} components with NaN/Inf values"
-        )
-
-    # Warn if D2D registration is likely to fail
-    if len(singular_components) + len(ill_conditioned_components) > K * 0.1:
-        rospy.logwarn(
-            f"[project_gmm] D2D registration likely to fail due to ill-conditioned matrices"
-        )
-
-    if reg_count > 0:
-        rospy.loginfo(f"[project_gmm] Regularized {reg_count}/{K} components")
-
     # Copy weights
     gmm_3d.weights_ = gmm_4d.weights_.copy()
+    return filter_well_conditioned_gmm(gmm_3d)
 
-    # Set other required attributes for sklearn GaussianMixture
-    gmm_3d.n_components_ = K  # This is set after fit() normally
-    gmm_3d.converged_ = True
-    gmm_3d.n_iter_ = 0
-    gmm_3d.lower_bound_ = (
-        -np.inf
-    )  # Log likelihood lower bound (not critical for saving)
 
-    # Compute precision matrices
-    try:
-        gmm_3d.precisions_cholesky_ = np.linalg.cholesky(
-            np.linalg.inv(gmm_3d.covariances_)
+def filter_well_conditioned_gmm(
+    gmm_3d, max_condition_number: float = 1e8, min_det: float = 1e-12, reg: float = 1e-6
+):
+    """Keep only components with numerically well-conditioned 3x3 covariances.
+
+    Thresholds are intentionally loose so that planar (high-condition-number)
+    components are kept: isoplanar_registration specifically needs them.
+    Only truly degenerate components (NaN/Inf, non-positive eigenvalues) are
+    dropped.
+    """
+    from sklearn.mixture import GaussianMixture
+
+    if hasattr(gmm_3d, "means_"):
+        K = int(gmm_3d.means_.shape[0])
+    else:
+        K = int(getattr(gmm_3d, "n_components_", getattr(gmm_3d, "n_components")))
+    keep = []
+    dropped_bad = []
+    dropped_singular = []
+    dropped_ill = []
+
+    for k in range(K):
+        cov = gmm_3d.covariances_[k].copy()
+        if np.any(np.isnan(cov)) or np.any(np.isinf(cov)):
+            dropped_bad.append(k)
+            continue
+
+        cov = 0.5 * (cov + cov.T)
+        try:
+            eigvals = np.linalg.eigvalsh(cov)
+        except np.linalg.LinAlgError:
+            dropped_bad.append(k)
+            continue
+
+        if np.any(np.isnan(eigvals)) or np.any(np.isinf(eigvals)):
+            dropped_bad.append(k)
+            continue
+
+        min_eigval = eigvals.min()
+        max_eigval = eigvals.max()
+        det = float(np.prod(eigvals))
+        if min_eigval <= 0.0 or det <= min_det:
+            dropped_singular.append(k)
+            continue
+
+        condition_number = max_eigval / min_eigval
+        if condition_number > max_condition_number:
+            dropped_ill.append(k)
+            continue
+
+        keep.append((k, cov))
+
+    if dropped_bad:
+        rospy.logwarn(
+            f"[filter_gmm] dropped {len(dropped_bad)}/{K} components (NaN/Inf or eigendecomposition failure): {dropped_bad[:10]}"
         )
-    except np.linalg.LinAlgError as e:
-        rospy.logerr(f"[project_gmm] Failed to compute precision matrices: {e}")
-        raise
+    if dropped_singular:
+        rospy.logwarn(
+            f"[filter_gmm] dropped {len(dropped_singular)}/{K} singular/near-singular components (det <= {min_det}): {dropped_singular[:10]}"
+        )
+    if dropped_ill:
+        rospy.logwarn(
+            f"[filter_gmm] dropped {len(dropped_ill)}/{K} ill-conditioned components (cond > {max_condition_number}): {dropped_ill[:10]}"
+        )
 
-    return gmm_3d
+    if not keep:
+        raise ValueError("No well-conditioned covariance matrices left after filtering")
+
+    keep_idx = [i for i, _ in keep]
+    covs = np.stack([cov + reg * np.eye(3) for _, cov in keep], axis=0)
+    weights = gmm_3d.weights_[keep_idx].astype(np.float64)
+    weights_sum = weights.sum()
+    if weights_sum <= 0.0 or not np.isfinite(weights_sum):
+        raise ValueError("Invalid weights after filtering GMM components")
+    weights /= weights_sum
+
+    filtered = GaussianMixture(n_components=len(keep_idx), covariance_type="full")
+    filtered.means_ = gmm_3d.means_[keep_idx].copy()
+    filtered.covariances_ = covs
+    filtered.weights_ = weights
+    filtered.n_components_ = len(keep_idx)
+    filtered.converged_ = True
+    filtered.n_iter_ = 0
+    filtered.lower_bound_ = -np.inf
+    filtered.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(covs))
+
+    if len(keep_idx) != K:
+        rospy.loginfo(
+            f"[filter_gmm] keeping {len(keep_idx)}/{K} well-conditioned components"
+        )
+
+    return filtered
 
 
 def save_gmm_to_file(gmm, filepath: str):
@@ -345,7 +340,10 @@ def save_gmm_to_file(gmm, filepath: str):
     if gmm.means_.shape[1] == 4:
         gmm_3d = project_gmm_4d_to_3d(gmm)
     else:
-        gmm_3d = gmm
+        gmm_3d = filter_well_conditioned_gmm(gmm)
+
+    if gmm_3d is None:
+        return None
 
     # Validate GMM before saving
     nan_count = 0
@@ -370,9 +368,9 @@ def save_gmm_to_file(gmm, filepath: str):
     save_gmm_official(filepath, gmm_3d)
 
     # Log file save with stats
-    rospy.loginfo(
-        f"[save_gmm] Saved {gmm_3d.n_components_} components to {os.path.basename(filepath)}"
-    )
+    # rospy.loginfo(
+    #     f"[save_gmm] Saved {gmm_3d.n_components_} components to {os.path.basename(filepath)}"
+    # )
 
 
 def plot_gmm_3d(
@@ -502,14 +500,20 @@ class GMMSLAMNode:
         self.min_points = rospy.get_param("~min_points", 50)
 
         # SOGMM parameters
-        self.sogmm_bandwidth = rospy.get_param("~sogmm_bandwidth", 0.2)
+        self.sogmm_bandwidth = rospy.get_param("~sogmm_bandwidth", 0.05)
         self.sogmm_compute = rospy.get_param("~sogmm_compute", "CPU")  # "CPU" or "GPU"
+        self.sogmm_max_points = rospy.get_param(
+            "~sogmm_max_points", 1000
+        )  # subsample before fitting (0 = no cap)
+        self.sogmm_n_components = rospy.get_param(
+            "~sogmm_n_components", 200
+        )  # fixed component count for now
         self.plot_first_frame = rospy.get_param("~plot_first_frame", False)
-        # iSAM2 / fixed-lag (backend scaffolding only for now)
-        self.use_isam2 = rospy.get_param("~use_isam2", False)
+        # Backend parameters (fixed-lag smoothing only)
+        self.use_fixed_lag_smoother = rospy.get_param("~use_fixed_lag_smoother", True)
         self.fixed_lag_s = rospy.get_param("~fixed_lag_s", 3.0)
-        self.odom_noise_sigma_t = rospy.get_param("~odom_noise_sigma_t", 0.10)
-        self.odom_noise_sigma_r = rospy.get_param("~odom_noise_sigma_r", 0.10)
+        self.odom_noise_sigma_t = rospy.get_param("~odom_noise_sigma_t", 0.06)
+        self.odom_noise_sigma_r = rospy.get_param("~odom_noise_sigma_r", 0.06)
 
         rospy.loginfo(f"[gmmslam] lidar_topic  : {self.lidar_topic}")
         rospy.loginfo(f"[gmmslam] sensor_frame : {self.sensor_frame}")
@@ -521,15 +525,29 @@ class GMMSLAMNode:
         rospy.loginfo(f"[gmmslam] voxel_size   : {self.voxel_size} m")
 
         if HAS_SOGMM:
-            rospy.loginfo(f"[gmmslam] SOGMM bandwidth : {self.sogmm_bandwidth}")
-            rospy.loginfo(f"[gmmslam] SOGMM compute   : {self.sogmm_compute}")
+            rospy.loginfo(f"[gmmslam] SOGMM bandwidth     : {self.sogmm_bandwidth}")
+            rospy.loginfo(f"[gmmslam] SOGMM compute       : {self.sogmm_compute}")
+            rospy.loginfo(
+                f"[gmmslam] SOGMM max_points    : {self.sogmm_max_points} (0=no cap)"
+            )
+            if self.sogmm_n_components > 0:
+                rospy.loginfo(
+                    f"[gmmslam] SOGMM n_components  : {self.sogmm_n_components} (fixed)"
+                )
+            else:
+                rospy.loginfo(
+                    "[gmmslam] SOGMM n_components  : auto (MeanShift enabled)"
+                )
         else:
             rospy.logwarn("[gmmslam] SOGMM unavailable – fitting will be skipped")
-        rospy.loginfo(f"[gmmslam] use_isam2        : {self.use_isam2}")
+        rospy.loginfo(f"[gmmslam] use_fixed_lag    : {self.use_fixed_lag_smoother}")
         rospy.loginfo(f"[gmmslam] fixed_lag_s      : {self.fixed_lag_s}")
         rospy.loginfo(
             f"[gmmslam] odom noise (t/r) : {self.odom_noise_sigma_t} / {self.odom_noise_sigma_r}"
         )
+        if not self.use_fixed_lag_smoother:
+            rospy.logwarn("[gmmslam] forcing fixed-lag backend ON as requested")
+            self.use_fixed_lag_smoother = True
 
         # ------------------------------------------------------------------
         # State
@@ -556,28 +574,49 @@ class GMMSLAMNode:
         self.prev_gmm_path = None  # path to previous frame's .gmm file
         self.gmm_dir = rospy.get_param("~gmm_dir", "/tmp/gmmslam_gmms")
         os.makedirs(self.gmm_dir, exist_ok=True)
-        # iSAM2 frontend buffers (step 2: queue odometry factors from D2D)
-        self._isam2_pending_factors = []
-        self._isam2_odom_noise = None
-        if self.use_isam2 and HAS_GTSAM:
-            sigmas = np.array(
-                [
-                    self.odom_noise_sigma_r,
-                    self.odom_noise_sigma_r,
-                    self.odom_noise_sigma_r,
-                    self.odom_noise_sigma_t,
-                    self.odom_noise_sigma_t,
-                    self.odom_noise_sigma_t,
-                ],
-                dtype=np.float64,
+        # Fixed-lag backend state (same pattern as GTSAM example)
+        self._odom_noise = None
+        self._prior_noise = None
+        self._fixed_lag = None
+        self._new_factors = None
+        self._new_values = None
+        self._new_timestamps = None
+        self._fixed_lag_initialized = False
+        if not HAS_GTSAM:
+            raise RuntimeError("Fixed-lag backend requested but gtsam is unavailable")
+        if not (
+            HAS_GTSAM_UNSTABLE
+            and hasattr(gtsam_unstable, "IncrementalFixedLagSmoother")
+        ):
+            raise RuntimeError(
+                "Fixed-lag backend requested but gtsam_unstable.IncrementalFixedLagSmoother is unavailable"
             )
-            self._isam2_odom_noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
-            rospy.loginfo("[gmmslam] iSAM2 frontend buffers initialised")
-        elif self.use_isam2 and not HAS_GTSAM:
-            rospy.logwarn(
-                "[gmmslam] ~use_isam2=True but gtsam is unavailable; disabling iSAM2 path"
+        sigmas = np.array(
+            [
+                self.odom_noise_sigma_r,
+                self.odom_noise_sigma_r,
+                self.odom_noise_sigma_r,
+                self.odom_noise_sigma_t,
+                self.odom_noise_sigma_t,
+                self.odom_noise_sigma_t,
+            ],
+            dtype=np.float64,
+        )
+        self._odom_noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
+        self._odom_noise_lost = gtsam.noiseModel.Diagonal.Sigmas(sigmas * 10.0)
+        self._prior_noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas * 0.1)
+        self._fixed_lag = gtsam_unstable.IncrementalFixedLagSmoother(self.fixed_lag_s)
+        map_ctor = getattr(gtsam_unstable, "FixedLagSmootherKeyTimestampMap", None)
+        if map_ctor is None:
+            raise RuntimeError(
+                "Fixed-lag backend requested but gtsam_unstable.FixedLagSmootherKeyTimestampMap is unavailable"
             )
-            self.use_isam2 = False
+        self._new_factors = gtsam.NonlinearFactorGraph()
+        self._new_values = gtsam.Values()
+        self._new_timestamps = map_ctor()
+        rospy.loginfo(
+            f"[gmmslam] backend initialised: IncrementalFixedLagSmoother (lag={self.fixed_lag_s:.2f}s)"
+        )
 
         # ------------------------------------------------------------------
         # TF broadcaster
@@ -661,25 +700,28 @@ class GMMSLAMNode:
                 f"[gmmslam] only {pts.shape[0]} points after filtering (< {self.min_points}), skipping",
             )
             return
+        if self._frame_count == 0:
+            self._fixed_lag_initialize(stamp)
 
         # --- SOGMM fitting ---
         curr_gmm_path = self._fit_sogmm(stamp, pts)
 
-        # --- D2D registration ---
-        if curr_gmm_path is not None and self.prev_gmm_path is not None:
-            T_prev_to_curr = self._register_gmm(curr_gmm_path, self.prev_gmm_path)
-            # source = current gmm, target = previous gmm --> resulting transformation is T_target->source
-            # which thus corresponds to T_prev->current
-            if T_prev_to_curr is not None:
-                if self.use_isam2:
-                    self._queue_odom_factor(
-                        prev_idx=self._frame_count - 1,
-                        curr_idx=self._frame_count,
-                        T_prev_to_curr=T_prev_to_curr,
-                    )
-                # self pose is T_world -> base before registration
-                # so T_world -> new_base = T_world -> old_base @ T_prev_to_curr --> new_base = old_base @ T_prev_to_curr
-                self.pose = self.pose @ T_prev_to_curr
+        # --- D2D registration + fixed-lag update ---
+        if self._frame_count > 0:
+            T_prev_to_curr = None
+            if curr_gmm_path is not None and self.prev_gmm_path is not None:
+                T_prev_to_curr = self._register_gmm(curr_gmm_path, self.prev_gmm_path)
+
+            if not self._fixed_lag_update_from_odom(
+                prev_idx=self._frame_count - 1,
+                curr_idx=self._frame_count,
+                T_prev_to_curr=T_prev_to_curr,
+                stamp=stamp,
+            ):
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[gmmslam] fixed-lag update failed; keeping previous published pose",
+                )
 
         # Store current GMM path for next iteration
         if curr_gmm_path is not None:
@@ -691,6 +733,9 @@ class GMMSLAMNode:
 
     # ------------------------------------------------------------------
     # SOGMM fitting
+    # https://github.com/gira3d/sogmm_py/blob/697cbeaf10c60fa80445c25e05dd9d720a296869/src/sogmm_py/sogmm.py
+    # https://github.com/gira3d/gmm_d2d_registration_examples/blob/082377d71d49201955b253e796ac6ca94fbfa904/python/create_and_save_gmm_example.py
+    # Sklean GMM Fitting: https://scikit-learn.org/stable/modules/generated/sklearn.mixture.GaussianMixture.html#sklearn.mixture.GaussianMixture.fit
     # ------------------------------------------------------------------
 
     def _fit_sogmm(self, stamp, pts: np.ndarray) -> str:
@@ -716,8 +761,20 @@ class GMMSLAMNode:
 
         pcld_4d = make_pcld_4d(pts)  # (N, 4)  [x, y, z, range]
 
+        # Subsample to cap fitting time (MeanShift + EM scale badly with N).
+        # sogmm_max_points=0 disables the cap.
+        if self.sogmm_max_points > 0 and pcld_4d.shape[0] > self.sogmm_max_points:
+            idx = np.random.choice(
+                pcld_4d.shape[0], self.sogmm_max_points, replace=False
+            )
+            pcld_4d = pcld_4d[idx]
+
         try:
-            local_model = self.sg.fit(pcld_4d)
+            sg_local = SOGMM(self.sogmm_bandwidth, compute=self.sogmm_compute)
+            if self.sogmm_n_components > 0:
+                local_model = sg_local.gmm_fit(pcld_4d, self.sogmm_n_components)
+            else:
+                local_model = sg_local.fit(pcld_4d)
         except Exception as e:
             rospy.logerr(
                 f"[gmmslam] SOGMM fit failed on frame {self._frame_count}: {e}"
@@ -735,11 +792,9 @@ class GMMSLAMNode:
 
         self.local_gmms.append((stamp, local_model))
         n_local = local_model.n_components_
-        n_global = self.sg.model.n_components_ if self.sg.model is not None else 0
         rospy.loginfo(
             f"[gmmslam] frame {self._frame_count:4d} | "
-            f"local GMM: {n_local:3d} components | "
-            f"global GMM: {n_global:4d} components"
+            f"local GMM: {n_local:3d} components (fresh per-frame fit)"
         )
 
         if self.plot_first_frame and self._frame_count == 0:
@@ -754,25 +809,25 @@ class GMMSLAMNode:
         try:
             save_gmm_to_file(local_model, gmm_path)
 
-            if os.path.exists(gmm_path):
-                file_size = os.path.getsize(gmm_path)
-                rospy.loginfo(f"[gmmslam] GMM file size: {file_size} bytes")
-                if file_size == 0:
-                    rospy.logerr(f"[gmmslam] GMM file is empty!")
-                    return None
-                # Read first line to verify CSV format (should have 13 columns)
-                with open(gmm_path, "r") as f:
-                    first_line = f.readline().strip()
-                    values = first_line.split(",")
-                    rospy.loginfo(f"[gmmslam] GMM CSV has {len(values)} columns")
-                    if len(values) != 13:
-                        rospy.logerr(
-                            f"[gmmslam] Expected 13 columns (3 mean + 9 cov + 1 weight)!"
-                        )
-                        return None
-            else:
-                rospy.logerr(f"[gmmslam] GMM file was not created!")
-                return None
+            # if os.path.exists(gmm_path):
+            #     file_size = os.path.getsize(gmm_path)
+            #     rospy.loginfo(f"[gmmslam] GMM file size: {file_size} bytes")
+            #     if file_size == 0:
+            #         rospy.logerr(f"[gmmslam] GMM file is empty!")
+            #         return None
+            #     # Read first line to verify CSV format (should have 13 columns)
+            #     with open(gmm_path, "r") as f:
+            #         first_line = f.readline().strip()
+            #         values = first_line.split(",")
+            #         rospy.loginfo(f"[gmmslam] GMM CSV has {len(values)} columns")
+            #         if len(values) != 13:
+            #             rospy.logerr(
+            #                 f"[gmmslam] Expected 13 columns (3 mean + 9 cov + 1 weight)!"
+            #             )
+            #             return None
+            # else:
+            #     rospy.logerr(f"[gmmslam] GMM file was not created!")
+            #     return None
 
             return gmm_path
         except Exception as e:
@@ -819,28 +874,29 @@ class GMMSLAMNode:
             return None
 
         try:
-            T_init = np.eye(4, dtype=np.float64)
+            T_init = np.zeros((4, 4), dtype=np.float64)
 
-            # Stage 1: isoplanar registration
+            # Stage 1: isoplanar registration: fast initial alignment
             result_iso = gmm_d2d_registration_py.isoplanar_registration(
                 T_init, source_path, target_path
             )
             T_iso = result_iso[0]
             score_iso = result_iso[1]
 
-            # Check for NaN scores (indicates ill-conditioned matrices)
-            if np.isnan(score_iso) or np.isinf(score_iso):
+            # Check for NaN scores or invalid transform from isoplanar stage.
+            # When isoplanar fails (no planar components in the scan) fall back
+            # to anisotropic-only, initialised from identity.
+            if (
+                np.isnan(score_iso)
+                or np.isinf(score_iso)
+                or np.any(np.isnan(T_iso))
+                or np.any(np.isinf(T_iso))
+            ):
                 rospy.logwarn(
-                    f"[gmmslam] D2D registration failed - ill-conditioned covariance matrices (iso score: nan)"
+                    "[gmmslam] isoplanar registration failed (score: nan/inf or invalid T) "
+                    "– falling back to anisotropic-only from identity"
                 )
-                return None
-
-            # Check for NaN/Inf in transformation
-            if np.any(np.isnan(T_iso)) or np.any(np.isinf(T_iso)):
-                rospy.logwarn(
-                    f"[gmmslam] D2D registration failed - invalid transformation (ill-conditioned matrices)"
-                )
-                return None
+                T_iso = T_init  # reset to identity so anisotropic starts clean
 
             # Stage 2: anisotropic refinement
             result_aniso = gmm_d2d_registration_py.anisotropic_registration(
@@ -851,16 +907,12 @@ class GMMSLAMNode:
 
             # Check for NaN scores (indicates ill-conditioned matrices)
             if np.isnan(score_final) or np.isinf(score_final):
-                rospy.logwarn(
-                    f"[gmmslam] D2D registration failed - ill-conditioned covariance matrices (aniso score: nan)"
-                )
+                rospy.logwarn(f"[gmmslam] D2D aniso failed - aniso score: nan")
                 return None
 
             # Check for NaN/Inf in final transformation
             if np.any(np.isnan(T_final)) or np.any(np.isinf(T_final)):
-                rospy.logwarn(
-                    f"[gmmslam] D2D registration failed - invalid transformation (ill-conditioned matrices)"
-                )
+                rospy.logwarn(f"[gmmslam] D2D aniso failed - ill-conditioned matrices")
                 return None
 
             rospy.loginfo(
@@ -886,23 +938,101 @@ class GMMSLAMNode:
         t = gtsam.Point3(float(T[0, 3]), float(T[1, 3]), float(T[2, 3]))
         return gtsam.Pose3(R, t)
 
-    def _queue_odom_factor(self, prev_idx: int, curr_idx: int, T_prev_to_curr: np.ndarray):
-        """Convert D2D relative transform into a queued iSAM2 odometry factor."""
-        if not (self.use_isam2 and HAS_GTSAM and self._isam2_odom_noise is not None):
-            return
-        if prev_idx < 0:
-            return
+    def _matrix_from_pose3(self, pose):
+        """Convert gtsam.Pose3 to a 4x4 numpy matrix."""
+        return np.array(pose.matrix(), dtype=np.float64)
+
+    def _stamp_to_sec(self, stamp):
+        return float(stamp.secs) + 1e-9 * float(stamp.nsecs)
+
+    def _reset_new_data(self):
+        """Clear per-update containers (example style)."""
+        self._new_factors.resize(0)
+        self._new_values.clear()
+        self._new_timestamps.clear()
+
+    def _timestamps_insert(self, key, t_sec: float):
+        """Insert (key, timestamp) into FixedLagSmootherKeyTimestampMap."""
         try:
-            rel_pose = self._pose3_from_matrix(T_prev_to_curr)
-            factor = gtsam.BetweenFactorPose3(
-                X(prev_idx), X(curr_idx), rel_pose, self._isam2_odom_noise
+            self._new_timestamps.insert((key, float(t_sec)))
+        except TypeError:
+            self._new_timestamps.insert(key, float(t_sec))
+
+    def _fixed_lag_initialize(self, stamp):
+        """Insert X0 prior and perform first fixed-lag update."""
+        if self._fixed_lag_initialized:
+            return True
+        try:
+            key0 = X(0)
+            t0 = self._stamp_to_sec(stamp)
+            pose0 = self._pose3_from_matrix(self.pose)
+            self._new_factors.push_back(
+                gtsam.PriorFactorPose3(key0, pose0, self._prior_noise)
             )
-            self._isam2_pending_factors.append((curr_idx, factor))
-            rospy.logdebug(
-                f"[gmmslam] queued odom factor X({prev_idx}) -> X({curr_idx})"
+            self._new_values.insert(key0, pose0)
+            self._timestamps_insert(key0, t0)
+            self._fixed_lag.update(
+                self._new_factors, self._new_values, self._new_timestamps
             )
+            self._reset_new_data()
+            self._fixed_lag_initialized = True
+            rospy.loginfo("[gmmslam] fixed-lag smoother initialized with prior X(0)")
+            return True
         except Exception as e:
-            rospy.logwarn(f"[gmmslam] failed to queue odom factor: {e}")
+            rospy.logwarn(f"[gmmslam] failed to initialize fixed-lag smoother: {e}")
+            return False
+
+    def _fixed_lag_update_from_odom(
+        self, prev_idx: int, curr_idx: int, T_prev_to_curr, stamp
+    ):
+        """Update fixed-lag smoother using one odometry edge.
+
+        If T_prev_to_curr is None (registration failed), inserts the key
+        with identity motion and heavily inflated noise so the factor
+        graph chain stays connected.
+        """
+        if prev_idx < 0:
+            return False
+        if not self._fixed_lag_initialize(stamp):
+            return False
+        try:
+            t_sec = self._stamp_to_sec(stamp)
+            key_prev = X(prev_idx)
+            key_curr = X(curr_idx)
+
+            if T_prev_to_curr is not None:
+                rel_pose = self._pose3_from_matrix(T_prev_to_curr)
+                noise = self._odom_noise
+                predicted_T = self.pose @ T_prev_to_curr
+            else:
+                rel_pose = gtsam.Pose3.Identity()
+                noise = self._odom_noise_lost
+                predicted_T = self.pose
+
+            self._new_factors.push_back(
+                gtsam.BetweenFactorPose3(key_prev, key_curr, rel_pose, noise)
+            )
+            self._new_values.insert(key_curr, self._pose3_from_matrix(predicted_T))
+            self._timestamps_insert(key_curr, t_sec)
+
+            self._fixed_lag.update(
+                self._new_factors, self._new_values, self._new_timestamps
+            )
+            self._reset_new_data()
+
+            estimate = self._fixed_lag.calculateEstimate()
+            self.pose = self._matrix_from_pose3(estimate.atPose3(key_curr))
+            if T_prev_to_curr is not None:
+                rospy.logdebug(f"[gmmslam] fixed-lag updated at X({curr_idx})")
+            else:
+                rospy.logdebug(
+                    f"[gmmslam] fixed-lag updated at X({curr_idx}) (identity, lost)"
+                )
+            return True
+        except Exception as e:
+            rospy.logwarn(f"[gmmslam] fixed-lag update failed at X({curr_idx}): {e}")
+            self._reset_new_data()
+            return False
 
     # ------------------------------------------------------------------
     # Publishing
@@ -921,6 +1051,7 @@ class GMMSLAMNode:
         odom.header.frame_id = self.odom_frame
         odom.child_frame_id = self.base_frame
         odom.pose.pose = pose_to_pose_stamped(T, stamp, self.odom_frame).pose
+        print(f"current odom position: {T[0,3]}, {T[1,3]}, {T[2,3]}")
         self.odom_pub.publish(odom)
 
         # --- Path ---
