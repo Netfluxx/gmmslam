@@ -124,11 +124,17 @@ ENV WEBOTS_HOME=/usr/local/webots
 ENV PYTHONPATH=${PYTHONPATH}:${WEBOTS_HOME}/lib/controller/python
 ENV LD_LIBRARY_PATH=${LD_LIBRARY_PATH}:${WEBOTS_HOME}/lib/webots:${WEBOTS_HOME}/lib/controller
 ENV ROS_PACKAGE_PATH=${WEBOTS_HOME}/projects/default/controllers/ros:${ROS_PACKAGE_PATH}
+ENV ROS_PACKAGE_PATH=/opt/gmmslam:${ROS_PACKAGE_PATH}
 
 # --- GMM-SLAM Python node ---
 # python/ is bind-mounted at runtime via compose.yaml → /opt/gmmslam/python
 # Only config files (not edited at runtime) are baked into the image.
+COPY package.xml /opt/gmmslam/package.xml
 COPY config/ /opt/gmmslam/config/
+RUN mkdir -p /opt/gmmslam/scripts && \
+    printf '#!/usr/bin/env bash\nexec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' > /opt/gmmslam/scripts/gmmslam_node.py && \
+    printf '#!/usr/bin/env bash\nexec python3 /opt/gmmslam/python/d2d_registration_node.py "$@"\n' > /opt/gmmslam/scripts/d2d_registration_node.py && \
+    chmod +x /opt/gmmslam/scripts/gmmslam_node.py /opt/gmmslam/scripts/d2d_registration_node.py
 
 # --- RViz visualization ---
 RUN mkdir -p /opt/gmmslam/rviz
@@ -143,8 +149,9 @@ RUN ${GIRA_WS}/gira3d-reconstruction/.venv/bin/pip install rospkg catkin-pkg plo
 RUN printf '#!/usr/bin/env bash\n'\
 'source /opt/ros/%s/setup.bash\n'\
 'cd %s/gira3d-reconstruction && source ./workon\n'\
+'export ROS_PACKAGE_PATH="/opt/gmmslam:${ROS_PACKAGE_PATH}"\n'\
 'export PYTHONPATH="%s/gira3d-registration/wet/install/gmm_d2d_registration_py:%s/gira3d-registration/wet/install/gmm:%s/gira3d-registration/wet/install/gmm_d2d_registration:%s/gira3d-registration/wet/src/gmm_d2d_registration_examples/python:${PYTHONPATH}:/opt/gmmslam/python"\n'\
-'exec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' \
+'exec roslaunch /opt/gmmslam/python/launch/gmmslam.launch "$@"\n' \
       "${ROS_DISTRO}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" > /usr/local/bin/run_gmmslam && \
     chmod +x /usr/local/bin/run_gmmslam
 

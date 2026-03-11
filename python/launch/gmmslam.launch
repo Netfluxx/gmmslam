@@ -5,6 +5,10 @@
   <arg name="sensor_frame"     default="depth_camera_1"/>
   <arg name="odom_frame"       default="world"/>
   <arg name="base_frame"       default="m500_1_base_link"/>
+  <arg name="enable_async_registration" default="true"/>
+  <arg name="registration_fit_stride"   default="3"/>
+  <arg name="registration_score_threshold" default="-1e9"/>
+  <arg name="registration_workers" default="2"/>
 
   <!-- Preprocessing -->
   <arg name="min_range"        default="0.1"/>
@@ -30,13 +34,18 @@
         args="0.083 0 0.0315  0 0 0  $(arg base_frame)  $(arg sensor_frame)"/>
 
   <!-- ===== GMM-SLAM node ===== -->
-  <node pkg="gslam_ros1" type="gmmslam_node.py"
+  <node pkg="gmmslam" type="gmmslam_node.py"
         name="gmmslam_node" output="screen" respawn="true">
 
     <param name="lidar_topic"      value="$(arg lidar_topic)"/>
     <param name="sensor_frame"     value="$(arg sensor_frame)"/>
     <param name="odom_frame"       value="$(arg odom_frame)"/>
     <param name="base_frame"       value="$(arg base_frame)"/>
+    <param name="enable_async_registration" value="$(arg enable_async_registration)"/>
+    <param name="registration_fit_stride"   value="$(arg registration_fit_stride)"/>
+    <param name="registration_score_threshold" value="$(arg registration_score_threshold)"/>
+    <param name="registration_request_topic" value="/gmmslam_node/registration/request"/>
+    <param name="registration_result_topic"  value="/gmmslam_node/registration/result"/>
 
     <param name="min_range"        value="$(arg min_range)"/>
     <param name="max_range"        value="$(arg max_range)"/>
@@ -50,6 +59,14 @@
     <param name="odom_noise_trans" value="$(arg odom_noise_trans)"/>
 
     <param name="min_points"       value="$(arg min_points)"/>
+  </node>
+
+  <node pkg="gmmslam" type="d2d_registration_node.py"
+        name="d2d_registration_node" output="screen" respawn="true">
+    <param name="request_topic" value="/gmmslam_node/registration/request"/>
+    <param name="result_topic"  value="/gmmslam_node/registration/result"/>
+    <param name="num_workers"   value="$(arg registration_workers)"/>
+    <param name="score_threshold" value="$(arg registration_score_threshold)"/>
   </node>
 
 </launch>
