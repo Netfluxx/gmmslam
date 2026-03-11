@@ -623,12 +623,21 @@ class GMMSLAMNode:
         # ------------------------------------------------------------------
         self.tf_broadcaster = tf2_ros.TransformBroadcaster()
 
+        # Ground truth
+        self.gt_topic = rospy.get_param(
+            "~gt_topic", "/m500_1/mavros/local_position/pose"
+        )
+        self._gt_path = Path()
+        self._gt_path.header.frame_id = self.odom_frame
+        self._latest_gt_pose = None
+
         # ------------------------------------------------------------------
         # Publishers
         # ------------------------------------------------------------------
         self.path_pub = rospy.Publisher("~path", Path, queue_size=1)
         self.odom_pub = rospy.Publisher("~odom", Odometry, queue_size=1)
         self.cloud_pub = rospy.Publisher("~map_cloud", PointCloud2, queue_size=1)
+        self.gt_path_pub = rospy.Publisher("~gt_path", Path, queue_size=1)
 
         # ------------------------------------------------------------------
         # Subscribers
@@ -636,6 +645,7 @@ class GMMSLAMNode:
         rospy.Subscriber(
             self.lidar_topic, PointCloud2, self._pcl_callback, queue_size=1
         )
+        rospy.Subscriber(self.gt_topic, PoseStamped, self._gt_callback, queue_size=1)
 
         # Depth image and camera info (for future use / logging)
         depth_ns = "/".join(self.lidar_topic.split("/")[:-1])  # strip "points"
@@ -645,6 +655,7 @@ class GMMSLAMNode:
         rospy.Subscriber(
             depth_ns + "/camera_info", CameraInfo, self._cam_info_callback, queue_size=1
         )
+        rospy.loginfo(f"[gmmslam] gt_topic     : {self.gt_topic}")
 
         # With use_sim_time=true rospy holds callbacks until the clock ticks.
         # Block here until time is valid so we don't silently drop messages.
@@ -659,6 +670,17 @@ class GMMSLAMNode:
     # ------------------------------------------------------------------
     # Callbacks
     # ------------------------------------------------------------------
+
+    def _gt_callback(self, msg: PoseStamped):
+        """Accumulate ground truth path and republish for visualization."""
+        self._latest_gt_pose = msg
+        ps = PoseStamped()
+        ps.header = msg.header
+        ps.header.frame_id = self.odom_frame
+        ps.pose = msg.pose
+        self._gt_path.header.stamp = msg.header.stamp
+        self._gt_path.poses.append(ps)
+        self.gt_path_pub.publish(self._gt_path)
 
     def _depth_callback(self, msg: Image):
         """Store the latest 32FC1 depth image (reserved for future processing)."""
