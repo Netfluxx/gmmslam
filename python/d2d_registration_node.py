@@ -69,6 +69,7 @@ class D2DRegistrationNode:
             stamp = float(req.get("stamp", 0.0))
             source_path = str(req["source_path"])
             target_path = str(req["target_path"])
+            is_loop_closure = bool(req.get("is_loop_closure", False))
         except Exception as e:
             rospy.logwarn_throttle(2.0, f"[d2d_reg] malformed request: {e}")
             return
@@ -80,6 +81,7 @@ class D2DRegistrationNode:
             "success": False,
             "score": float("-inf"),
             "transform": np.eye(4, dtype=np.float64).reshape(-1).tolist(),
+            "is_loop_closure": is_loop_closure,
         }
 
         if not HAS_GMM_REGISTRATION:

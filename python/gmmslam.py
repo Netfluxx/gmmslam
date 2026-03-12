@@ -12,11 +12,13 @@ Subscribed topics (names read from ROS params / launch file):
 
 Published topics:
   ~path                nav_msgs/Path              accumulated trajectory
+  ~global_graph_path   nav_msgs/Path              long-term global submap graph trajectory
   ~odom                nav_msgs/Odometry          current odometry estimate
-  ~map_cloud           sensor_msgs/PointCloud2    accumulated map points (decimated)
-  ~noisy_gt_pose       geometry_msgs/PoseStamped  accumulated noisy GT odometry pose
-  ~noisy_gt_path       nav_msgs/Path              accumulated noisy GT trajectory
-  ~gmm_markers         visualization_msgs/MarkerArray  per-component spheres scaled by λ₁
+  ~map_cloud           sensor_msgs/PointCloud2    global map cloud (gray, slow refresh)
+  ~latest_frame_cloud  sensor_msgs/PointCloud2    latest frame cloud (red)
+  ~gmm_markers         visualization_msgs/MarkerArray  latest-frame Gaussian ellipsoids (red)
+  ~gmm_global_markers  visualization_msgs/MarkerArray  global Gaussian map ellipsoids (gray)
+  ~global_graph_markers visualization_msgs/MarkerArray submap nodes (green) + loop edges
 
 Broadcast TF:
   odom_frame → base_frame   current pose
@@ -24,15 +26,16 @@ Broadcast TF:
 
 import json
 import queue
+import struct
 import threading
 
 import numpy as np
 
 import rospy
 import tf2_ros
-from geometry_msgs.msg import TransformStamped, PoseStamped
+from geometry_msgs.msg import TransformStamped, PoseStamped, Point
 from nav_msgs.msg import Odometry, Path
-from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
+from sensor_msgs.msg import PointCloud2, PointField, Image, CameraInfo, Imu
 from std_msgs.msg import String
 from visualization_msgs.msg import Marker, MarkerArray
 import sensor_msgs.point_cloud2 as pc2
@@ -174,6 +177,28 @@ def numpy_to_pc2(pts: np.ndarray, stamp, frame_id: str) -> PointCloud2:
     header.stamp = stamp
     header.frame_id = frame_id
     return pc2.create_cloud_xyz32(header, pts.tolist())
+
+
+def numpy_to_pc2_rgb(
+    pts: np.ndarray, stamp, frame_id: str, r: int, g: int, b: int
+) -> PointCloud2:
+    """Convert an (N,3) array to PointCloud2 with a constant RGB color."""
+    header = rospy.Header()
+    header.stamp = stamp
+    header.frame_id = frame_id
+    fields = [
+        PointField("x", 0, PointField.FLOAT32, 1),
+        PointField("y", 4, PointField.FLOAT32, 1),
+        PointField("z", 8, PointField.FLOAT32, 1),
+        PointField("rgb", 12, PointField.FLOAT32, 1),
+    ]
+    rgb_uint = (int(r) << 16) | (int(g) << 8) | int(b)
+    rgb_float = struct.unpack("f", struct.pack("I", rgb_uint))[0]
+    points = [
+        (float(p[0]), float(p[1]), float(p[2]), rgb_float)
+        for p in pts.astype(np.float32)
+    ]
+    return pc2.create_cloud(header, fields, points)
 
 
 def make_pcld_4d(pts: np.ndarray) -> np.ndarray:
@@ -507,11 +532,18 @@ class GMMSLAMNode:
         self.max_range = rospy.get_param("~max_range", 10.0)
         self.voxel_size = rospy.get_param("~voxel_leaf_size", 0.05)
         self.min_points = rospy.get_param("~min_points", 50)
+        self.global_map_publish_period_s = max(
+            0.1, float(rospy.get_param("~global_map_publish_period_s", 2.0))
+        )
+        self.global_gmm_publish_period_s = max(
+            0.1, float(rospy.get_param("~global_gmm_publish_period_s", 2.0))
+        )
 
         # SOGMM parameters
         # bandwidth = bandwidth of the kernel used for the Gaussian Blurring
         # Mean Shift (GBMS) within the SOGMM algorithm
-        # so higher => fewer components, lower => more components
+        # so higher => fewer components, lower => more components. Only useful if we dont
+        # use fixed number of components.
         self.sogmm_bandwidth = rospy.get_param("~sogmm_bandwidth", 0.95)
         self.sogmm_compute = rospy.get_param("~sogmm_compute", "CPU")  # "CPU" or "GPU"
         self.sogmm_max_points = rospy.get_param(
@@ -526,9 +558,42 @@ class GMMSLAMNode:
         self.plot_first_frame = rospy.get_param("~plot_first_frame", False)
         # Backend parameters (fixed-lag smoothing only)
         self.use_fixed_lag_smoother = rospy.get_param("~use_fixed_lag_smoother", True)
-        self.fixed_lag_s = rospy.get_param("~fixed_lag_s", 0.25)
+        self.fixed_lag_s = rospy.get_param("~fixed_lag_s", 0.5)
         self.odom_noise_sigma_t = rospy.get_param("~odom_noise_sigma_t", 0.06)
         self.odom_noise_sigma_r = rospy.get_param("~odom_noise_sigma_r", 0.06)
+        self.keyframe_translation_thresh_m = float(
+            rospy.get_param("~keyframe_translation_thresh_m", 0.12)
+        )
+        self.keyframe_rotation_thresh_deg = float(
+            rospy.get_param("~keyframe_rotation_thresh_deg", 5.0)
+        )
+        self.keyframe_max_interval_s = float(
+            rospy.get_param("~keyframe_max_interval_s", 0.35)
+        )
+        self.enable_global_pose_graph = bool(
+            rospy.get_param("~enable_global_pose_graph", True)
+        )
+        self.submap_translation_thresh_m = float(
+            rospy.get_param("~submap_translation_thresh_m", 0.8)
+        )
+        self.submap_rotation_thresh_deg = float(
+            rospy.get_param("~submap_rotation_thresh_deg", 15.0)
+        )
+        self.submap_max_interval_s = float(
+            rospy.get_param("~submap_max_interval_s", 2.0)
+        )
+        self.submap_between_sigma_t = float(
+            rospy.get_param("~submap_between_sigma_t", 0.08)
+        )
+        self.submap_between_sigma_r = float(
+            rospy.get_param("~submap_between_sigma_r", 0.08)
+        )
+        self.submap_prior_sigma_t = float(
+            rospy.get_param("~submap_prior_sigma_t", 0.02)
+        )
+        self.submap_prior_sigma_r = float(
+            rospy.get_param("~submap_prior_sigma_r", 0.02)
+        )
         self.enable_async_registration = rospy.get_param(
             "~enable_async_registration", True
         )
@@ -540,7 +605,7 @@ class GMMSLAMNode:
                     "~registration_request_every_n_frames",
                     "~registration_request_stride",
                     _param_with_alias(
-                        "~registration_request_stride", "~registration_fit_stride", 3
+                        "~registration_request_stride", "~registration_fit_stride", 2
                     ),
                 )
             ),
@@ -574,6 +639,40 @@ class GMMSLAMNode:
         )
         self.registration_enqueue_cooldown_frames = max(
             0, int(rospy.get_param("~registration_enqueue_cooldown_frames", 8))
+        )
+        self.enable_loop_closure_detection = bool(
+            rospy.get_param("~enable_loop_closure_detection", True)
+        )
+        self.loop_closure_search_radius_m = float(
+            rospy.get_param("~loop_closure_search_radius_m", 3.0)
+        )
+        # min keyframe gap : how many keyframes to skip before requesting a loop closure
+        self.loop_closure_min_keyframe_gap = max(
+            10, int(rospy.get_param("~loop_closure_min_keyframe_gap", 10))
+        )
+        self.loop_closure_max_candidates = max(
+            1, int(rospy.get_param("~loop_closure_max_candidates", 100))
+        )
+        self.loop_closure_request_every_n_keyframes = max(
+            1, int(rospy.get_param("~loop_closure_request_every_n_keyframes", 2))
+        )
+        self.loop_closure_max_age_s = float(
+            rospy.get_param("~loop_closure_max_age_s", 520.0)
+        )
+        self.loop_closure_gmm_keep_keyframes = max(
+            200, int(rospy.get_param("~loop_closure_gmm_keep_keyframes", 2000))
+        )
+        self.pose_history_keep_keyframes = max(
+            600, int(rospy.get_param("~pose_history_keep_keyframes", 5000))
+        )
+        self.loop_closure_detect_score_threshold = float(
+            rospy.get_param("~loop_closure_detect_score_threshold", 0.6)
+        )
+        self.loop_closure_super_sigma_t = float(
+            rospy.get_param("~loop_closure_super_sigma_t", 0.0005)
+        )
+        self.loop_closure_super_sigma_r = float(
+            rospy.get_param("~loop_closure_super_sigma_r", 0.0005)
         )
         # Insert one async registration factor every N frames.
         self.registration_factor_every_n_frames = max(
@@ -612,6 +711,12 @@ class GMMSLAMNode:
             f"[gmmslam] range        : [{self.min_range}, {self.max_range}] m"
         )
         rospy.loginfo(f"[gmmslam] voxel_size   : {self.voxel_size} m")
+        rospy.loginfo(
+            f"[gmmslam] global map period : {self.global_map_publish_period_s:.2f} s"
+        )
+        rospy.loginfo(
+            f"[gmmslam] global gmm period : {self.global_gmm_publish_period_s:.2f} s"
+        )
 
         if HAS_SOGMM:
             rospy.loginfo(f"[gmmslam] SOGMM bandwidth     : {self.sogmm_bandwidth}")
@@ -631,6 +736,16 @@ class GMMSLAMNode:
             rospy.logwarn("[gmmslam] SOGMM unavailable – fitting will be skipped")
         rospy.loginfo(f"[gmmslam] use_fixed_lag    : {self.use_fixed_lag_smoother}")
         rospy.loginfo(f"[gmmslam] fixed_lag_s      : {self.fixed_lag_s}")
+        rospy.loginfo(
+            f"[gmmslam] keyframe trigger : {self.keyframe_translation_thresh_m:.3f} m | "
+            f"{self.keyframe_rotation_thresh_deg:.2f} deg | "
+            f"{self.keyframe_max_interval_s:.3f} s max"
+        )
+        rospy.loginfo(
+            f"[gmmslam] global pose graph : {self.enable_global_pose_graph} | "
+            f"submap trigger {self.submap_translation_thresh_m:.2f} m / "
+            f"{self.submap_rotation_thresh_deg:.1f} deg / {self.submap_max_interval_s:.2f} s"
+        )
         rospy.loginfo(f"[gmmslam] async reg enabled : {self.enable_async_registration}")
         rospy.loginfo(
             f"[gmmslam] reg request every N frames: {self.registration_request_every_n_frames}"
@@ -646,6 +761,16 @@ class GMMSLAMNode:
         )
         rospy.loginfo(
             f"[gmmslam] strong factor threshold: {self.loop_closure_score_threshold}"
+        )
+        rospy.loginfo(
+            f"[gmmslam] loop closure detect: {self.enable_loop_closure_detection} | "
+            f"radius={self.loop_closure_search_radius_m:.2f} m | "
+            f"score>={self.loop_closure_detect_score_threshold:.2f}"
+        )
+        rospy.loginfo(
+            f"[gmmslam] loop history: age<={self.loop_closure_max_age_s:.1f}s | "
+            f"gmm_keep={self.loop_closure_gmm_keep_keyframes} | "
+            f"pose_keep={self.pose_history_keep_keyframes}"
         )
         rospy.loginfo(
             f"[gmmslam] odom noise (t/r) : {self.odom_noise_sigma_t} / {self.odom_noise_sigma_r}"
@@ -675,13 +800,26 @@ class GMMSLAMNode:
         self.path = Path()
         self.map_pts: list = []  # accumulated map points (list of np arrays)
         self.map_decimate = 5  # add 1 out of N frames to map
-        self._map_cloud_last_pub_t = 0.0  # throttle np.vstack+publish to 2 Hz
+        self._map_cloud_last_pub_t = 0.0
+        self._global_gmm_markers_last_pub_t = 0.0
+        self._global_gmm_next_id = 0
+        self._latest_gmm_idx = -1
+        self._last_global_gmm_processed_idx = -1
+        self._latest_gmm_model = None
+        self._local_gmms_by_idx = {}
+        self._global_gmm_markers = MarkerArray()
+        self._pose_by_idx = {0: self.pose.copy()}
 
         self._frame_count = 0
+        self._next_key_idx = 0
         self._latest_key_idx = 0
+        self._last_keyframe_pose = None
+        self._last_keyframe_t_sec = None
+        self._pending_keyframe_rel = None
         self._first_cloud_seen = False
         self._reg_lock = threading.Lock()
         self._graph_lock = threading.Lock()
+        self._global_graph_lock = threading.Lock()
         self._key_t_sec: dict = {}  # frame_idx -> t_sec for lag-window checks
         self._reg_fit_queue: queue.Queue = queue.Queue(
             maxsize=self.registration_queue_size
@@ -690,8 +828,19 @@ class GMMSLAMNode:
             maxsize=self.registration_result_queue_size
         )
         self._gmm_paths_by_idx = {}
+        self._pending_loop_requests = set()
+        self._loop_edges_added = set()
+        self._key_to_submap = {}
+        self._submap_pose_by_idx = {}
+        self._submap_ids = []
+        self._submap_anchor_key = {}
+        self._last_submap_idx = -1
+        self._last_submap_pose = None
+        self._last_submap_t_sec = None
+        self._global_loop_edges_added = set()
         self._dropped_reg_fit_frames = 0
         self._dropped_reg_result_msgs = 0
+        self._deferred_gtsam_batches = 0
         self._reg_enqueue_resume_frame = 0
         self._last_backpressure_log_t = 0.0
 
@@ -713,6 +862,9 @@ class GMMSLAMNode:
         self._odom_noise = None
         self._prior_noise = None
         self._loop_closure_noise = None
+        self._loop_closure_super_noise = None
+        self._submap_between_noise = None
+        self._submap_prior_noise = None
         self._fixed_lag = None
         self._new_factors = None
         self._new_values = None
@@ -760,6 +912,44 @@ class GMMSLAMNode:
             dtype=np.float64,
         )
         self._loop_closure_noise = gtsam.noiseModel.Diagonal.Sigmas(loop_sigmas)
+        loop_super_sigmas = np.array(
+            [
+                self.loop_closure_super_sigma_r,
+                self.loop_closure_super_sigma_r,
+                self.loop_closure_super_sigma_r,
+                self.loop_closure_super_sigma_t,
+                self.loop_closure_super_sigma_t,
+                self.loop_closure_super_sigma_t,
+            ],
+            dtype=np.float64,
+        )
+        self._loop_closure_super_noise = gtsam.noiseModel.Diagonal.Sigmas(
+            loop_super_sigmas
+        )
+        submap_sigmas = np.array(
+            [
+                self.submap_between_sigma_r,
+                self.submap_between_sigma_r,
+                self.submap_between_sigma_r,
+                self.submap_between_sigma_t,
+                self.submap_between_sigma_t,
+                self.submap_between_sigma_t,
+            ],
+            dtype=np.float64,
+        )
+        self._submap_between_noise = gtsam.noiseModel.Diagonal.Sigmas(submap_sigmas)
+        submap_prior_sigmas = np.array(
+            [
+                self.submap_prior_sigma_r,
+                self.submap_prior_sigma_r,
+                self.submap_prior_sigma_r,
+                self.submap_prior_sigma_t,
+                self.submap_prior_sigma_t,
+                self.submap_prior_sigma_t,
+            ],
+            dtype=np.float64,
+        )
+        self._submap_prior_noise = gtsam.noiseModel.Diagonal.Sigmas(submap_prior_sigmas)
         gt_sigmas = np.array(
             [
                 self.gt_factor_sigma_r,
@@ -773,6 +963,9 @@ class GMMSLAMNode:
         )
         self._gt_factor_noise = gtsam.noiseModel.Diagonal.Sigmas(gt_sigmas)
         self._fixed_lag = gtsam_unstable.IncrementalFixedLagSmoother(self.fixed_lag_s)
+        self._global_isam = gtsam.ISAM2(gtsam.ISAM2Params())
+        self._global_new_factors = gtsam.NonlinearFactorGraph()
+        self._global_new_values = gtsam.Values()
         map_ctor = getattr(gtsam_unstable, "FixedLagSmootherKeyTimestampMap", None)
         if map_ctor is None:
             raise RuntimeError(
@@ -803,26 +996,34 @@ class GMMSLAMNode:
         self._latest_gt_pose_raw = None
         self._gt_origin_inv = None
         self._gt_init_start_time = None
-        self._noisy_gt_pose = np.eye(4, dtype=np.float64)
-        self._noisy_gt_path = Path()
-        self._noisy_gt_path.header.frame_id = self.odom_frame
         self._graph_node_markers = MarkerArray()
         self._graph_nodes_last_pub_t = 0.0  # throttle full-array publish to 2 Hz
+        self._global_graph_markers_last_pub_t = 0.0
+        self._global_graph_path = Path()
+        self._global_graph_path.header.frame_id = self.odom_frame
 
         # ------------------------------------------------------------------
         # Publishers
         # ------------------------------------------------------------------
         self.path_pub = rospy.Publisher("~path", Path, queue_size=1)
+        self.global_graph_path_pub = rospy.Publisher(
+            "~global_graph_path", Path, queue_size=1
+        )
         self.odom_pub = rospy.Publisher("~odom", Odometry, queue_size=1)
         self.cloud_pub = rospy.Publisher("~map_cloud", PointCloud2, queue_size=1)
+        self.latest_frame_cloud_pub = rospy.Publisher(
+            "~latest_frame_cloud", PointCloud2, queue_size=1
+        )
         self.gt_path_pub = rospy.Publisher("~gt_path", Path, queue_size=1)
         self.gt_pose_pub = rospy.Publisher("~gt_pose", PoseStamped, queue_size=1)
-        self.noisy_gt_pose_pub = rospy.Publisher(
-            "~noisy_gt_pose", PoseStamped, queue_size=1
-        )
-        self.noisy_gt_path_pub = rospy.Publisher("~noisy_gt_path", Path, queue_size=1)
         self.gmm_markers_pub = rospy.Publisher(
             "~gmm_markers", MarkerArray, queue_size=1
+        )
+        self.gmm_global_markers_pub = rospy.Publisher(
+            "~gmm_global_markers", MarkerArray, queue_size=1, latch=True
+        )
+        self.global_graph_markers_pub = rospy.Publisher(
+            "~global_graph_markers", MarkerArray, queue_size=1, latch=True
         )
         self.graph_nodes_pub = rospy.Publisher(
             "~graph_nodes", MarkerArray, queue_size=1, latch=True
@@ -959,7 +1160,7 @@ class GMMSLAMNode:
         self._latest_camera_info = msg
 
     def _imu_callback(self, msg: Imu):
-        """Buffer IMU measurements for preintegration / deskewing."""
+        """Buffer IMU measurements for preintegration."""
         self._latest_imu = msg
         acc = np.array(
             [
@@ -974,6 +1175,94 @@ class GMMSLAMNode:
         self._imu_buffer.append((msg.header.stamp, acc, gyro))
         # Keep only the latest 1 second of data, 200hz
         self._imu_buffer = self._imu_buffer[-200:]
+
+    def _enqueue_loop_closure_requests(
+        self, curr_idx: int, stamp, source_path: str, sequential_prev_idx: int = None
+    ):
+        """Enqueue additional loop-closure registration requests in a spatial sphere."""
+        if not self.enable_loop_closure_detection:
+            return
+        if curr_idx < self.loop_closure_min_keyframe_gap:
+            return
+        if (curr_idx % self.loop_closure_request_every_n_keyframes) != 0:
+            return
+
+        with self._graph_lock:
+            T_curr = self._pose_by_idx.get(curr_idx)
+            if T_curr is None:
+                return
+            curr_pos = T_curr[:3, 3].copy()
+            pose_snapshot = {k: v.copy() for k, v in self._pose_by_idx.items()}
+
+        t_curr = self._key_t_sec.get(curr_idx)
+        if t_curr is None:
+            return
+
+        with self._reg_lock:
+            gmm_snapshot = dict(self._gmm_paths_by_idx)
+            pending_snapshot = set(self._pending_loop_requests)
+            added_snapshot = set(self._loop_edges_added)
+
+        # Candidate keys: old enough in index, not too old in time, and with
+        # a fitted GMM on disk.
+        near = []
+        n_age_filtered = 0
+        n_radius_filtered = 0
+        for idx, target_path in gmm_snapshot.items():
+            if idx >= curr_idx:
+                continue
+            if curr_idx - idx < self.loop_closure_min_keyframe_gap:
+                continue
+            if sequential_prev_idx is not None and idx == sequential_prev_idx:
+                continue
+            t_idx = self._key_t_sec.get(idx)
+            if t_idx is None:
+                continue
+            if (t_curr - t_idx) > self.loop_closure_max_age_s:
+                n_age_filtered += 1
+                continue
+            T_idx = pose_snapshot.get(idx)
+            if T_idx is None:
+                continue
+            d = float(np.linalg.norm(T_idx[:3, 3] - curr_pos))
+            if d > self.loop_closure_search_radius_m:
+                n_radius_filtered += 1
+                continue
+            edge = (min(idx, curr_idx), max(idx, curr_idx))
+            if edge in pending_snapshot or edge in added_snapshot:
+                continue
+            near.append((d, idx, target_path))
+
+        if not near:
+            rospy.loginfo(
+                f"[gmmslam] loop search @key {curr_idx}: 0 candidates in "
+                f"{self.loop_closure_search_radius_m:.2f} m sphere "
+                f"(age_filtered={n_age_filtered}, radius_filtered={n_radius_filtered}, "
+                f"tracked_gmms={len(gmm_snapshot)}, tracked_poses={len(pose_snapshot)})"
+            )
+            return
+        near.sort(key=lambda x: x[0])
+        selected = near[: self.loop_closure_max_candidates]
+        rospy.loginfo(
+            f"[gmmslam] loop search @key {curr_idx}: {len(near)} candidates in "
+            f"{self.loop_closure_search_radius_m:.2f} m, dispatching {len(selected)}"
+        )
+
+        for _, idx, target_path in selected:
+            payload = {
+                "prev_idx": int(idx),
+                "curr_idx": int(curr_idx),
+                "stamp": float(self._stamp_to_sec(stamp)),
+                "source_path": source_path,
+                "target_path": target_path,
+                "is_loop_closure": True,
+            }
+            self.reg_request_pub.publish(String(data=json.dumps(payload)))
+            rospy.loginfo(f"[gmmslam] loop request sent: X({idx})->X({curr_idx})")
+            with self._reg_lock:
+                self._pending_loop_requests.add(
+                    (min(int(idx), int(curr_idx)), max(int(idx), int(curr_idx)))
+                )
 
     def _registration_fit_worker_loop(self):
         """Background worker: fit GMMs and emit async registration requests."""
@@ -1013,12 +1302,19 @@ class GMMSLAMNode:
                     "stamp": float(self._stamp_to_sec(stamp)),
                     "source_path": gmm_path,
                     "target_path": prev_path,
+                    "is_loop_closure": False,
                 }
                 self.reg_request_pub.publish(String(data=json.dumps(payload)))
 
+                # Additional loop-closure candidates inside a sphere around the
+                # current estimate (limited count for bounded runtime).
+                self._enqueue_loop_closure_requests(
+                    frame_idx, stamp, gmm_path, sequential_prev_idx=prev_idx
+                )
+
                 # Keep only recent indices in memory.
                 with self._reg_lock:
-                    min_keep = max(0, frame_idx - 200)
+                    min_keep = max(0, frame_idx - self.loop_closure_gmm_keep_keyframes)
                     stale = [k for k in self._gmm_paths_by_idx.keys() if k < min_keep]
                     for k in stale:
                         del self._gmm_paths_by_idx[k]
@@ -1032,14 +1328,35 @@ class GMMSLAMNode:
         try:
             rospy.logdebug(f"[gmmslam] received registration result")
             data = json.loads(msg.data)
+            is_loop_closure = bool(data.get("is_loop_closure", False))
+            prev_idx = int(data["prev_idx"])
+            curr_idx = int(data["curr_idx"])
+            edge = (min(prev_idx, curr_idx), max(prev_idx, curr_idx))
+            if is_loop_closure:
+                with self._reg_lock:
+                    self._pending_loop_requests.discard(edge)
             if not bool(data.get("success", False)):
                 return
             score = float(data.get("score", float("-inf")))
-            if score < self.registration_score_threshold:
-                return
-            prev_idx = int(data["prev_idx"])
-            curr_idx = int(data["curr_idx"])
-            if (curr_idx % self.registration_factor_every_n_frames) != 0:
+            if is_loop_closure:
+                if (curr_idx - prev_idx) < self.loop_closure_min_keyframe_gap:
+                    rospy.loginfo(
+                        f"[gmmslam] loop rejected: X({prev_idx})->X({curr_idx}) "
+                        f"gap={curr_idx - prev_idx} < {self.loop_closure_min_keyframe_gap}"
+                    )
+                    return
+                if score < self.loop_closure_detect_score_threshold:
+                    rospy.loginfo(
+                        f"[gmmslam] loop rejected: X({prev_idx})->X({curr_idx}) "
+                        f"score={score:.4f} < {self.loop_closure_detect_score_threshold:.4f}"
+                    )
+                    return
+            else:
+                if score < self.registration_score_threshold:
+                    return
+                if (curr_idx % self.registration_factor_every_n_frames) != 0:
+                    return
+            if prev_idx >= curr_idx:
                 return
             T_list = data["transform"]
             T = np.array(T_list, dtype=np.float64).reshape(4, 4)
@@ -1052,9 +1369,31 @@ class GMMSLAMNode:
         if np.any(np.isnan(T)) or np.any(np.isinf(T)):
             return
 
-        force_loop = score >= self.loop_closure_score_threshold
+        force_loop = is_loop_closure or (score >= self.loop_closure_score_threshold)
+        use_super_loop_noise = is_loop_closure and (
+            score >= self.loop_closure_detect_score_threshold
+        )
+        if is_loop_closure:
+            rospy.loginfo(
+                f"[gmmslam] loop detected: X({prev_idx})->X({curr_idx}) "
+                f"score={score:.4f} (super_low_noise={use_super_loop_noise})"
+            )
+            if use_super_loop_noise:
+                # Feed long-term global graph even if this edge is stale for fixed-lag.
+                self._global_graph_add_loop_factor(
+                    prev_idx, curr_idx, T, rospy.Time.now()
+                )
         try:
-            self._reg_result_queue.put_nowait((prev_idx, curr_idx, T, force_loop))
+            self._reg_result_queue.put_nowait(
+                (
+                    prev_idx,
+                    curr_idx,
+                    T,
+                    force_loop,
+                    use_super_loop_noise,
+                    is_loop_closure,
+                )
+            )
         except queue.Full:
             self._dropped_reg_result_msgs += 1
 
@@ -1072,6 +1411,13 @@ class GMMSLAMNode:
             )
             self._dropped_reg_fit_frames = 0
             self._dropped_reg_result_msgs = 0
+        if self._deferred_gtsam_batches > 0:
+            rospy.logwarn(
+                "[gmmslam] backend overloaded: "
+                f"deferred smoother updates={self._deferred_gtsam_batches} "
+                "(batched and retried, not dropped)"
+            )
+            self._deferred_gtsam_batches = 0
 
     def _registration_result_worker_loop(self):
         """Unused — registration results are now drained on the lidar callback thread."""
@@ -1118,9 +1464,28 @@ class GMMSLAMNode:
         if self.enable_async_registration:
             while True:
                 try:
-                    r_prev, r_curr, r_T, r_loop = self._reg_result_queue.get_nowait()
+                    item = self._reg_result_queue.get_nowait()
+                    if len(item) >= 6:
+                        (
+                            r_prev,
+                            r_curr,
+                            r_T,
+                            r_loop,
+                            r_super_loop,
+                            r_is_loop_candidate,
+                        ) = item
+                    else:
+                        r_prev, r_curr, r_T, r_loop = item
+                        r_super_loop = False
+                        r_is_loop_candidate = False
                     self._stage_registration_factor(
-                        r_prev, r_curr, r_T, force_loop=r_loop
+                        r_prev,
+                        r_curr,
+                        r_T,
+                        force_loop=r_loop,
+                        use_super_loop_noise=r_super_loop,
+                        is_loop_candidate=r_is_loop_candidate,
+                        stamp=stamp,
                     )
                 except queue.Empty:
                     break
@@ -1130,38 +1495,67 @@ class GMMSLAMNode:
                     )
                     break
 
-        # Stage factors and enqueue GTSAM solve (non-blocking — solve runs in
-        # _gtsam_backend_loop thread).  _latest_key_idx is updated optimistically
-        # here on the lidar thread so that registration factor lag-window checks
-        # on the next callback see the correct value immediately.
-        _staged_ok = self._fixed_lag_update_from_odom(
-            prev_idx=self._frame_count - 1,
-            curr_idx=self._frame_count,
-            stamp=stamp,
-        )
-        if _staged_ok:
-            self._latest_key_idx = self._frame_count
-        else:
-            rospy.logwarn_throttle(
-                2.0,
-                "[gmmslam] factor staging failed; keeping previous published pose",
-            )
+        # Sample noisy GT relative motion once per scan and propagate the pose
+        # continuously, even on non-keyframes.
+        gt_rel_mat = self._sample_noisy_gt_relative_pose3(stamp)
+        if gt_rel_mat is not None:
+            with self._graph_lock:
+                self.pose = self.pose @ gt_rel_mat
+            if self._pending_keyframe_rel is None:
+                self._pending_keyframe_rel = gt_rel_mat.copy()
+            else:
+                self._pending_keyframe_rel = self._pending_keyframe_rel @ gt_rel_mat
 
-        # Offload expensive fitting and registration request generation.
+        # Motion/time-triggered keyframe insertion for more even graph spacing.
+        added_keyframe = False
+        current_key_idx = self._next_key_idx
+        if self._should_add_keyframe(stamp):
+            keyframe_rel_mat = self._pending_keyframe_rel
+            _staged_ok = self._fixed_lag_update_from_odom(
+                prev_idx=current_key_idx - 1,
+                curr_idx=current_key_idx,
+                stamp=stamp,
+                gt_rel_mat=keyframe_rel_mat,
+            )
+            if _staged_ok:
+                self._latest_key_idx = current_key_idx
+                with self._graph_lock:
+                    self._last_keyframe_pose = self.pose.copy()
+                self._last_keyframe_t_sec = self._stamp_to_sec(stamp)
+                self._pending_keyframe_rel = None
+                self._global_graph_update_with_keyframe(current_key_idx, stamp)
+                self._next_key_idx += 1
+                added_keyframe = True
+            else:
+                rospy.logwarn_throttle(
+                    2.0,
+                    "[gmmslam] factor staging failed; keeping previous published pose",
+                )
+
+        # Offload expensive fitting/registration only for accepted keyframes.
         if (
-            self.enable_async_registration
+            added_keyframe
+            and self.enable_async_registration
             and HAS_SOGMM
-            and (self._frame_count % self.registration_request_every_n_frames == 0)
-            and (self._frame_count >= self._reg_enqueue_resume_frame)
+            and (current_key_idx % self.registration_request_every_n_frames == 0)
+            and (current_key_idx >= self._reg_enqueue_resume_frame)
         ):
             try:
-                self._reg_fit_queue.put_nowait((self._frame_count, stamp, pts.copy()))
+                self._reg_fit_queue.put_nowait((current_key_idx, stamp, pts.copy()))
             except queue.Full:
+                # Keep registration current: drop oldest pending fit request and
+                # replace it with the newest keyframe instead of pausing.
                 self._dropped_reg_fit_frames += 1
-                if self.registration_enqueue_cooldown_frames > 0:
-                    self._reg_enqueue_resume_frame = (
-                        self._frame_count + self.registration_enqueue_cooldown_frames
-                    )
+                try:
+                    _ = self._reg_fit_queue.get_nowait()
+                    self._reg_fit_queue.put_nowait((current_key_idx, stamp, pts.copy()))
+                except queue.Empty:
+                    pass
+                except queue.Full:
+                    if self.registration_enqueue_cooldown_frames > 0:
+                        self._reg_enqueue_resume_frame = (
+                            current_key_idx + self.registration_enqueue_cooldown_frames
+                        )
 
         # _publish_pose_only (TF + odom) stays on the lidar thread — it is
         # small and latency-sensitive.  Everything else is handed to the vis
@@ -1237,6 +1631,14 @@ class GMMSLAMNode:
             return None
 
         self.local_gmms.append((stamp, local_model))
+        with self._reg_lock:
+            self._latest_gmm_idx = idx
+            self._latest_gmm_model = local_model
+            self._local_gmms_by_idx[idx] = (stamp, local_model)
+            # Keep only a sliding window to avoid unbounded memory use.
+            stale_idx = [k for k in self._local_gmms_by_idx.keys() if k < (idx - 400)]
+            for k in stale_idx:
+                del self._local_gmms_by_idx[k]
         n_local = local_model.n_components_
         rospy.loginfo(
             f"[gmmslam] frame {idx:4d} | "
@@ -1417,7 +1819,7 @@ class GMMSLAMNode:
         return T
 
     def _sample_noisy_gt_relative_pose3(self, stamp):
-        """Build a noisy relative GT motion to be used as a BetweenFactor."""
+        """Build a noisy relative GT motion matrix for a BetweenFactor."""
         _ = stamp
         if not self.use_noisy_gt_factor:
             return None
@@ -1440,7 +1842,165 @@ class GMMSLAMNode:
         T_noisy[:3, :3] = R_noise @ T_rel_gt[:3, :3]
         T_noisy[:3, 3] = T_rel_gt[:3, 3] + trans_noise
         self._last_gt_T_for_factor = T_curr_gt
-        return self._pose3_from_matrix(T_noisy)
+        return T_noisy
+
+    def _should_add_keyframe(self, stamp) -> bool:
+        """Motion + time trigger for graph keyframe insertion."""
+        if self._next_key_idx == 0:
+            return True
+        if self._last_keyframe_pose is None or self._last_keyframe_t_sec is None:
+            return True
+
+        t_sec = self._stamp_to_sec(stamp)
+        dt = t_sec - self._last_keyframe_t_sec
+        if dt >= self.keyframe_max_interval_s:
+            return True
+
+        with self._graph_lock:
+            T_now = self.pose.copy()
+        T_rel = np.linalg.inv(self._last_keyframe_pose) @ T_now
+        dtrans = float(np.linalg.norm(T_rel[:3, 3]))
+        drot_deg = float(np.degrees(Rotation.from_matrix(T_rel[:3, :3]).magnitude()))
+        if dtrans >= self.keyframe_translation_thresh_m:
+            return True
+        if drot_deg >= self.keyframe_rotation_thresh_deg:
+            return True
+        return False
+
+    def _should_create_submap(self, T_curr: np.ndarray, t_sec: float) -> bool:
+        """Create a submap when motion/time thresholds are met."""
+        if self._last_submap_pose is None or self._last_submap_t_sec is None:
+            return True
+        if (t_sec - self._last_submap_t_sec) >= self.submap_max_interval_s:
+            return True
+        T_rel = np.linalg.inv(self._last_submap_pose) @ T_curr
+        dtrans = float(np.linalg.norm(T_rel[:3, 3]))
+        drot_deg = float(np.degrees(Rotation.from_matrix(T_rel[:3, :3]).magnitude()))
+        return (
+            dtrans >= self.submap_translation_thresh_m
+            or drot_deg >= self.submap_rotation_thresh_deg
+        )
+
+    def _global_graph_commit(self, stamp):
+        """Commit pending global-graph factors/values and publish path."""
+        if not self.enable_global_pose_graph:
+            return
+        with self._global_graph_lock:
+            try:
+                self._global_isam.update(
+                    self._global_new_factors, self._global_new_values
+                )
+                self._global_new_factors.resize(0)
+                self._global_new_values.clear()
+                est = self._global_isam.calculateEstimate()
+            except Exception as e:
+                rospy.logwarn_throttle(
+                    2.0, f"[gmmslam] global graph update failed: {e}"
+                )
+                return
+
+            path = Path()
+            path.header.stamp = stamp
+            path.header.frame_id = self.odom_frame
+            for sid in self._submap_ids:
+                key = X(sid)
+                try:
+                    T_sid = self._matrix_from_pose3(est.atPose3(key))
+                except Exception:
+                    continue
+                self._submap_pose_by_idx[sid] = T_sid
+                path.poses.append(pose_to_pose_stamped(T_sid, stamp, self.odom_frame))
+            self._global_graph_path = path
+        self.global_graph_path_pub.publish(self._global_graph_path)
+
+    def _global_graph_update_with_keyframe(self, key_idx: int, stamp):
+        """Insert/update submaps in the long-term global pose graph."""
+        if not self.enable_global_pose_graph:
+            return
+        with self._graph_lock:
+            T_curr = self._pose_by_idx.get(key_idx, self.pose).copy()
+        t_sec = self._stamp_to_sec(stamp)
+
+        if self._should_create_submap(T_curr, t_sec):
+            sid = len(self._submap_ids)
+            key_sid = X(sid)
+            with self._global_graph_lock:
+                self._global_new_values.insert(key_sid, self._pose3_from_matrix(T_curr))
+                if sid == 0:
+                    self._global_new_factors.push_back(
+                        gtsam.PriorFactorPose3(
+                            key_sid,
+                            self._pose3_from_matrix(T_curr),
+                            self._submap_prior_noise,
+                        )
+                    )
+                else:
+                    T_prev = self._last_submap_pose
+                    rel = np.linalg.inv(T_prev) @ T_curr
+                    self._global_new_factors.push_back(
+                        gtsam.BetweenFactorPose3(
+                            X(self._last_submap_idx),
+                            key_sid,
+                            self._pose3_from_matrix(rel),
+                            self._submap_between_noise,
+                        )
+                    )
+            self._submap_ids.append(sid)
+            self._submap_pose_by_idx[sid] = T_curr.copy()
+            self._submap_anchor_key[sid] = key_idx
+            self._last_submap_idx = sid
+            self._last_submap_pose = T_curr.copy()
+            self._last_submap_t_sec = t_sec
+            self._key_to_submap[key_idx] = sid
+            self._global_graph_commit(stamp)
+        else:
+            if self._last_submap_idx >= 0:
+                self._key_to_submap[key_idx] = self._last_submap_idx
+
+    def _global_graph_add_loop_factor(
+        self, prev_key_idx: int, curr_key_idx: int, T_prev_to_curr: np.ndarray, stamp
+    ):
+        """Add accepted loop closure to global submap graph with super-low noise."""
+        if not self.enable_global_pose_graph:
+            return
+        sid_prev = self._key_to_submap.get(prev_key_idx)
+        sid_curr = self._key_to_submap.get(curr_key_idx)
+        if sid_prev is None or sid_curr is None or sid_prev == sid_curr:
+            return
+        edge = (min(sid_prev, sid_curr), max(sid_prev, sid_curr))
+        if edge in self._global_loop_edges_added:
+            return
+
+        # Convert keyframe measurement to submap measurement when possible.
+        T_rel_sub = T_prev_to_curr.copy()
+        T_w_kp = self._pose_by_idx.get(prev_key_idx)
+        T_w_kc = self._pose_by_idx.get(curr_key_idx)
+        T_w_sp = self._submap_pose_by_idx.get(sid_prev)
+        T_w_sc = self._submap_pose_by_idx.get(sid_curr)
+        if (
+            T_w_kp is not None
+            and T_w_kc is not None
+            and T_w_sp is not None
+            and T_w_sc is not None
+        ):
+            T_sp_kp = np.linalg.inv(T_w_sp) @ T_w_kp
+            T_kc_sc = np.linalg.inv(T_w_kc) @ T_w_sc
+            T_rel_sub = T_sp_kp @ T_prev_to_curr @ T_kc_sc
+
+        with self._global_graph_lock:
+            self._global_new_factors.push_back(
+                gtsam.BetweenFactorPose3(
+                    X(sid_prev),
+                    X(sid_curr),
+                    self._pose3_from_matrix(T_rel_sub),
+                    self._loop_closure_super_noise,
+                )
+            )
+        self._global_loop_edges_added.add(edge)
+        rospy.loginfo(
+            f"[gmmslam] added global loop factor S({sid_prev})->S({sid_curr})"
+        )
+        self._global_graph_commit(stamp)
 
     def _reset_new_data(self):
         """Clear per-update containers (example style)."""
@@ -1478,6 +2038,14 @@ class GMMSLAMNode:
                 with self._graph_lock:
                     self.pose = new_pose
                     self._latest_key_idx = curr_idx
+                    self._pose_by_idx[curr_idx] = new_pose.copy()
+                    stale_pose_idx = [
+                        k
+                        for k in self._pose_by_idx.keys()
+                        if k < (curr_idx - self.pose_history_keep_keyframes)
+                    ]
+                    for k in stale_pose_idx:
+                        del self._pose_by_idx[k]
                 rospy.logdebug(f"[gmmslam] GTSAM backend solved at X({curr_idx})")
             except Exception as e:
                 rospy.logwarn(f"[gmmslam] GTSAM backend failed at X({curr_idx}): {e}")
@@ -1507,7 +2075,9 @@ class GMMSLAMNode:
             rospy.logwarn(f"[gmmslam] failed to initialize fixed-lag smoother: {e}")
             return False
 
-    def _fixed_lag_update_from_odom(self, prev_idx: int, curr_idx: int, stamp):
+    def _fixed_lag_update_from_odom(
+        self, prev_idx: int, curr_idx: int, stamp, gt_rel_mat: np.ndarray = None
+    ):
         """Update fixed-lag smoother with one immediate odometry-like edge.
 
         This path never waits for heavy registration; it inserts an identity
@@ -1544,30 +2114,18 @@ class GMMSLAMNode:
         )
 
         # --- Optional noisy-GT between factor ----------------------------
-        noisy_gt_rel_pose = self._sample_noisy_gt_relative_pose3(stamp)
-        if noisy_gt_rel_pose is not None:
+        if gt_rel_mat is not None:
+            noisy_gt_rel_pose = self._pose3_from_matrix(gt_rel_mat)
             self._new_factors.push_back(
                 gtsam.BetweenFactorPose3(
                     key_prev, key_curr, noisy_gt_rel_pose, self._gt_factor_noise
                 )
             )
-            gt_rel_mat = self._matrix_from_pose3(noisy_gt_rel_pose)
             rospy.logdebug(
                 f"[gmmslam] added noisy GT between X({prev_idx})->X({curr_idx}) "
                 f"| dtrans={np.linalg.norm(gt_rel_mat[:3,3]):.3f} m"
                 f"| drot={Rotation.from_matrix(gt_rel_mat[:3,:3]).magnitude():.3f} rad"
             )
-            # Accumulate and publish noisy GT here on the lidar thread — the
-            # messages are small so serialization does not block publishing.
-            self._noisy_gt_pose = self._noisy_gt_pose @ gt_rel_mat
-            noisy_gt_ps = pose_to_pose_stamped(
-                self._noisy_gt_pose, stamp, self.odom_frame
-            )
-            self._noisy_gt_path.header.stamp = stamp
-            self._noisy_gt_path.poses.append(noisy_gt_ps)
-            # Publish single pose here (small, fast). Path is O(N) — publish
-            # from the vis thread to avoid stalling the lidar callback.
-            self.noisy_gt_pose_pub.publish(noisy_gt_ps)
 
         self._new_values.insert(key_curr, self._pose3_from_matrix(predicted_T))
         self._timestamps_insert(key_curr, t_sec)
@@ -1590,11 +2148,18 @@ class GMMSLAMNode:
                 (curr_idx, factors_snap, values_snap, timestamps_snap)
             )
         except queue.Full:
-            rospy.logwarn_throttle(
-                2.0,
-                f"[gmmslam] GTSAM queue full; dropping solve for X({curr_idx}) "
-                f"(pose estimate will be stale until next accepted frame)",
-            )
+            # Do not drop factors: keep this snapshot staged so it gets batched
+            # with the next frame and retried on the next callback.
+            self._new_factors = factors_snap
+            self._new_values = values_snap
+            self._new_timestamps = timestamps_snap
+            self._deferred_gtsam_batches += 1
+
+        # Publish/predict the latest pose even if the backend solve is deferred.
+        with self._graph_lock:
+            self.pose = predicted_T.copy()
+            self._latest_key_idx = curr_idx
+            self._pose_by_idx[curr_idx] = predicted_T.copy()
         return True
 
     def _stage_registration_factor(
@@ -1603,6 +2168,9 @@ class GMMSLAMNode:
         curr_idx: int,
         T_prev_to_curr: np.ndarray,
         force_loop: bool = False,
+        use_super_loop_noise: bool = False,
+        is_loop_candidate: bool = False,
+        stamp=None,
     ):
         """Push a registration between-factor into _new_factors without calling update().
 
@@ -1631,15 +2199,27 @@ class GMMSLAMNode:
         key_prev = X(prev_idx)
         key_curr = X(curr_idx)
         rel_pose = self._pose3_from_matrix(T_prev_to_curr)
+        edge = (min(prev_idx, curr_idx), max(prev_idx, curr_idx))
+        if is_loop_candidate and edge in self._loop_edges_added:
+            return
         self._new_factors.push_back(
             gtsam.BetweenFactorPose3(key_prev, key_curr, rel_pose, self._odom_noise)
         )
         if force_loop:
-            self._new_factors.push_back(
-                gtsam.BetweenFactorPose3(
-                    key_prev, key_curr, rel_pose, self._loop_closure_noise
-                )
+            loop_noise = (
+                self._loop_closure_super_noise
+                if use_super_loop_noise
+                else self._loop_closure_noise
             )
+            self._new_factors.push_back(
+                gtsam.BetweenFactorPose3(key_prev, key_curr, rel_pose, loop_noise)
+            )
+            if is_loop_candidate:
+                self._loop_edges_added.add(edge)
+                if stamp is not None and use_super_loop_noise:
+                    self._global_graph_add_loop_factor(
+                        prev_idx, curr_idx, T_prev_to_curr, stamp
+                    )
         if force_loop:
             rospy.loginfo(
                 f"[gmmslam] staged loop-closure factor X({prev_idx})->X({curr_idx})"
@@ -1699,24 +2279,30 @@ class GMMSLAMNode:
         self.path.poses.append(ps)
         self.path_pub.publish(self.path)
 
-        # --- Noisy GT path (O(N) — kept off the lidar callback thread) ---
-        self.noisy_gt_path_pub.publish(self._noisy_gt_path)
+        # Transform current scan into world frame (odom_frame defaults to "world").
+        ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+        pts_h = np.hstack([pts.astype(np.float64), ones])  # (N,4)
+        pts_w = (T @ pts_h.T).T[:, :3].astype(np.float32)
 
-        # --- Accumulated map cloud (throttled) ---
+        # --- Latest frame cloud (red, world frame) ---
+        self.latest_frame_cloud_pub.publish(
+            numpy_to_pc2_rgb(pts_w, stamp, self.odom_frame, r=255, g=0, b=0)
+        )
+
+        # --- Accumulated global map cloud (gray, slow refresh) ---
         if frame_count % self.map_decimate == 0:
-            # Transform current scan into world frame and append.
-            ones = np.ones((pts.shape[0], 1), dtype=np.float64)
-            pts_h = np.hstack([pts.astype(np.float64), ones])  # (N,4)
-            pts_w = (T @ pts_h.T).T[:, :3].astype(np.float32)
             self.map_pts.append(pts_w)
 
-        # Publish the accumulated cloud at most every 2 s.  np.vstack rebuilds
-        # the full O(N) array — doing this every 5 frames caused the vis thread
-        # to spend seconds here as the map grows.
+        # Publish the accumulated cloud at a slow rate to keep viz responsive.
         now_t = self._stamp_to_sec(stamp)
-        if len(self.map_pts) > 0 and (now_t - self._map_cloud_last_pub_t) >= 2.0:
+        if (
+            len(self.map_pts) > 0
+            and (now_t - self._map_cloud_last_pub_t) >= self.global_map_publish_period_s
+        ):
             all_pts = np.vstack(self.map_pts)
-            self.cloud_pub.publish(numpy_to_pc2(all_pts, stamp, self.odom_frame))
+            self.cloud_pub.publish(
+                numpy_to_pc2_rgb(all_pts, stamp, self.odom_frame, r=140, g=140, b=140)
+            )
             self._map_cloud_last_pub_t = now_t
 
         # --- Graph node markers ---
@@ -1746,89 +2332,197 @@ class GMMSLAMNode:
             self.graph_nodes_pub.publish(self._graph_node_markers)
             self._graph_nodes_last_pub_t = now_t
 
+        # --- Global submap graph markers (green nodes + loop edges) ---
+        self._publish_global_graph_markers(stamp, now_t)
+
         # --- GMM component eigenvalue markers ---
         self._publish_gmm_markers(stamp, T)
 
-    def _publish_gmm_markers(self, stamp, T: np.ndarray):
-        """Publish a MarkerArray of ellipsoids representing the most recent local GMM.
-
-        Each SPHERE marker is scaled along its three principal axes by 2·√λᵢ
-        (1-σ extent) and oriented by the eigenvectors of the 3×3 covariance,
-        giving a true covariance ellipsoid in RViz.  The mean is transformed
-        into odom_frame via the current pose.
-        Color encodes λ₁ (largest eigenvalue): blue = compact, red = spread out.
-        """
-        if not self.local_gmms:
+    def _publish_global_graph_markers(self, stamp, now_t: float):
+        """Publish global submap nodes and loop-closure edges for RViz."""
+        if not self.enable_global_pose_graph:
             return
-        _, gmm = self.local_gmms[-1]
-        K = gmm.n_components_ if hasattr(gmm, "n_components_") else gmm.n_components
+        if (now_t - self._global_graph_markers_last_pub_t) < 0.5:
+            return
 
-        # Covariances may be stored as (K, D, D) or flattened (K, D*D).
-        D = gmm.means_.shape[1]
-        covs_raw = gmm.covariances_
-        if covs_raw.ndim == 2:  # flattened (K, D*D)
-            covs_raw = covs_raw.reshape(K, D, D)
-
-        R_world = T[:3, :3]
-
-        # Pre-scan λ₁ for color normalization.
-        lambda1_all = np.empty(K, dtype=np.float64)
-        for k in range(K):
-            eigvals = np.linalg.eigvalsh(covs_raw[k, :3, :3])
-            lambda1_all[k] = max(float(eigvals[-1]), 1e-9)
-        lmin, lmax = lambda1_all.min(), lambda1_all.max()
-        lrange = max(lmax - lmin, 1e-12)
+        with self._global_graph_lock:
+            submap_ids = list(self._submap_ids)
+            submap_poses = {
+                sid: self._submap_pose_by_idx.get(sid) for sid in submap_ids
+            }
+            loop_edges = list(self._global_loop_edges_added)
 
         ma = MarkerArray()
-        for k in range(K):
-            cov3 = covs_raw[k, :3, :3]
-            # Symmetrize to guard against floating-point asymmetry.
-            cov3 = 0.5 * (cov3 + cov3.T)
-            eigvals, eigvecs = np.linalg.eigh(cov3)  # ascending; eigvecs are columns
-            eigvals = np.maximum(eigvals, 1e-9)
 
-            # Rotate eigenvectors into world frame and build a quaternion.
-            # eigvecs columns form a rotation matrix R_local (cov frame → sensor frame).
-            # Ensure right-handed by fixing determinant.
-            R_local = eigvecs.copy()
-            if np.linalg.det(R_local) < 0:
-                R_local[:, 0] *= -1
-            R_marker = R_world @ R_local
-            q = Rotation.from_matrix(R_marker).as_quat()  # [x, y, z, w]
-
-            mu_h = np.array([*gmm.means_[k, :3], 1.0], dtype=np.float64)
-            mu_w = (T @ mu_h)[:3]
-
-            t_norm = (lambda1_all[k] - lmin) / lrange  # 0..1
-
+        # Submap nodes: green spheres.
+        for sid in submap_ids:
+            T_sid = submap_poses.get(sid)
+            if T_sid is None:
+                continue
             m = Marker()
             m.header.stamp = stamp
             m.header.frame_id = self.odom_frame
-            m.ns = "gmm_ellipsoids"
-            m.id = k
+            m.ns = "global_submaps"
+            m.id = int(sid)
             m.type = Marker.SPHERE
             m.action = Marker.ADD
-            m.pose.position.x = float(mu_w[0])
-            m.pose.position.y = float(mu_w[1])
-            m.pose.position.z = float(mu_w[2])
-            m.pose.orientation.x = float(q[0])
-            m.pose.orientation.y = float(q[1])
-            m.pose.orientation.z = float(q[2])
-            m.pose.orientation.w = float(q[3])
-            # Scale = 2·√λ per axis (1-σ ellipsoid diameters).
-            # eigvals are in ascending order; assign to x/y/z of the marker axes.
-            s = 2.0 * self.gmm_marker_sigma
-            m.scale.x = max(s * np.sqrt(eigvals[0]), 0.02)
-            m.scale.y = max(s * np.sqrt(eigvals[1]), 0.02)
-            m.scale.z = max(s * np.sqrt(eigvals[2]), 0.02)
-            m.color.r = float(t_norm)
-            m.color.g = 0.2
-            m.color.b = float(1.0 - t_norm)
-            m.color.a = float(min(max(gmm.weights_[k] * K, 0.1), 1.0))
-            m.lifetime = rospy.Duration(2.0)
+            m.pose.position.x = float(T_sid[0, 3])
+            m.pose.position.y = float(T_sid[1, 3])
+            m.pose.position.z = float(T_sid[2, 3])
+            m.pose.orientation.w = 1.0
+            m.scale.x = 0.08
+            m.scale.y = 0.08
+            m.scale.z = 0.08
+            m.color.r = 0.0
+            m.color.g = 1.0
+            m.color.b = 0.0
+            m.color.a = 0.95
             ma.markers.append(m)
 
-        self.gmm_markers_pub.publish(ma)
+        # Loop closures: magenta line segments between submaps.
+        loop_marker = Marker()
+        loop_marker.header.stamp = stamp
+        loop_marker.header.frame_id = self.odom_frame
+        loop_marker.ns = "global_loops"
+        loop_marker.id = 0
+        loop_marker.type = Marker.LINE_LIST
+        loop_marker.action = Marker.ADD
+        loop_marker.pose.orientation.w = 1.0
+        loop_marker.scale.x = 0.05
+        loop_marker.color.r = 1.0
+        loop_marker.color.g = 0.0
+        loop_marker.color.b = 1.0
+        loop_marker.color.a = 0.95
+        for sid_a, sid_b in loop_edges:
+            Ta = submap_poses.get(sid_a)
+            Tb = submap_poses.get(sid_b)
+            if Ta is None or Tb is None:
+                continue
+            p0 = Point()
+            p0.x = float(Ta[0, 3])
+            p0.y = float(Ta[1, 3])
+            p0.z = float(Ta[2, 3])
+            p1 = Point()
+            p1.x = float(Tb[0, 3])
+            p1.y = float(Tb[1, 3])
+            p1.z = float(Tb[2, 3])
+            loop_marker.points.append(p0)
+            loop_marker.points.append(p1)
+        if len(loop_marker.points) > 0:
+            ma.markers.append(loop_marker)
+
+        self.global_graph_markers_pub.publish(ma)
+        self._global_graph_markers_last_pub_t = now_t
+
+    def _publish_gmm_markers(self, stamp, T: np.ndarray):
+        """Publish latest (red) and global (gray) Gaussian ellipsoid markers."""
+
+        def _make_markers(
+            gmm, T_world, ns, color_rgb, alpha, id_start=0, lifetime_s=0.0
+        ):
+            ma = MarkerArray()
+            if gmm is None:
+                return ma
+            K = gmm.n_components_ if hasattr(gmm, "n_components_") else gmm.n_components
+            D = gmm.means_.shape[1]
+            covs_raw = gmm.covariances_
+            if covs_raw.ndim == 2:
+                covs_raw = covs_raw.reshape(K, D, D)
+
+            R_world = T_world[:3, :3]
+            for k in range(K):
+                cov3 = 0.5 * (covs_raw[k, :3, :3] + covs_raw[k, :3, :3].T)
+                eigvals, eigvecs = np.linalg.eigh(cov3)
+                eigvals = np.maximum(eigvals, 1e-9)
+                R_local = eigvecs.copy()
+                if np.linalg.det(R_local) < 0:
+                    R_local[:, 0] *= -1
+                q = Rotation.from_matrix(R_world @ R_local).as_quat()
+
+                mu_h = np.array([*gmm.means_[k, :3], 1.0], dtype=np.float64)
+                mu_w = (T_world @ mu_h)[:3]
+
+                m = Marker()
+                m.header.stamp = stamp
+                m.header.frame_id = self.odom_frame
+                m.ns = ns
+                m.id = int(id_start + k)
+                m.type = Marker.SPHERE
+                m.action = Marker.ADD
+                m.pose.position.x = float(mu_w[0])
+                m.pose.position.y = float(mu_w[1])
+                m.pose.position.z = float(mu_w[2])
+                m.pose.orientation.x = float(q[0])
+                m.pose.orientation.y = float(q[1])
+                m.pose.orientation.z = float(q[2])
+                m.pose.orientation.w = float(q[3])
+                s = 2.0 * self.gmm_marker_sigma
+                m.scale.x = max(s * np.sqrt(eigvals[0]), 0.02)
+                m.scale.y = max(s * np.sqrt(eigvals[1]), 0.02)
+                m.scale.z = max(s * np.sqrt(eigvals[2]), 0.02)
+                m.color.r = float(color_rgb[0])
+                m.color.g = float(color_rgb[1])
+                m.color.b = float(color_rgb[2])
+                m.color.a = float(alpha)
+                m.lifetime = (
+                    rospy.Duration(lifetime_s)
+                    if lifetime_s > 0.0
+                    else rospy.Duration(0.0)
+                )
+                ma.markers.append(m)
+            return ma
+
+        # Latest-frame Gaussian ellipsoids (red, world frame).
+        with self._reg_lock:
+            latest_idx = int(self._latest_gmm_idx)
+            latest_gmm = self._latest_gmm_model
+        if latest_gmm is not None:
+            with self._graph_lock:
+                T_latest = self._pose_by_idx.get(latest_idx, T).copy()
+            latest_ma = _make_markers(
+                latest_gmm,
+                T_latest,
+                ns="gmm_latest",
+                color_rgb=(1.0, 0.0, 0.0),
+                alpha=0.9,
+                id_start=0,
+                lifetime_s=0.6,
+            )
+            self.gmm_markers_pub.publish(latest_ma)
+
+        # Global Gaussian map (gray, slow refresh): accumulate from fitted local GMMs.
+        with self._reg_lock:
+            new_idx = sorted(
+                k
+                for k in self._local_gmms_by_idx.keys()
+                if k > self._last_global_gmm_processed_idx
+                and (k % self.map_decimate == 0)
+            )
+            for idx in new_idx:
+                _, gmm_i = self._local_gmms_by_idx[idx]
+                with self._graph_lock:
+                    T_i = self._pose_by_idx.get(idx, T).copy()
+                ma_i = _make_markers(
+                    gmm_i,
+                    T_i,
+                    ns="gmm_global",
+                    color_rgb=(0.5, 0.5, 0.5),
+                    alpha=0.35,
+                    id_start=self._global_gmm_next_id,
+                    lifetime_s=0.0,
+                )
+                self._global_gmm_markers.markers.extend(ma_i.markers)
+                self._global_gmm_next_id += len(ma_i.markers)
+                self._last_global_gmm_processed_idx = max(
+                    self._last_global_gmm_processed_idx, idx
+                )
+
+        now_t = self._stamp_to_sec(stamp)
+        if (
+            now_t - self._global_gmm_markers_last_pub_t
+        ) >= self.global_gmm_publish_period_s:
+            self.gmm_global_markers_pub.publish(self._global_gmm_markers)
+            self._global_gmm_markers_last_pub_t = now_t
 
 
 def main():

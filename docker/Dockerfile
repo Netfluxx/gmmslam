@@ -134,7 +134,8 @@ COPY config/ /opt/gmmslam/config/
 RUN mkdir -p /opt/gmmslam/scripts && \
     printf '#!/usr/bin/env bash\nexec python3 /opt/gmmslam/python/gmmslam.py "$@"\n' > /opt/gmmslam/scripts/gmmslam_node.py && \
     printf '#!/usr/bin/env bash\nexec python3 /opt/gmmslam/python/d2d_registration_node.py "$@"\n' > /opt/gmmslam/scripts/d2d_registration_node.py && \
-    chmod +x /opt/gmmslam/scripts/gmmslam_node.py /opt/gmmslam/scripts/d2d_registration_node.py
+    printf '#!/usr/bin/env bash\nexec python3 /opt/gmmslam/python/noisy_gt_publisher_node.py "$@"\n' > /opt/gmmslam/scripts/noisy_gt_publisher_node.py && \
+    chmod +x /opt/gmmslam/scripts/gmmslam_node.py /opt/gmmslam/scripts/d2d_registration_node.py /opt/gmmslam/scripts/noisy_gt_publisher_node.py
 
 # --- RViz visualization ---
 RUN mkdir -p /opt/gmmslam/rviz

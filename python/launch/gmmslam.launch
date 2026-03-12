@@ -12,8 +12,32 @@
   <arg name="strong_factor_score_threshold" default="2.0"/>
   <arg name="strong_factor_sigma_t" default="0.01"/>
   <arg name="strong_factor_sigma_r" default="0.01"/>
+  <arg name="enable_loop_closure_detection" default="true"/>
+  <arg name="loop_closure_search_radius_m" default="2.5"/>
+  <arg name="loop_closure_min_keyframe_gap" default="10"/>
+  <arg name="loop_closure_max_candidates" default="3"/>
+  <arg name="loop_closure_request_every_n_keyframes" default="2"/>
+  <arg name="loop_closure_max_age_s" default="720.0"/>
+  <arg name="loop_closure_gmm_keep_keyframes" default="2000"/>
+  <arg name="pose_history_keep_keyframes" default="5000"/>
+  <arg name="loop_closure_detect_score_threshold" default="0.6"/>
+  <arg name="loop_closure_super_sigma_t" default="0.001"/>
+  <arg name="loop_closure_super_sigma_r" default="0.001"/>
   <arg name="solve_after_registration_factor" default="false"/>
-  <arg name="registration_workers" default="2"/>
+  <arg name="registration_workers" default="4"/>
+  <arg name="enable_global_pose_graph" default="true"/>
+  <arg name="submap_translation_thresh_m" default="0.75"/>
+  <arg name="submap_rotation_thresh_deg" default="15.0"/>
+  <arg name="submap_max_interval_s" default="2.0"/>
+  <arg name="submap_between_sigma_t" default="0.08"/>
+  <arg name="submap_between_sigma_r" default="0.08"/>
+  <arg name="submap_prior_sigma_t" default="0.02"/>
+  <arg name="submap_prior_sigma_r" default="0.02"/>
+  <arg name="gt_topic" default="/m500_1/mavros/local_position/pose"/>
+  <arg name="gt_init_wait_s" default="3.0"/>
+  <arg name="gt_noise_sigma_t" default="0.0"/>
+  <arg name="gt_noise_sigma_r" default="0.0"/>
+  <arg name="gt_noise_seed" default="-1"/>
 
   <!-- Preprocessing -->
   <arg name="min_range"        default="0.1"/>
@@ -21,6 +45,9 @@
   <arg name="voxel_leaf_size"  default="0.05"/>
 
   <!-- GMM -->
+  <arg name="sogmm_max_points" default="400"/>
+  <arg name="sogmm_n_components" default="100"/>
+  <!-- Deprecated legacy args kept only for compatibility; not used by gmmslam.py -->
   <arg name="n_components"     default="50"/>
   <arg name="covariance_mode"  default="isoplanar"/>
 
@@ -53,14 +80,41 @@
     <param name="strong_factor_score_threshold" value="$(arg strong_factor_score_threshold)"/>
     <param name="strong_factor_sigma_t" value="$(arg strong_factor_sigma_t)"/>
     <param name="strong_factor_sigma_r" value="$(arg strong_factor_sigma_r)"/>
+    <param name="enable_loop_closure_detection" value="$(arg enable_loop_closure_detection)"/>
+    <param name="loop_closure_search_radius_m" value="$(arg loop_closure_search_radius_m)"/>
+    <param name="loop_closure_min_keyframe_gap" value="$(arg loop_closure_min_keyframe_gap)"/>
+    <param name="loop_closure_max_candidates" value="$(arg loop_closure_max_candidates)"/>
+    <param name="loop_closure_request_every_n_keyframes" value="$(arg loop_closure_request_every_n_keyframes)"/>
+    <param name="loop_closure_max_age_s" value="$(arg loop_closure_max_age_s)"/>
+    <param name="loop_closure_gmm_keep_keyframes" value="$(arg loop_closure_gmm_keep_keyframes)"/>
+    <param name="pose_history_keep_keyframes" value="$(arg pose_history_keep_keyframes)"/>
+    <param name="loop_closure_detect_score_threshold" value="$(arg loop_closure_detect_score_threshold)"/>
+    <param name="loop_closure_super_sigma_t" value="$(arg loop_closure_super_sigma_t)"/>
+    <param name="loop_closure_super_sigma_r" value="$(arg loop_closure_super_sigma_r)"/>
     <param name="solve_after_registration_factor" value="$(arg solve_after_registration_factor)"/>
     <param name="registration_request_topic" value="/gmmslam_node/registration/request"/>
     <param name="registration_result_topic"  value="/gmmslam_node/registration/result"/>
+    <param name="enable_global_pose_graph" value="$(arg enable_global_pose_graph)"/>
+    <param name="submap_translation_thresh_m" value="$(arg submap_translation_thresh_m)"/>
+    <param name="submap_rotation_thresh_deg" value="$(arg submap_rotation_thresh_deg)"/>
+    <param name="submap_max_interval_s" value="$(arg submap_max_interval_s)"/>
+    <param name="submap_between_sigma_t" value="$(arg submap_between_sigma_t)"/>
+    <param name="submap_between_sigma_r" value="$(arg submap_between_sigma_r)"/>
+    <param name="submap_prior_sigma_t" value="$(arg submap_prior_sigma_t)"/>
+    <param name="submap_prior_sigma_r" value="$(arg submap_prior_sigma_r)"/>
+    <param name="gt_topic" value="$(arg gt_topic)"/>
+    <param name="gt_init_wait_s" value="$(arg gt_init_wait_s)"/>
+    <param name="gt_noise_sigma_t" value="$(arg gt_noise_sigma_t)"/>
+    <param name="gt_noise_sigma_r" value="$(arg gt_noise_sigma_r)"/>
+    <param name="gt_noise_seed" value="$(arg gt_noise_seed)"/>
 
     <param name="min_range"        value="$(arg min_range)"/>
     <param name="max_range"        value="$(arg max_range)"/>
     <param name="voxel_leaf_size"  value="$(arg voxel_leaf_size)"/>
+    <param name="sogmm_max_points" value="$(arg sogmm_max_points)"/>
+    <param name="sogmm_n_components" value="$(arg sogmm_n_components)"/>
 
+    <!-- legacy compatibility params (ignored by current gmmslam.py) -->
     <param name="n_components"     value="$(arg n_components)"/>
     <param name="covariance_mode"  value="$(arg covariance_mode)"/>
 
@@ -77,6 +131,18 @@
     <param name="result_topic"  value="/gmmslam_node/registration/result"/>
     <param name="num_workers"   value="$(arg registration_workers)"/>
     <param name="score_threshold" value="$(arg registration_score_threshold)"/>
+  </node>
+
+  <node pkg="gmmslam" type="noisy_gt_publisher_node.py"
+        name="noisy_gt_publisher_node" output="screen" respawn="true">
+    <param name="gt_topic" value="$(arg gt_topic)"/>
+    <param name="odom_frame" value="$(arg odom_frame)"/>
+    <param name="gt_init_wait_s" value="$(arg gt_init_wait_s)"/>
+    <param name="gt_noise_sigma_t" value="$(arg gt_noise_sigma_t)"/>
+    <param name="gt_noise_sigma_r" value="$(arg gt_noise_sigma_r)"/>
+    <param name="gt_noise_seed" value="$(arg gt_noise_seed)"/>
+    <param name="pose_topic" value="/gmmslam_node/noisy_gt_pose"/>
+    <param name="path_topic" value="/gmmslam_node/noisy_gt_path"/>
   </node>
 
 </launch>
