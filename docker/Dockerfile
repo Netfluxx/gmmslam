@@ -151,6 +151,7 @@ RUN printf '#!/usr/bin/env bash\n'\
 'cd %s/gira3d-reconstruction && source ./workon\n'\
 'export ROS_PACKAGE_PATH="/opt/gmmslam:${ROS_PACKAGE_PATH}"\n'\
 'export PYTHONPATH="%s/gira3d-registration/wet/install/gmm_d2d_registration_py:%s/gira3d-registration/wet/install/gmm:%s/gira3d-registration/wet/install/gmm_d2d_registration:%s/gira3d-registration/wet/src/gmm_d2d_registration_examples/python:${PYTHONPATH}:/opt/gmmslam/python"\n'\
+'rosrun rviz rviz -d ~/rviz_setup_gmmslam/clean_rviz_gmmslam.rviz >/tmp/gmmslam_rviz.log 2>&1 &\n'\
 'exec roslaunch /opt/gmmslam/python/launch/gmmslam.launch "$@"\n' \
       "${ROS_DISTRO}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" "${GIRA_WS}" > /usr/local/bin/run_gmmslam && \
     chmod +x /usr/local/bin/run_gmmslam

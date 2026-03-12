@@ -239,15 +239,12 @@ def project_gmm_4d_to_3d(gmm_4d):
     return filter_well_conditioned_gmm(gmm_3d)
 
 
-def filter_well_conditioned_gmm(
-    gmm_3d, max_condition_number: float = 1e8, min_det: float = 1e-12, reg: float = 1e-6
-):
-    """Keep only components with numerically well-conditioned 3x3 covariances.
+def filter_well_conditioned_gmm(gmm_3d, reg: float = 1e-4):
+    """Keep only components with well-conditioned 3x3 covariances.
 
-    Thresholds are intentionally loose so that planar (high-condition-number)
-    components are kept: isoplanar_registration specifically needs them.
-    Only truly degenerate components (NaN/Inf, non-positive eigenvalues) are
-    dropped.
+    Only drops components with NaN/Inf or non-positive eigenvalues after
+    regularization.  Planar (near-singular) components are intentionally kept
+    because isoplanar_registration specifically relies on them.
     """
     from sklearn.mixture import GaussianMixture
 
@@ -257,8 +254,6 @@ def filter_well_conditioned_gmm(
         K = int(getattr(gmm_3d, "n_components_", getattr(gmm_3d, "n_components")))
     keep = []
     dropped_bad = []
-    dropped_singular = []
-    dropped_ill = []
 
     for k in range(K):
         cov = gmm_3d.covariances_[k].copy()
@@ -266,49 +261,35 @@ def filter_well_conditioned_gmm(
             dropped_bad.append(k)
             continue
 
-        cov = 0.5 * (cov + cov.T)
+        # Symmetrize and regularize before eigenvalue check.
+        cov = 0.5 * (cov + cov.T) + reg * np.eye(3)
         try:
             eigvals = np.linalg.eigvalsh(cov)
         except np.linalg.LinAlgError:
             dropped_bad.append(k)
             continue
 
-        if np.any(np.isnan(eigvals)) or np.any(np.isinf(eigvals)):
+        if (
+            np.any(np.isnan(eigvals))
+            or np.any(np.isinf(eigvals))
+            or eigvals.min() <= 0.0
+        ):
             dropped_bad.append(k)
-            continue
-
-        min_eigval = eigvals.min()
-        max_eigval = eigvals.max()
-        det = float(np.prod(eigvals))
-        if min_eigval <= 0.0 or det <= min_det:
-            dropped_singular.append(k)
-            continue
-
-        condition_number = max_eigval / min_eigval
-        if condition_number > max_condition_number:
-            dropped_ill.append(k)
             continue
 
         keep.append((k, cov))
 
     if dropped_bad:
-        rospy.logwarn(
-            f"[filter_gmm] dropped {len(dropped_bad)}/{K} components (NaN/Inf or eigendecomposition failure): {dropped_bad[:10]}"
-        )
-    if dropped_singular:
-        rospy.logwarn(
-            f"[filter_gmm] dropped {len(dropped_singular)}/{K} singular/near-singular components (det <= {min_det}): {dropped_singular[:10]}"
-        )
-    if dropped_ill:
-        rospy.logwarn(
-            f"[filter_gmm] dropped {len(dropped_ill)}/{K} ill-conditioned components (cond > {max_condition_number}): {dropped_ill[:10]}"
+        rospy.logwarn_throttle(
+            10.0,
+            f"[filter_gmm] dropped {len(dropped_bad)}/{K} bad components (NaN/Inf/non-PD): {dropped_bad[:5]}",
         )
 
     if not keep:
         raise ValueError("No well-conditioned covariance matrices left after filtering")
 
     keep_idx = [i for i, _ in keep]
-    covs = np.stack([cov + reg * np.eye(3) for _, cov in keep], axis=0)
+    covs = np.stack([cov for _, cov in keep], axis=0)  # reg already applied above
     weights = gmm_3d.weights_[keep_idx].astype(np.float64)
     weights_sum = weights.sum()
     if weights_sum <= 0.0 or not np.isfinite(weights_sum):
@@ -323,7 +304,12 @@ def filter_well_conditioned_gmm(
     filtered.converged_ = True
     filtered.n_iter_ = 0
     filtered.lower_bound_ = -np.inf
-    filtered.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(covs))
+    # Compute precisions_cholesky_ with extra regularization for near-planar covs.
+    try:
+        filtered.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(covs))
+    except np.linalg.LinAlgError:
+        covs_safe = covs + 1e-3 * np.eye(3)
+        filtered.precisions_cholesky_ = np.linalg.cholesky(np.linalg.inv(covs_safe))
 
     if len(keep_idx) != K:
         rospy.loginfo(
@@ -491,6 +477,17 @@ class GMMSLAMNode:
     def __init__(self):
         rospy.init_node("gmmslam_node", anonymous=False)
 
+        def _param_with_alias(new_name: str, old_name: str, default):
+            """Read new param name first, then legacy name."""
+            if rospy.has_param(new_name):
+                return rospy.get_param(new_name)
+            if rospy.has_param(old_name):
+                rospy.logwarn_once(
+                    f"[gmmslam] parameter '{old_name}' is deprecated, use '{new_name}'"
+                )
+                return rospy.get_param(old_name)
+            return default
+
         # ------------------------------------------------------------------
         # Parameters
         # ------------------------------------------------------------------
@@ -511,7 +508,7 @@ class GMMSLAMNode:
         self.sogmm_bandwidth = rospy.get_param("~sogmm_bandwidth", 0.05)
         self.sogmm_compute = rospy.get_param("~sogmm_compute", "CPU")  # "CPU" or "GPU"
         self.sogmm_max_points = rospy.get_param(
-            "~sogmm_max_points", 1000
+            "~sogmm_max_points", 300
         )  # subsample before fitting (0 = no cap)
         self.sogmm_n_components = rospy.get_param(
             "~sogmm_n_components", 200
@@ -519,17 +516,39 @@ class GMMSLAMNode:
         self.plot_first_frame = rospy.get_param("~plot_first_frame", False)
         # Backend parameters (fixed-lag smoothing only)
         self.use_fixed_lag_smoother = rospy.get_param("~use_fixed_lag_smoother", True)
-        self.fixed_lag_s = rospy.get_param("~fixed_lag_s", 3.0)
+        self.fixed_lag_s = rospy.get_param("~fixed_lag_s", 0.25)
         self.odom_noise_sigma_t = rospy.get_param("~odom_noise_sigma_t", 0.06)
         self.odom_noise_sigma_r = rospy.get_param("~odom_noise_sigma_r", 0.06)
         self.enable_async_registration = rospy.get_param(
             "~enable_async_registration", True
         )
-        self.registration_fit_stride = max(
-            1, int(rospy.get_param("~registration_fit_stride", 3))
+        # Enqueue one registration request every N frames.
+        self.registration_request_every_n_frames = max(
+            1,
+            int(
+                _param_with_alias(
+                    "~registration_request_every_n_frames",
+                    "~registration_request_stride",
+                    _param_with_alias(
+                        "~registration_request_stride", "~registration_fit_stride", 3
+                    ),
+                )
+            ),
         )
         self.registration_score_threshold = float(
             rospy.get_param("~registration_score_threshold", -1.0e9)
+        )
+        # If score exceeds this threshold, add an extra strong factor on that edge.
+        self.loop_closure_score_threshold = float(
+            _param_with_alias(
+                "~strong_factor_score_threshold", "~loop_closure_score_threshold", 2.0
+            )
+        )
+        self.loop_closure_sigma_t = float(
+            _param_with_alias("~strong_factor_sigma_t", "~loop_closure_sigma_t", 0.01)
+        )
+        self.loop_closure_sigma_r = float(
+            _param_with_alias("~strong_factor_sigma_r", "~loop_closure_sigma_r", 0.01)
         )
         self.registration_request_topic = rospy.get_param(
             "~registration_request_topic", "/gmmslam_node/registration/request"
@@ -540,11 +559,36 @@ class GMMSLAMNode:
         self.registration_queue_size = max(
             1, int(rospy.get_param("~registration_queue_size", 8))
         )
+        self.registration_result_queue_size = max(
+            1, int(rospy.get_param("~registration_result_queue_size", 64))
+        )
+        # Insert one async registration factor every N frames.
+        self.registration_factor_every_n_frames = max(
+            1,
+            int(
+                _param_with_alias(
+                    "~registration_factor_every_n_frames",
+                    "~registration_factor_stride",
+                    _param_with_alias(
+                        "~registration_factor_stride", "~registration_apply_stride", 1
+                    ),
+                )
+            ),
+        )
+        # Whether to solve and publish immediately when an async registration arrives.
+        self.solve_on_registration_result = bool(
+            _param_with_alias(
+                "~solve_after_registration_factor",
+                "~solve_on_registration_result",
+                False,
+            )
+        )
+        self.gt_init_wait_s = float(rospy.get_param("~gt_init_wait_s", 3.0))
         self.use_noisy_gt_factor = rospy.get_param("~use_noisy_gt_factor", True)
-        self.gt_noise_sigma_t = rospy.get_param("~gt_noise_sigma_t", 0.05)
-        self.gt_noise_sigma_r = rospy.get_param("~gt_noise_sigma_r", 0.03)
-        self.gt_factor_sigma_t = rospy.get_param("~gt_factor_sigma_t", 0.15)
-        self.gt_factor_sigma_r = rospy.get_param("~gt_factor_sigma_r", 0.10)
+        self.gt_noise_sigma_t = rospy.get_param("~gt_noise_sigma_t", 0.00)
+        self.gt_noise_sigma_r = rospy.get_param("~gt_noise_sigma_r", 0.00)
+        self.gt_factor_sigma_t = rospy.get_param("~gt_factor_sigma_t", 0.0001)
+        self.gt_factor_sigma_r = rospy.get_param("~gt_factor_sigma_r", 0.0001)
         self.gt_noise_seed = rospy.get_param("~gt_noise_seed", -1)
 
         rospy.loginfo(f"[gmmslam] lidar_topic  : {self.lidar_topic}")
@@ -575,9 +619,20 @@ class GMMSLAMNode:
         rospy.loginfo(f"[gmmslam] use_fixed_lag    : {self.use_fixed_lag_smoother}")
         rospy.loginfo(f"[gmmslam] fixed_lag_s      : {self.fixed_lag_s}")
         rospy.loginfo(f"[gmmslam] async reg enabled : {self.enable_async_registration}")
-        rospy.loginfo(f"[gmmslam] reg fit stride    : {self.registration_fit_stride}")
+        rospy.loginfo(
+            f"[gmmslam] reg request every N frames: {self.registration_request_every_n_frames}"
+        )
         rospy.loginfo(
             f"[gmmslam] reg score threshold: {self.registration_score_threshold}"
+        )
+        rospy.loginfo(
+            f"[gmmslam] reg factor every N frames : {self.registration_factor_every_n_frames}"
+        )
+        rospy.loginfo(
+            f"[gmmslam] solve after reg factor: {self.solve_on_registration_result}"
+        )
+        rospy.loginfo(
+            f"[gmmslam] strong factor threshold: {self.loop_closure_score_threshold}"
         )
         rospy.loginfo(
             f"[gmmslam] odom noise (t/r) : {self.odom_noise_sigma_t} / {self.odom_noise_sigma_r}"
@@ -610,10 +665,14 @@ class GMMSLAMNode:
 
         self._frame_count = 0
         self._latest_key_idx = 0
+        self._first_cloud_seen = False
         self._reg_lock = threading.Lock()
         self._graph_lock = threading.Lock()
         self._reg_fit_queue: queue.Queue = queue.Queue(
             maxsize=self.registration_queue_size
+        )
+        self._reg_result_queue: queue.Queue = queue.Queue(
+            maxsize=self.registration_result_queue_size
         )
         self._gmm_paths_by_idx = {}
 
@@ -634,6 +693,7 @@ class GMMSLAMNode:
         # Fixed-lag backend state (same pattern as GTSAM example)
         self._odom_noise = None
         self._prior_noise = None
+        self._loop_closure_noise = None
         self._fixed_lag = None
         self._new_factors = None
         self._new_values = None
@@ -669,6 +729,18 @@ class GMMSLAMNode:
         self._odom_noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas)
         self._odom_noise_lost = gtsam.noiseModel.Diagonal.Sigmas(sigmas * 10.0)
         self._prior_noise = gtsam.noiseModel.Diagonal.Sigmas(sigmas * 0.1)
+        loop_sigmas = np.array(
+            [
+                self.loop_closure_sigma_r,
+                self.loop_closure_sigma_r,
+                self.loop_closure_sigma_r,
+                self.loop_closure_sigma_t,
+                self.loop_closure_sigma_t,
+                self.loop_closure_sigma_t,
+            ],
+            dtype=np.float64,
+        )
+        self._loop_closure_noise = gtsam.noiseModel.Diagonal.Sigmas(loop_sigmas)
         gt_sigmas = np.array(
             [
                 self.gt_factor_sigma_r,
@@ -706,6 +778,9 @@ class GMMSLAMNode:
         self._gt_path = Path()
         self._gt_path.header.frame_id = self.odom_frame
         self._latest_gt_pose = None
+        self._latest_gt_pose_raw = None
+        self._gt_origin_inv = None
+        self._gt_init_start_time = None
 
         # ------------------------------------------------------------------
         # Publishers
@@ -714,6 +789,7 @@ class GMMSLAMNode:
         self.odom_pub = rospy.Publisher("~odom", Odometry, queue_size=1)
         self.cloud_pub = rospy.Publisher("~map_cloud", PointCloud2, queue_size=1)
         self.gt_path_pub = rospy.Publisher("~gt_path", Path, queue_size=1)
+        self.gt_pose_pub = rospy.Publisher("~gt_pose", PoseStamped, queue_size=1)
         self.reg_request_pub = rospy.Publisher(
             self.registration_request_topic, String, queue_size=10
         )
@@ -752,6 +828,10 @@ class GMMSLAMNode:
                 target=self._registration_fit_worker_loop, daemon=True
             )
             self._reg_worker.start()
+            self._reg_result_worker = threading.Thread(
+                target=self._registration_result_worker_loop, daemon=True
+            )
+            self._reg_result_worker.start()
 
         # With use_sim_time=true rospy holds callbacks until the clock ticks.
         # Block here until time is valid so we don't silently drop messages.
@@ -760,6 +840,10 @@ class GMMSLAMNode:
             while not rospy.is_shutdown() and rospy.Time.now().is_zero():
                 rospy.sleep(0.1)
             rospy.loginfo("[gmmslam] clock started, ready")
+        self._gt_init_start_time = rospy.Time.now()
+        rospy.loginfo(
+            f"[gmmslam] waiting {self.gt_init_wait_s:.1f}s before GT frame reset initialization"
+        )
 
         rospy.loginfo("[gmmslam] node ready, waiting for point clouds …")
 
@@ -768,15 +852,51 @@ class GMMSLAMNode:
     # ------------------------------------------------------------------
 
     def _gt_callback(self, msg: PoseStamped):
-        """Accumulate ground truth path and republish for visualization."""
-        self._latest_gt_pose = msg
-        ps = PoseStamped()
-        ps.header = msg.header
-        ps.header.frame_id = self.odom_frame
-        ps.pose = msg.pose
-        self._gt_path.header.stamp = msg.header.stamp
+        """Accumulate GT path after resetting first valid pose to odom origin."""
+        self._latest_gt_pose_raw = msg
+        if not self._ensure_gt_origin_initialized(msg.header.stamp):
+            return
+
+        T_gt_webots = self._pose_msg_to_matrix(msg.pose)
+        T_gt_odom = self._gt_origin_inv @ T_gt_webots
+        ps = pose_to_pose_stamped(T_gt_odom, msg.header.stamp, self.odom_frame)
+        self._latest_gt_pose = ps
+        self._gt_path.header.stamp = ps.header.stamp
         self._gt_path.poses.append(ps)
+        self.gt_pose_pub.publish(ps)
         self.gt_path_pub.publish(self._gt_path)
+
+    def _ensure_gt_origin_initialized(self, stamp) -> bool:
+        """Initialize GT origin after configured startup wait."""
+        if self._gt_origin_inv is not None:
+            return True
+        if self._gt_init_start_time is None:
+            self._gt_init_start_time = rospy.Time.now()
+        now = rospy.Time.now()
+        if now.is_zero():
+            now = stamp
+        elapsed = self._stamp_to_sec(now) - self._stamp_to_sec(self._gt_init_start_time)
+        if elapsed < self.gt_init_wait_s:
+            rospy.logwarn_throttle(
+                2.0,
+                f"[gmmslam] waiting for GT initialization window ({elapsed:.2f}/{self.gt_init_wait_s:.2f}s)",
+            )
+            return False
+        if self._latest_gt_pose_raw is None:
+            rospy.logwarn_throttle(
+                2.0,
+                "[gmmslam] GT init window elapsed but no GT pose received yet on gt_topic",
+            )
+            return False
+
+        T0 = self._pose_msg_to_matrix(self._latest_gt_pose_raw.pose)
+        self._gt_origin_inv = np.linalg.inv(T0)
+        self._gt_path = Path()
+        self._gt_path.header.frame_id = self.odom_frame
+        rospy.loginfo(
+            f"[gmmslam] GT origin initialized after {elapsed:.2f}s (GT reset to odom origin)"
+        )
+        return True
 
     def _depth_callback(self, msg: Image):
         """Store the latest 32FC1 depth image (reserved for future processing)."""
@@ -821,8 +941,16 @@ class GMMSLAMNode:
 
                 with self._reg_lock:
                     self._gmm_paths_by_idx[frame_idx] = gmm_path
-                    prev_idx = frame_idx - 1
-                    prev_path = self._gmm_paths_by_idx.get(prev_idx)
+                    # Find the most recently fitted frame before this one.
+                    prev_idx = max(
+                        (k for k in self._gmm_paths_by_idx.keys() if k < frame_idx),
+                        default=None,
+                    )
+                    prev_path = (
+                        self._gmm_paths_by_idx.get(prev_idx)
+                        if prev_idx is not None
+                        else None
+                    )
 
                 if prev_path is None:
                     continue
@@ -848,8 +976,9 @@ class GMMSLAMNode:
                 )
 
     def _registration_result_callback(self, msg: String):
-        """Apply async registration result as an extra graph factor."""
+        """Parse async registration result and enqueue graph update."""
         try:
+            rospy.logdebug(f"[gmmslam] received registration result")
             data = json.loads(msg.data)
             if not bool(data.get("success", False)):
                 return
@@ -858,6 +987,8 @@ class GMMSLAMNode:
                 return
             prev_idx = int(data["prev_idx"])
             curr_idx = int(data["curr_idx"])
+            if (curr_idx % self.registration_factor_every_n_frames) != 0:
+                return
             T_list = data["transform"]
             T = np.array(T_list, dtype=np.float64).reshape(4, 4)
         except Exception as e:
@@ -869,7 +1000,33 @@ class GMMSLAMNode:
         if np.any(np.isnan(T)) or np.any(np.isinf(T)):
             return
 
-        self._add_async_registration_factor(prev_idx, curr_idx, T)
+        force_loop = score >= self.loop_closure_score_threshold
+        try:
+            self._reg_result_queue.put_nowait((prev_idx, curr_idx, T, force_loop))
+        except queue.Full:
+            rospy.logwarn_throttle(
+                2.0,
+                "[gmmslam] registration result queue full; dropping this result",
+            )
+
+    def _registration_result_worker_loop(self):
+        """Consume parsed registration results and apply graph updates."""
+        while not rospy.is_shutdown():
+            try:
+                item = self._reg_result_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            try:
+                prev_idx, curr_idx, T, force_loop = item
+                self._add_async_registration_factor(
+                    prev_idx, curr_idx, T, force_loop=force_loop
+                )
+            except Exception as e:
+                rospy.logwarn_throttle(
+                    2.0, f"[gmmslam] registration result worker error: {e}"
+                )
 
     def _pcl_callback(self, msg: PointCloud2):
         try:
@@ -881,10 +1038,13 @@ class GMMSLAMNode:
             rospy.logerr(traceback.format_exc())
 
     def _pcl_callback_inner(self, msg: PointCloud2):
-        if self._frame_count == 0:
+        if not self._first_cloud_seen:
             rospy.loginfo("[gmmslam] first point cloud received, processing started")
+            self._first_cloud_seen = True
 
         stamp = msg.header.stamp
+        if not self._ensure_gt_origin_initialized(stamp):
+            return
 
         # 1. Convert to numpy
         pts = pc2_to_numpy(msg)
@@ -923,7 +1083,7 @@ class GMMSLAMNode:
         if (
             self.enable_async_registration
             and HAS_SOGMM
-            and (self._frame_count % self.registration_fit_stride == 0)
+            and (self._frame_count % self.registration_request_every_n_frames == 0)
         ):
             try:
                 self._reg_fit_queue.put_nowait((self._frame_count, stamp, pts.copy()))
@@ -1050,97 +1210,97 @@ class GMMSLAMNode:
     # see: https://github.com/gira3d/gmm_d2d_registration_examples/blob/082377d71d49201955b253e796ac6ca94fbfa904/python/registration_example.py
     # ------------------------------------------------------------------
 
-    def _register_gmm(self, source_path: str, target_path: str) -> np.ndarray:
-        """Register source GMM to target GMM using D2D registration.
+    # def _register_gmm(self, source_path: str, target_path: str) -> np.ndarray:
+    #     """Register source GMM to target GMM using D2D registration.
 
-        Performs two-stage registration:
-          1. isoplanar_registration - fast alignment
-          2. anisotropic_registration - refinement
+    #     Performs two-stage registration:
+    #       1. isoplanar_registration - fast alignment
+    #       2. anisotropic_registration - refinement
 
-        Parameters
-        ----------
-        source_path : str
-            Path to current frame's .gmm file
-        target_path : str
-            Path to previous frame's .gmm file
+    #     Parameters
+    #     ----------
+    #     source_path : str
+    #         Path to current frame's .gmm file
+    #     target_path : str
+    #         Path to previous frame's .gmm file
 
-        Returns
-        -------
-        T : (4,4) np.ndarray or None
-            returns the source in the target frame so T_target -> source
-            Returns None if registration failed.
-        """
-        if not HAS_GMM_REGISTRATION:
-            return None
+    #     Returns
+    #     -------
+    #     T : (4,4) np.ndarray or None
+    #         returns the source in the target frame so T_target -> source
+    #         Returns None if registration failed.
+    #     """
+    #     if not HAS_GMM_REGISTRATION:
+    #         return None
 
-        # Validate input files exist
-        if not os.path.exists(source_path):
-            rospy.logerr(f"[gmmslam] Source GMM file not found: {source_path}")
-            return None
-        if not os.path.exists(target_path):
-            rospy.logerr(f"[gmmslam] Target GMM file not found: {target_path}")
-            return None
+    #     # Validate input files exist
+    #     if not os.path.exists(source_path):
+    #         rospy.logerr(f"[gmmslam] Source GMM file not found: {source_path}")
+    #         return None
+    #     if not os.path.exists(target_path):
+    #         rospy.logerr(f"[gmmslam] Target GMM file not found: {target_path}")
+    #         return None
 
-        try:
-            # Identity is the correct neutral initialization for SE(3).
-            # A zero matrix can break/degenerate optimization, especially on pure rotations.
-            T_init = np.eye(4, dtype=np.float64)
+    #     try:
+    #         # Identity is the correct neutral initialization for SE(3).
+    #         # A zero matrix can break/degenerate optimization, especially on pure rotations.
+    #         T_init = np.eye(4, dtype=np.float64)
 
-            # Stage 1: isoplanar registration: fast initial alignment
-            result_iso = gmm_d2d_registration_py.isoplanar_registration(
-                T_init, source_path, target_path
-            )
-            T_iso = result_iso[0]
-            score_iso = result_iso[1]
+    #         # Stage 1: isoplanar registration: fast initial alignment
+    #         result_iso = gmm_d2d_registration_py.isoplanar_registration(
+    #             T_init, source_path, target_path
+    #         )
+    #         T_iso = result_iso[0]
+    #         score_iso = result_iso[1]
 
-            # Check for NaN scores or invalid transform from isoplanar stage.
-            # When isoplanar fails (no planar components in the scan) fall back
-            # to anisotropic-only, initialised from identity.
-            if (
-                np.isnan(score_iso)
-                or np.isinf(score_iso)
-                or np.any(np.isnan(T_iso))
-                or np.any(np.isinf(T_iso))
-            ):
-                rospy.logwarn(
-                    "[gmmslam] isoplanar registration failed (score: nan/inf or invalid T) "
-                    "– falling back to anisotropic-only from identity"
-                )
-                T_iso = T_init  # reset to identity so anisotropic starts clean
+    #         # Check for NaN scores or invalid transform from isoplanar stage.
+    #         # When isoplanar fails (no planar components in the scan) fall back
+    #         # to anisotropic-only, initialised from identity.
+    #         if (
+    #             np.isnan(score_iso)
+    #             or np.isinf(score_iso)
+    #             or np.any(np.isnan(T_iso))
+    #             or np.any(np.isinf(T_iso))
+    #         ):
+    #             rospy.logwarn(
+    #                 "[gmmslam] isoplanar registration failed (score: nan/inf or invalid T) "
+    #                 "– falling back to anisotropic-only from identity"
+    #             )
+    #             T_iso = T_init  # reset to identity so anisotropic starts clean
 
-            # Stage 2: anisotropic refinement
-            result_aniso = gmm_d2d_registration_py.anisotropic_registration(
-                T_iso, source_path, target_path
-            )
-            T_final = result_aniso[0]
-            score_final = result_aniso[1]
+    #         # Stage 2: anisotropic refinement
+    #         result_aniso = gmm_d2d_registration_py.anisotropic_registration(
+    #             T_iso, source_path, target_path
+    #         )
+    #         T_final = result_aniso[0]
+    #         score_final = result_aniso[1]
 
-            # Check for NaN scores (indicates ill-conditioned matrices)
-            if np.isnan(score_final) or np.isinf(score_final):
-                rospy.logwarn(f"[gmmslam] D2D aniso failed - aniso score: nan")
-                return None
+    #         # Check for NaN scores (indicates ill-conditioned matrices)
+    #         if np.isnan(score_final) or np.isinf(score_final):
+    #             rospy.logwarn(f"[gmmslam] D2D aniso failed - aniso score: nan")
+    #             return None
 
-            # Check for NaN/Inf in final transformation
-            if np.any(np.isnan(T_final)) or np.any(np.isinf(T_final)):
-                rospy.logwarn(f"[gmmslam] D2D aniso failed - ill-conditioned matrices")
-                return None
+    #         # Check for NaN/Inf in final transformation
+    #         if np.any(np.isnan(T_final)) or np.any(np.isinf(T_final)):
+    #             rospy.logwarn(f"[gmmslam] D2D aniso failed - ill-conditioned matrices")
+    #             return None
 
-            rospy.loginfo(
-                f"[gmmslam] D2D registration | iso score: {score_iso:.4f} | aniso score: {score_final:.4f}"
-            )
+    #         rospy.loginfo(
+    #             f"[gmmslam] D2D registration | iso score: {score_iso:.4f} | aniso score: {score_final:.4f}"
+    #         )
 
-            # Log transformation for debugging
-            rospy.logdebug(
-                f"[gmmslam] T_final translation: [{T_final[0,3]:.3f}, {T_final[1,3]:.3f}, {T_final[2,3]:.3f}]"
-            )
+    #         # Log transformation for debugging
+    #         rospy.logdebug(
+    #             f"[gmmslam] T_final translation: [{T_final[0,3]:.3f}, {T_final[1,3]:.3f}, {T_final[2,3]:.3f}]"
+    #         )
 
-            return T_final
-        except Exception as e:
-            rospy.logerr(f"[gmmslam] D2D registration failed: {e}")
-            import traceback
+    #         return T_final
+    #     except Exception as e:
+    #         rospy.logerr(f"[gmmslam] D2D registration failed: {e}")
+    #         import traceback
 
-            rospy.logerr(traceback.format_exc())
-            return None
+    #         rospy.logerr(traceback.format_exc())
+    #         return None
 
     def _pose3_from_matrix(self, T: np.ndarray):
         """Build gtsam.Pose3 from a 4x4 SE(3) matrix."""
@@ -1301,38 +1461,70 @@ class GMMSLAMNode:
             return False
 
     def _add_async_registration_factor(
-        self, prev_idx: int, curr_idx: int, T_prev_to_curr: np.ndarray
+        self,
+        prev_idx: int,
+        curr_idx: int,
+        T_prev_to_curr: np.ndarray,
+        force_loop: bool = False,
     ):
         """Inject async registration edge when result becomes available."""
         if prev_idx < 0:
             return
         if curr_idx > self._latest_key_idx:
-            # Variable not in graph yet; ignore and wait for a future result.
+            # Variable not in graph yet; ignore.
             return
 
         try:
             with self._graph_lock:
                 key_prev = X(prev_idx)
                 key_curr = X(curr_idx)
+
+                # Guard against keys already marginalized out of the lag window.
+                # Attempting to add a factor referencing a non-existent key corrupts
+                # the GTSAM smoother's internal state and breaks all future updates.
+                try:
+                    current_estimate = self._fixed_lag.calculateEstimate()
+                    if not current_estimate.exists(
+                        key_prev
+                    ) or not current_estimate.exists(key_curr):
+                        rospy.logdebug(
+                            f"[gmmslam] skipping stale registration factor X({prev_idx})->X({curr_idx}): "
+                            f"key(s) already marginalized from lag window"
+                        )
+                        return
+                except Exception:
+                    return
                 rel_pose = self._pose3_from_matrix(T_prev_to_curr)
                 self._new_factors.push_back(
                     gtsam.BetweenFactorPose3(
                         key_prev, key_curr, rel_pose, self._odom_noise
                     )
                 )
+                if force_loop:
+                    self._new_factors.push_back(
+                        gtsam.BetweenFactorPose3(
+                            key_prev, key_curr, rel_pose, self._loop_closure_noise
+                        )
+                    )
                 self._fixed_lag.update(
                     self._new_factors, self._new_values, self._new_timestamps
                 )
                 self._reset_new_data()
-
-                estimate = self._fixed_lag.calculateEstimate()
-                latest_key = X(self._latest_key_idx)
-                self.pose = self._matrix_from_pose3(estimate.atPose3(latest_key))
-            stamp = rospy.Time.now()
-            self._publish_pose_only(stamp)
-            rospy.logdebug(
-                f"[gmmslam] async registration factor added for X({prev_idx})->X({curr_idx})"
-            )
+                if self.solve_on_registration_result:
+                    estimate = self._fixed_lag.calculateEstimate()
+                    latest_key = X(self._latest_key_idx)
+                    self.pose = self._matrix_from_pose3(estimate.atPose3(latest_key))
+            if self.solve_on_registration_result:
+                stamp = rospy.Time.now()
+                self._publish_pose_only(stamp)
+            if force_loop:
+                rospy.loginfo(
+                    f"[gmmslam] loop-closure-strength factor added for X({prev_idx})->X({curr_idx})"
+                )
+            else:
+                rospy.logdebug(
+                    f"[gmmslam] async registration factor added for X({prev_idx})->X({curr_idx})"
+                )
         except Exception as e:
             rospy.logwarn_throttle(
                 2.0,

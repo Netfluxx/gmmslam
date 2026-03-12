@@ -5,6 +5,349 @@ Panels:
     Property Tree Widget:
       Expanded:
         - /Global Options1
+        - /Grid1
+        - /TF1
+        - /PathEstimate1
+        - /PathGroundTruth1
+      Splitter Ratio: 0.5
+    Tree Height: 650
+  - Class: rviz/Selection
+    Name: Selection
+  - Class: rviz/Tool Properties
+    Expanded:
+      - /2D Pose Estimate1
+      - /2D Nav Goal1
+    Name: Tool Properties
+    Splitter Ratio: 0.58
+  - Class: rviz/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+  - Class: rviz/Time
+    Name: Time
+    SyncMode: 0
+    SyncSource: ""
+
+Preferences:
+  PromptSaveOnExit: true
+
+Toolbars:
+  toolButtonStyle: 2
+
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Alpha: 0.35
+      Cell Size: 1
+      Plane: XY
+      Plane Cell Count: 40
+      Color: 160; 160; 164
+      Line Style:
+        Value: Lines
+        Line Width: 0.03
+      Reference Frame: <Fixed Frame>
+      Value: true
+
+    - Class: rviz/TF
+      Name: TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Alpha: 0.8
+      Marker Scale: 0.35
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Value: true
+
+    - Class: rviz/Path
+      Name: PathEstimate
+      Enabled: true
+      Topic: /gmmslam_node/path
+      Color: 25; 255; 0
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.06
+      Buffer Length: 1
+      Pose Style: None
+      Queue Size: 5
+      Value: true
+
+    - Class: rviz/Path
+      Name: PathGroundTruth
+      Enabled: true
+      Topic: /gmmslam_node/gt_path
+      Color: 255; 80; 80
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.06
+      Buffer Length: 1
+      Pose Style: None
+      Queue Size: 5
+      Value: true
+
+    - Class: rviz/Odometry
+      Name: Odometry
+      Enabled: true
+      Topic: /gmmslam_node/odom
+      Shape: Arrow
+      Color: 255; 255; 0
+      Position Tolerance: 0.1
+      Angle Tolerance: 0.1
+      Keep: 1
+      Value: true
+
+    - Class: rviz/PointCloud2
+      Name: MapCloud
+      Enabled: true
+      Topic: /gmmslam_node/map_cloud
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.02
+      Color Transformer: AxisColor
+      Axis: Z
+      Decay Time: 0
+      Queue Size: 1
+      Use Fixed Frame: true
+      Alpha: 0.7
+      Value: true
+
+    - Class: rviz/PointCloud2
+      Name: LiveDepthCloud
+      Enabled: false
+      Topic: /m500_1/mpa/depth/points
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.01
+      Color Transformer: AxisColor
+      Axis: Z
+      Decay Time: 0
+      Queue Size: 1
+      Use Fixed Frame: true
+      Alpha: 0.5
+      Value: true
+
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Default Light: true
+    Fixed Frame: world
+    Frame Rate: 60
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+      Hide Inactive Objects: true
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+    - Class: rviz/SetInitialPose
+      Topic: /initialpose
+    - Class: rviz/SetGoal
+      Topic: /move_base_simple/goal
+    - Class: rviz/PublishPoint
+      Topic: /clicked_point
+      Single click: true
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Distance: 8
+      Name: Current View
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 0.5
+      Yaw: 0.8
+      Near Clip Distance: 0.01
+      Target Frame: <Fixed Frame>
+    Saved: ~
+
+Window Geometry:
+  Displays:
+    collapsed: false
+  Selection:
+    collapsed: false
+  Tool Properties:
+    collapsed: false
+  Views:
+    collapsed: false
+  Time:
+    collapsed: false
+  Height: 980
+  Width: 1600
+  Hide Left Dock: false
+  Hide Right Dock: false
+Panels:
+  - Class: rviz/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
+        - /Grid1
+        - /TF1
+        - /PathEstimate1
+        - /PathGroundTruth1
+      Splitter Ratio: 0.5
+    Tree Height: 600
+  - Class: rviz/Views
+    Expanded:
+      - /Current View1
+    Name: Views
+    Splitter Ratio: 0.5
+  - Class: rviz/Time
+    Name: Time
+    SyncMode: 0
+    SyncSource: ""
+
+Visualization Manager:
+  Class: ""
+  Displays:
+    - Class: rviz/Grid
+      Name: Grid
+      Enabled: true
+      Alpha: 0.35
+      Cell Size: 1
+      Plane: XY
+      Plane Cell Count: 40
+      Color: 160; 160; 164
+      Line Style:
+        Value: Lines
+        Line Width: 0.03
+      Reference Frame: <Fixed Frame>
+      Value: true
+
+    - Class: rviz/TF
+      Name: TF
+      Enabled: true
+      Frame Timeout: 15
+      Marker Alpha: 0.8
+      Marker Scale: 0.35
+      Show Arrows: true
+      Show Axes: true
+      Show Names: true
+      Value: true
+
+    - Class: rviz/Path
+      Name: PathEstimate
+      Enabled: true
+      Topic: /gmmslam_node/path
+      Color: 25; 255; 0
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.06
+      Buffer Length: 1
+      Pose Style: None
+      Queue Size: 5
+      Value: true
+
+    - Class: rviz/Path
+      Name: PathGroundTruth
+      Enabled: true
+      Topic: /gmmslam_node/gt_path
+      Color: 255; 80; 80
+      Alpha: 1
+      Line Style: Billboards
+      Line Width: 0.06
+      Buffer Length: 1
+      Pose Style: None
+      Queue Size: 5
+      Value: true
+
+    - Class: rviz/Pose
+      Name: OdomPose
+      Enabled: true
+      Topic: /gmmslam_node/odom
+      Color: 255; 255; 0
+      Shape: Arrow
+      Shaft Length: 0.45
+      Shaft Radius: 0.025
+      Head Length: 0.12
+      Head Radius: 0.05
+      Queue Size: 5
+      Value: true
+
+    - Class: rviz/PointCloud2
+      Name: MapCloud
+      Enabled: true
+      Topic: /gmmslam_node/map_cloud
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.02
+      Color Transformer: AxisColor
+      Axis: Z
+      Decay Time: 0
+      Queue Size: 1
+      Use Fixed Frame: true
+      Alpha: 0.7
+      Value: true
+
+    - Class: rviz/PointCloud2
+      Name: LiveDepthCloud
+      Enabled: false
+      Topic: /m500_1/mpa/depth/points
+      Style: Points
+      Size (Pixels): 2
+      Size (m): 0.01
+      Color Transformer: AxisColor
+      Axis: Z
+      Decay Time: 0
+      Queue Size: 1
+      Use Fixed Frame: true
+      Alpha: 0.5
+      Value: true
+
+  Enabled: true
+  Global Options:
+    Background Color: 48; 48; 48
+    Default Light: true
+    Fixed Frame: world
+    Frame Rate: 60
+  Name: root
+  Tools:
+    - Class: rviz/Interact
+    - Class: rviz/MoveCamera
+    - Class: rviz/Select
+    - Class: rviz/FocusCamera
+    - Class: rviz/Measure
+    - Class: rviz/SetInitialPose
+      Topic: /initialpose
+    - Class: rviz/SetGoal
+      Topic: /move_base_simple/goal
+    - Class: rviz/PublishPoint
+      Topic: /clicked_point
+      Single click: true
+  Value: true
+  Views:
+    Current:
+      Class: rviz/Orbit
+      Name: Current View
+      Distance: 7
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Pitch: 0.55
+      Yaw: 0.8
+      Near Clip Distance: 0.01
+      Target Frame: <Fixed Frame>
+    Saved: ~
+
+Window Geometry:
+  Width: 1600
+  Height: 980
+Panels:
+  - Class: rviz/Displays
+    Help Height: 78
+    Name: Displays
+    Property Tree Widget:
+      Expanded:
+        - /Global Options1
         - /TF1
         - /DepthCloud1
       Splitter Ratio: 0.5

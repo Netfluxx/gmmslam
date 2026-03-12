@@ -6,8 +6,13 @@
   <arg name="odom_frame"       default="world"/>
   <arg name="base_frame"       default="m500_1_base_link"/>
   <arg name="enable_async_registration" default="true"/>
-  <arg name="registration_fit_stride"   default="3"/>
+  <arg name="registration_request_every_n_frames" default="2"/>
+  <arg name="registration_factor_every_n_frames"  default="2"/>
   <arg name="registration_score_threshold" default="-1e9"/>
+  <arg name="strong_factor_score_threshold" default="2.0"/>
+  <arg name="strong_factor_sigma_t" default="0.01"/>
+  <arg name="strong_factor_sigma_r" default="0.01"/>
+  <arg name="solve_after_registration_factor" default="false"/>
   <arg name="registration_workers" default="2"/>
 
   <!-- Preprocessing -->
@@ -20,9 +25,9 @@
   <arg name="covariance_mode"  default="isoplanar"/>
 
   <!-- iSAM2 -->
-  <arg name="lag"              default="5.0"/>
-  <arg name="odom_noise_rot"   default="0.01"/>
-  <arg name="odom_noise_trans" default="0.08"/>
+  <arg name="lag"              default="1.0"/>
+  <arg name="odom_noise_rot"   default="0.03"/>
+  <arg name="odom_noise_trans" default="0.03"/>
 
   <!-- Minimum valid points per cloud (below this the frame is skipped) -->
   <arg name="min_points"       default="50"/>
@@ -42,8 +47,13 @@
     <param name="odom_frame"       value="$(arg odom_frame)"/>
     <param name="base_frame"       value="$(arg base_frame)"/>
     <param name="enable_async_registration" value="$(arg enable_async_registration)"/>
-    <param name="registration_fit_stride"   value="$(arg registration_fit_stride)"/>
+    <param name="registration_request_every_n_frames" value="$(arg registration_request_every_n_frames)"/>
+    <param name="registration_factor_every_n_frames"  value="$(arg registration_factor_every_n_frames)"/>
     <param name="registration_score_threshold" value="$(arg registration_score_threshold)"/>
+    <param name="strong_factor_score_threshold" value="$(arg strong_factor_score_threshold)"/>
+    <param name="strong_factor_sigma_t" value="$(arg strong_factor_sigma_t)"/>
+    <param name="strong_factor_sigma_r" value="$(arg strong_factor_sigma_r)"/>
+    <param name="solve_after_registration_factor" value="$(arg solve_after_registration_factor)"/>
     <param name="registration_request_topic" value="/gmmslam_node/registration/request"/>
     <param name="registration_result_topic"  value="/gmmslam_node/registration/result"/>
 

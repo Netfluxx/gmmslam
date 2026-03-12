@@ -126,6 +126,11 @@ class D2DRegistrationNode:
             result["success"] = True
             result["score"] = score_final
             result["transform"] = T_final.reshape(-1).tolist()
+
+            rospy.loginfo_throttle(
+                5.0,
+                f"[d2d_reg] registration success | prev={prev_idx} curr={curr_idx} score={score_final:.4f}",
+            )
             self.result_pub.publish(String(data=json.dumps(result)))
         except Exception as e:
             rospy.logwarn_throttle(2.0, f"[d2d_reg] registration failed: {e}")
