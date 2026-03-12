@@ -14,6 +14,9 @@ Published topics:
   ~path                nav_msgs/Path              accumulated trajectory
   ~odom                nav_msgs/Odometry          current odometry estimate
   ~map_cloud           sensor_msgs/PointCloud2    accumulated map points (decimated)
+  ~noisy_gt_pose       geometry_msgs/PoseStamped  accumulated noisy GT odometry pose
+  ~noisy_gt_path       nav_msgs/Path              accumulated noisy GT trajectory
+  ~gmm_markers         visualization_msgs/MarkerArray  per-component spheres scaled by λ₁
 
 Broadcast TF:
   odom_frame → base_frame   current pose
@@ -31,6 +34,7 @@ from geometry_msgs.msg import TransformStamped, PoseStamped
 from nav_msgs.msg import Odometry, Path
 from sensor_msgs.msg import PointCloud2, Image, CameraInfo, Imu
 from std_msgs.msg import String
+from visualization_msgs.msg import Marker, MarkerArray
 import sensor_msgs.point_cloud2 as pc2
 from scipy.spatial.transform import Rotation
 
@@ -505,7 +509,10 @@ class GMMSLAMNode:
         self.min_points = rospy.get_param("~min_points", 50)
 
         # SOGMM parameters
-        self.sogmm_bandwidth = rospy.get_param("~sogmm_bandwidth", 0.05)
+        # bandwidth = bandwidth of the kernel used for the Gaussian Blurring
+        # Mean Shift (GBMS) within the SOGMM algorithm
+        # so higher => fewer components, lower => more components
+        self.sogmm_bandwidth = rospy.get_param("~sogmm_bandwidth", 0.95)
         self.sogmm_compute = rospy.get_param("~sogmm_compute", "CPU")  # "CPU" or "GPU"
         self.sogmm_max_points = rospy.get_param(
             "~sogmm_max_points", 300
@@ -513,6 +520,9 @@ class GMMSLAMNode:
         self.sogmm_n_components = rospy.get_param(
             "~sogmm_n_components", 200
         )  # fixed component count for now
+        self.gmm_marker_sigma = float(
+            rospy.get_param("~gmm_marker_sigma", 3.0)
+        )  # sigma multiplier for ellipsoid scale in RViz (3.0 = 3-sigma)
         self.plot_first_frame = rospy.get_param("~plot_first_frame", False)
         # Backend parameters (fixed-lag smoothing only)
         self.use_fixed_lag_smoother = rospy.get_param("~use_fixed_lag_smoother", True)
@@ -561,6 +571,9 @@ class GMMSLAMNode:
         )
         self.registration_result_queue_size = max(
             1, int(rospy.get_param("~registration_result_queue_size", 64))
+        )
+        self.registration_enqueue_cooldown_frames = max(
+            0, int(rospy.get_param("~registration_enqueue_cooldown_frames", 8))
         )
         # Insert one async registration factor every N frames.
         self.registration_factor_every_n_frames = max(
@@ -662,12 +675,14 @@ class GMMSLAMNode:
         self.path = Path()
         self.map_pts: list = []  # accumulated map points (list of np arrays)
         self.map_decimate = 5  # add 1 out of N frames to map
+        self._map_cloud_last_pub_t = 0.0  # throttle np.vstack+publish to 2 Hz
 
         self._frame_count = 0
         self._latest_key_idx = 0
         self._first_cloud_seen = False
         self._reg_lock = threading.Lock()
         self._graph_lock = threading.Lock()
+        self._key_t_sec: dict = {}  # frame_idx -> t_sec for lag-window checks
         self._reg_fit_queue: queue.Queue = queue.Queue(
             maxsize=self.registration_queue_size
         )
@@ -675,6 +690,10 @@ class GMMSLAMNode:
             maxsize=self.registration_result_queue_size
         )
         self._gmm_paths_by_idx = {}
+        self._dropped_reg_fit_frames = 0
+        self._dropped_reg_result_msgs = 0
+        self._reg_enqueue_resume_frame = 0
+        self._last_backpressure_log_t = 0.0
 
         # SOGMM state
         # sg         – incremental global SOGMM (builds up over all scans)
@@ -759,9 +778,12 @@ class GMMSLAMNode:
             raise RuntimeError(
                 "Fixed-lag backend requested but gtsam_unstable.FixedLagSmootherKeyTimestampMap is unavailable"
             )
+        self._map_ctor = map_ctor  # saved for container re-creation in the async path
         self._new_factors = gtsam.NonlinearFactorGraph()
         self._new_values = gtsam.Values()
         self._new_timestamps = map_ctor()
+        # Queue for the dedicated GTSAM backend thread (maxsize=2 keeps latency low).
+        self._gtsam_queue: queue.Queue = queue.Queue(maxsize=2)
         rospy.loginfo(
             f"[gmmslam] backend initialised: IncrementalFixedLagSmoother (lag={self.fixed_lag_s:.2f}s)"
         )
@@ -781,6 +803,11 @@ class GMMSLAMNode:
         self._latest_gt_pose_raw = None
         self._gt_origin_inv = None
         self._gt_init_start_time = None
+        self._noisy_gt_pose = np.eye(4, dtype=np.float64)
+        self._noisy_gt_path = Path()
+        self._noisy_gt_path.header.frame_id = self.odom_frame
+        self._graph_node_markers = MarkerArray()
+        self._graph_nodes_last_pub_t = 0.0  # throttle full-array publish to 2 Hz
 
         # ------------------------------------------------------------------
         # Publishers
@@ -790,6 +817,16 @@ class GMMSLAMNode:
         self.cloud_pub = rospy.Publisher("~map_cloud", PointCloud2, queue_size=1)
         self.gt_path_pub = rospy.Publisher("~gt_path", Path, queue_size=1)
         self.gt_pose_pub = rospy.Publisher("~gt_pose", PoseStamped, queue_size=1)
+        self.noisy_gt_pose_pub = rospy.Publisher(
+            "~noisy_gt_pose", PoseStamped, queue_size=1
+        )
+        self.noisy_gt_path_pub = rospy.Publisher("~noisy_gt_path", Path, queue_size=1)
+        self.gmm_markers_pub = rospy.Publisher(
+            "~gmm_markers", MarkerArray, queue_size=1
+        )
+        self.graph_nodes_pub = rospy.Publisher(
+            "~graph_nodes", MarkerArray, queue_size=1, latch=True
+        )
         self.reg_request_pub = rospy.Publisher(
             self.registration_request_topic, String, queue_size=10
         )
@@ -828,10 +865,25 @@ class GMMSLAMNode:
                 target=self._registration_fit_worker_loop, daemon=True
             )
             self._reg_worker.start()
-            self._reg_result_worker = threading.Thread(
-                target=self._registration_result_worker_loop, daemon=True
-            )
-            self._reg_result_worker.start()
+            # NOTE: registration results are drained on the lidar callback thread
+            # (_pcl_callback_inner) to avoid _graph_lock contention with the odom
+            # update. We do NOT start a separate result-worker thread here.
+
+        # Dedicated visualization thread — runs _publish_scan_products so that
+        # growing-message serialization (path, map cloud, GMM markers) never
+        # blocks the lidar callback thread.  maxsize=1 means we always drop the
+        # oldest pending frame if the vis thread is still busy.
+        self._vis_queue: queue.Queue = queue.Queue(maxsize=1)
+        self._vis_worker = threading.Thread(target=self._vis_loop, daemon=True)
+        self._vis_worker.start()
+
+        # Dedicated GTSAM backend thread — keeps _fixed_lag.update() and
+        # calculateEstimate() off the lidar callback thread so publishing never
+        # blocks on GTSAM latency or GIL contention with SOGMM.
+        self._gtsam_worker = threading.Thread(
+            target=self._gtsam_backend_loop, daemon=True
+        )
+        self._gtsam_worker.start()
 
         # With use_sim_time=true rospy holds callbacks until the clock ticks.
         # Block here until time is valid so we don't silently drop messages.
@@ -1004,29 +1056,26 @@ class GMMSLAMNode:
         try:
             self._reg_result_queue.put_nowait((prev_idx, curr_idx, T, force_loop))
         except queue.Full:
-            rospy.logwarn_throttle(
-                2.0,
-                "[gmmslam] registration result queue full; dropping this result",
+            self._dropped_reg_result_msgs += 1
+
+    def _log_backpressure_periodic(self, stamp):
+        """Emit sparse queue-backpressure logs outside hot loops."""
+        t_sec = self._stamp_to_sec(stamp)
+        if (t_sec - self._last_backpressure_log_t) < 5.0:
+            return
+        self._last_backpressure_log_t = t_sec
+        if self._dropped_reg_fit_frames > 0 or self._dropped_reg_result_msgs > 0:
+            rospy.logwarn(
+                "[gmmslam] async registration overloaded: "
+                f"dropped fit frames={self._dropped_reg_fit_frames}, "
+                f"dropped reg results={self._dropped_reg_result_msgs}"
             )
+            self._dropped_reg_fit_frames = 0
+            self._dropped_reg_result_msgs = 0
 
     def _registration_result_worker_loop(self):
-        """Consume parsed registration results and apply graph updates."""
-        while not rospy.is_shutdown():
-            try:
-                item = self._reg_result_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
-            if item is None:
-                break
-            try:
-                prev_idx, curr_idx, T, force_loop = item
-                self._add_async_registration_factor(
-                    prev_idx, curr_idx, T, force_loop=force_loop
-                )
-            except Exception as e:
-                rospy.logwarn_throttle(
-                    2.0, f"[gmmslam] registration result worker error: {e}"
-                )
+        """Unused — registration results are now drained on the lidar callback thread."""
+        pass
 
     def _pcl_callback(self, msg: PointCloud2):
         try:
@@ -1063,40 +1112,69 @@ class GMMSLAMNode:
                 f"[gmmslam] only {pts.shape[0]} points after filtering (< {self.min_points}), skipping",
             )
             return
-        if self._frame_count == 0:
-            self._fixed_lag_initialize(stamp)
-        # Fixed-lag update is always performed immediately on each new scan.
-        if self._frame_count > 0:
-            if not self._fixed_lag_update_from_odom(
-                prev_idx=self._frame_count - 1,
-                curr_idx=self._frame_count,
-                stamp=stamp,
-            ):
-                rospy.logwarn_throttle(
-                    2.0,
-                    "[gmmslam] fixed-lag update failed; keeping previous published pose",
-                )
-            else:
-                self._latest_key_idx = self._frame_count
+        # Stage any pending registration factors into _new_factors BEFORE the
+        # odom update so everything is committed in a single _fixed_lag.update()
+        # call.  This avoids a second expensive GTSAM update per callback.
+        if self.enable_async_registration:
+            while True:
+                try:
+                    r_prev, r_curr, r_T, r_loop = self._reg_result_queue.get_nowait()
+                    self._stage_registration_factor(
+                        r_prev, r_curr, r_T, force_loop=r_loop
+                    )
+                except queue.Empty:
+                    break
+                except Exception as e:
+                    rospy.logwarn_throttle(
+                        2.0, f"[gmmslam] registration drain error: {e}"
+                    )
+                    break
+
+        # Stage factors and enqueue GTSAM solve (non-blocking — solve runs in
+        # _gtsam_backend_loop thread).  _latest_key_idx is updated optimistically
+        # here on the lidar thread so that registration factor lag-window checks
+        # on the next callback see the correct value immediately.
+        _staged_ok = self._fixed_lag_update_from_odom(
+            prev_idx=self._frame_count - 1,
+            curr_idx=self._frame_count,
+            stamp=stamp,
+        )
+        if _staged_ok:
+            self._latest_key_idx = self._frame_count
+        else:
+            rospy.logwarn_throttle(
+                2.0,
+                "[gmmslam] factor staging failed; keeping previous published pose",
+            )
 
         # Offload expensive fitting and registration request generation.
         if (
             self.enable_async_registration
             and HAS_SOGMM
             and (self._frame_count % self.registration_request_every_n_frames == 0)
+            and (self._frame_count >= self._reg_enqueue_resume_frame)
         ):
             try:
                 self._reg_fit_queue.put_nowait((self._frame_count, stamp, pts.copy()))
             except queue.Full:
-                rospy.logwarn_throttle(
-                    2.0,
-                    "[gmmslam] registration fit queue full; dropping this frame",
-                )
+                self._dropped_reg_fit_frames += 1
+                if self.registration_enqueue_cooldown_frames > 0:
+                    self._reg_enqueue_resume_frame = (
+                        self._frame_count + self.registration_enqueue_cooldown_frames
+                    )
 
-        # Publish scan-dependent products (path/map cloud).
-        self._publish_pose_only(stamp)
-        self._publish_scan_products(stamp, pts)
-        self._frame_count += 1
+        # _publish_pose_only (TF + odom) stays on the lidar thread — it is
+        # small and latency-sensitive.  Everything else is handed to the vis
+        # thread via a drop queue so growing messages never stall this thread.
+        try:
+            self._publish_pose_only(stamp)
+            try:
+                self._vis_queue.put_nowait((stamp, pts.copy(), self._frame_count))
+            except queue.Full:
+                pass  # vis thread is busy; drop this frame's scan products
+        finally:
+            self._log_backpressure_periodic(stamp)
+            self._frame_count += 1
 
     # ------------------------------------------------------------------
     # SOGMM fitting
@@ -1377,6 +1455,33 @@ class GMMSLAMNode:
         except TypeError:
             self._new_timestamps.insert(key, float(t_sec))
 
+    def _gtsam_backend_loop(self):
+        """Dedicated GTSAM solve thread.
+
+        Drains _gtsam_queue and runs _fixed_lag.update() + calculateEstimate()
+        without ever blocking the lidar callback thread.  self.pose is updated
+        here under _graph_lock so the lidar callback always reads a consistent
+        (possibly one-frame-stale) estimate.
+        """
+        while not rospy.is_shutdown():
+            try:
+                task = self._gtsam_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if task is None:
+                break
+            curr_idx, factors, values, timestamps = task
+            try:
+                self._fixed_lag.update(factors, values, timestamps)
+                estimate = self._fixed_lag.calculateEstimate()
+                new_pose = self._matrix_from_pose3(estimate.atPose3(X(curr_idx)))
+                with self._graph_lock:
+                    self.pose = new_pose
+                    self._latest_key_idx = curr_idx
+                rospy.logdebug(f"[gmmslam] GTSAM backend solved at X({curr_idx})")
+            except Exception as e:
+                rospy.logwarn(f"[gmmslam] GTSAM backend failed at X({curr_idx}): {e}")
+
     def _fixed_lag_initialize(self, stamp):
         """Insert X0 prior and perform first fixed-lag update."""
         if self._fixed_lag_initialized:
@@ -1407,130 +1512,142 @@ class GMMSLAMNode:
 
         This path never waits for heavy registration; it inserts an identity
         motion edge with inflated noise, plus optional noisy-GT between factor.
-        Async registration factors are added later when results arrive.
+        Heavy GTSAM work (update + calculateEstimate) is offloaded to the
+        dedicated _gtsam_backend_loop thread via _gtsam_queue so the lidar
+        callback is never blocked.
+
+        When prev_idx < 0 (frame 0), there is no predecessor edge to add; the
+        smoother has already been seeded by _fixed_lag_initialize but we still
+        record the key timestamp so that registration factors can reference X(0).
         """
-        if prev_idx < 0:
-            return False
         if not self._fixed_lag_initialize(stamp):
             return False
-        try:
-            with self._graph_lock:
-                t_sec = self._stamp_to_sec(stamp)
-                key_prev = X(prev_idx)
-                key_curr = X(curr_idx)
-
-                rel_pose = gtsam.Pose3.Identity()
-                noise = self._odom_noise_lost
-                predicted_T = self.pose
-
-                self._new_factors.push_back(
-                    gtsam.BetweenFactorPose3(key_prev, key_curr, rel_pose, noise)
-                )
-                noisy_gt_rel_pose = self._sample_noisy_gt_relative_pose3(stamp)
-                if noisy_gt_rel_pose is not None:
-                    self._new_factors.push_back(
-                        gtsam.BetweenFactorPose3(
-                            key_prev, key_curr, noisy_gt_rel_pose, self._gt_factor_noise
-                        )
-                    )
-                    # Lightweight visibility to confirm GT factor is active.
-                    gt_rel_mat = self._matrix_from_pose3(noisy_gt_rel_pose)
-                    gt_dtrans = np.linalg.norm(gt_rel_mat[:3, 3])
-                    gt_drot = Rotation.from_matrix(gt_rel_mat[:3, :3]).magnitude()
-                    rospy.logdebug(
-                        f"[gmmslam] added noisy GT between X({prev_idx})->X({curr_idx}) "
-                        f"| dtrans={gt_dtrans:.3f} m | drot={gt_drot:.3f} rad"
-                    )
-                self._new_values.insert(key_curr, self._pose3_from_matrix(predicted_T))
-                self._timestamps_insert(key_curr, t_sec)
-
-                self._fixed_lag.update(
-                    self._new_factors, self._new_values, self._new_timestamps
-                )
-                self._reset_new_data()
-
-                estimate = self._fixed_lag.calculateEstimate()
-                self.pose = self._matrix_from_pose3(estimate.atPose3(key_curr))
-            rospy.logdebug(
-                f"[gmmslam] fixed-lag updated at X({curr_idx}) (identity base edge)"
-            )
+        if prev_idx < 0:
+            # Frame 0: prior already committed by _fixed_lag_initialize.
+            # Record the timestamp so _stage_registration_factor can look it up.
+            self._key_t_sec[curr_idx] = self._stamp_to_sec(stamp)
             return True
-        except Exception as e:
-            rospy.logwarn(f"[gmmslam] fixed-lag update failed at X({curr_idx}): {e}")
-            self._reset_new_data()
-            return False
 
-    def _add_async_registration_factor(
+        t_sec = self._stamp_to_sec(stamp)
+        key_prev = X(prev_idx)
+        key_curr = X(curr_idx)
+
+        # Read pose under lock (GTSAM thread may be writing concurrently).
+        with self._graph_lock:
+            predicted_T = self.pose.copy()
+
+        # --- Stage odom factor (fast, no GTSAM solve) --------------------
+        self._new_factors.push_back(
+            gtsam.BetweenFactorPose3(
+                key_prev, key_curr, gtsam.Pose3.Identity(), self._odom_noise_lost
+            )
+        )
+
+        # --- Optional noisy-GT between factor ----------------------------
+        noisy_gt_rel_pose = self._sample_noisy_gt_relative_pose3(stamp)
+        if noisy_gt_rel_pose is not None:
+            self._new_factors.push_back(
+                gtsam.BetweenFactorPose3(
+                    key_prev, key_curr, noisy_gt_rel_pose, self._gt_factor_noise
+                )
+            )
+            gt_rel_mat = self._matrix_from_pose3(noisy_gt_rel_pose)
+            rospy.logdebug(
+                f"[gmmslam] added noisy GT between X({prev_idx})->X({curr_idx}) "
+                f"| dtrans={np.linalg.norm(gt_rel_mat[:3,3]):.3f} m"
+                f"| drot={Rotation.from_matrix(gt_rel_mat[:3,:3]).magnitude():.3f} rad"
+            )
+            # Accumulate and publish noisy GT here on the lidar thread — the
+            # messages are small so serialization does not block publishing.
+            self._noisy_gt_pose = self._noisy_gt_pose @ gt_rel_mat
+            noisy_gt_ps = pose_to_pose_stamped(
+                self._noisy_gt_pose, stamp, self.odom_frame
+            )
+            self._noisy_gt_path.header.stamp = stamp
+            self._noisy_gt_path.poses.append(noisy_gt_ps)
+            # Publish single pose here (small, fast). Path is O(N) — publish
+            # from the vis thread to avoid stalling the lidar callback.
+            self.noisy_gt_pose_pub.publish(noisy_gt_ps)
+
+        self._new_values.insert(key_curr, self._pose3_from_matrix(predicted_T))
+        self._timestamps_insert(key_curr, t_sec)
+        # Record timestamp immediately so _stage_registration_factor can use it
+        # for lag-window checks on the *next* lidar callback, before the GTSAM
+        # backend thread has a chance to run.
+        self._key_t_sec[curr_idx] = t_sec
+
+        # --- Snapshot factor containers and hand off to GTSAM thread -----
+        # Swap in fresh containers so the next callback can stage immediately.
+        factors_snap = self._new_factors
+        values_snap = self._new_values
+        timestamps_snap = self._new_timestamps
+        self._new_factors = gtsam.NonlinearFactorGraph()
+        self._new_values = gtsam.Values()
+        self._new_timestamps = self._map_ctor()
+
+        try:
+            self._gtsam_queue.put_nowait(
+                (curr_idx, factors_snap, values_snap, timestamps_snap)
+            )
+        except queue.Full:
+            rospy.logwarn_throttle(
+                2.0,
+                f"[gmmslam] GTSAM queue full; dropping solve for X({curr_idx}) "
+                f"(pose estimate will be stale until next accepted frame)",
+            )
+        return True
+
+    def _stage_registration_factor(
         self,
         prev_idx: int,
         curr_idx: int,
         T_prev_to_curr: np.ndarray,
         force_loop: bool = False,
     ):
-        """Inject async registration edge when result becomes available."""
-        if prev_idx < 0:
-            return
-        if curr_idx > self._latest_key_idx:
-            # Variable not in graph yet; ignore.
+        """Push a registration between-factor into _new_factors without calling update().
+
+        Called on the lidar thread before the odom update so that registration
+        and odometry factors are committed in a single _fixed_lag.update() call.
+        Uses timestamp bookkeeping to check lag-window membership — no
+        calculateEstimate() call needed.
+        """
+        if prev_idx < 0 or curr_idx > self._latest_key_idx:
             return
 
-        try:
-            with self._graph_lock:
-                key_prev = X(prev_idx)
-                key_curr = X(curr_idx)
-
-                # Guard against keys already marginalized out of the lag window.
-                # Attempting to add a factor referencing a non-existent key corrupts
-                # the GTSAM smoother's internal state and breaks all future updates.
-                try:
-                    current_estimate = self._fixed_lag.calculateEstimate()
-                    if not current_estimate.exists(
-                        key_prev
-                    ) or not current_estimate.exists(key_curr):
-                        rospy.logdebug(
-                            f"[gmmslam] skipping stale registration factor X({prev_idx})->X({curr_idx}): "
-                            f"key(s) already marginalized from lag window"
-                        )
-                        return
-                except Exception:
-                    return
-                rel_pose = self._pose3_from_matrix(T_prev_to_curr)
-                self._new_factors.push_back(
-                    gtsam.BetweenFactorPose3(
-                        key_prev, key_curr, rel_pose, self._odom_noise
-                    )
-                )
-                if force_loop:
-                    self._new_factors.push_back(
-                        gtsam.BetweenFactorPose3(
-                            key_prev, key_curr, rel_pose, self._loop_closure_noise
-                        )
-                    )
-                self._fixed_lag.update(
-                    self._new_factors, self._new_values, self._new_timestamps
-                )
-                self._reset_new_data()
-                if self.solve_on_registration_result:
-                    estimate = self._fixed_lag.calculateEstimate()
-                    latest_key = X(self._latest_key_idx)
-                    self.pose = self._matrix_from_pose3(estimate.atPose3(latest_key))
-            if self.solve_on_registration_result:
-                stamp = rospy.Time.now()
-                self._publish_pose_only(stamp)
-            if force_loop:
-                rospy.loginfo(
-                    f"[gmmslam] loop-closure-strength factor added for X({prev_idx})->X({curr_idx})"
-                )
-            else:
-                rospy.logdebug(
-                    f"[gmmslam] async registration factor added for X({prev_idx})->X({curr_idx})"
-                )
-        except Exception as e:
-            rospy.logwarn_throttle(
-                2.0,
-                f"[gmmslam] failed to add async registration factor X({prev_idx})->X({curr_idx}): {e}",
+        # Check both keys are still within the lag window using our own timestamp
+        # records.  This is O(1) and avoids an expensive calculateEstimate() call.
+        t_prev = self._key_t_sec.get(prev_idx)
+        t_curr = self._key_t_sec.get(curr_idx)
+        if t_prev is None or t_curr is None:
+            return
+        t_latest = self._key_t_sec.get(self._latest_key_idx, 0.0)
+        if (t_latest - t_prev) > self.fixed_lag_s * 1.1:  # 10% margin
+            rospy.logdebug(
+                f"[gmmslam] skipping stale registration factor X({prev_idx})->X({curr_idx}): "
+                f"key already outside lag window"
             )
-            self._reset_new_data()
+            return
+
+        key_prev = X(prev_idx)
+        key_curr = X(curr_idx)
+        rel_pose = self._pose3_from_matrix(T_prev_to_curr)
+        self._new_factors.push_back(
+            gtsam.BetweenFactorPose3(key_prev, key_curr, rel_pose, self._odom_noise)
+        )
+        if force_loop:
+            self._new_factors.push_back(
+                gtsam.BetweenFactorPose3(
+                    key_prev, key_curr, rel_pose, self._loop_closure_noise
+                )
+            )
+        if force_loop:
+            rospy.loginfo(
+                f"[gmmslam] staged loop-closure factor X({prev_idx})->X({curr_idx})"
+            )
+        else:
+            rospy.logdebug(
+                f"[gmmslam] staged registration factor X({prev_idx})->X({curr_idx})"
+            )
 
     # ------------------------------------------------------------------
     # Publishing
@@ -1551,9 +1668,30 @@ class GMMSLAMNode:
         odom.pose.pose = pose_to_pose_stamped(T, stamp, self.odom_frame).pose
         self.odom_pub.publish(odom)
 
-    def _publish_scan_products(self, stamp, pts: np.ndarray):
-        """Publish scan-rate products that should not run at 120 Hz."""
-        T = self.pose
+    def _vis_loop(self):
+        """Dedicated visualization thread: drains _vis_queue and publishes all
+        scan-rate products whose serialization cost grows with runtime
+        (path, map cloud, GMM markers, graph nodes).
+        """
+        while not rospy.is_shutdown():
+            try:
+                item = self._vis_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+            stamp, pts, frame_count = item
+            try:
+                self._publish_scan_products(stamp, pts, frame_count)
+            except Exception as e:
+                rospy.logerr_throttle(2.0, f"[gmmslam] vis thread error: {e}")
+
+    def _publish_scan_products(self, stamp, pts: np.ndarray, frame_count: int = None):
+        """Publish scan-rate products (runs on the vis thread, NOT the lidar thread)."""
+        if frame_count is None:
+            frame_count = self._frame_count
+        with self._graph_lock:
+            T = self.pose.copy()
 
         # --- Path ---
         ps = pose_to_pose_stamped(T, stamp, self.odom_frame)
@@ -1561,17 +1699,136 @@ class GMMSLAMNode:
         self.path.poses.append(ps)
         self.path_pub.publish(self.path)
 
+        # --- Noisy GT path (O(N) — kept off the lidar callback thread) ---
+        self.noisy_gt_path_pub.publish(self._noisy_gt_path)
+
         # --- Accumulated map cloud (throttled) ---
-        if self._frame_count % self.map_decimate == 0:
-            # Transform current scan into world frame and append
+        if frame_count % self.map_decimate == 0:
+            # Transform current scan into world frame and append.
             ones = np.ones((pts.shape[0], 1), dtype=np.float64)
             pts_h = np.hstack([pts.astype(np.float64), ones])  # (N,4)
             pts_w = (T @ pts_h.T).T[:, :3].astype(np.float32)
             self.map_pts.append(pts_w)
 
-            if len(self.map_pts) > 0:  # and self.cloud_pub.get_num_connections() > 0:
-                all_pts = np.vstack(self.map_pts)
-                self.cloud_pub.publish(numpy_to_pc2(all_pts, stamp, self.odom_frame))
+        # Publish the accumulated cloud at most every 2 s.  np.vstack rebuilds
+        # the full O(N) array — doing this every 5 frames caused the vis thread
+        # to spend seconds here as the map grows.
+        now_t = self._stamp_to_sec(stamp)
+        if len(self.map_pts) > 0 and (now_t - self._map_cloud_last_pub_t) >= 2.0:
+            all_pts = np.vstack(self.map_pts)
+            self.cloud_pub.publish(numpy_to_pc2(all_pts, stamp, self.odom_frame))
+            self._map_cloud_last_pub_t = now_t
+
+        # --- Graph node markers ---
+        # Accumulate every frame but publish at most 2 Hz to avoid serializing
+        # a growing array on every lidar callback (which would block all publishers).
+        # latch=True ensures late RViz subscribers receive the full history.
+        m = Marker()
+        m.header.stamp = stamp
+        m.header.frame_id = self.odom_frame
+        m.ns = "graph_nodes"
+        m.id = frame_count
+        m.type = Marker.SPHERE
+        m.action = Marker.ADD
+        m.pose.position.x = float(T[0, 3])
+        m.pose.position.y = float(T[1, 3])
+        m.pose.position.z = float(T[2, 3])
+        m.pose.orientation.w = 1.0
+        m.scale.x = 0.08
+        m.scale.y = 0.08
+        m.scale.z = 0.08
+        m.color.r = 1.0
+        m.color.g = 0.0
+        m.color.b = 0.0
+        m.color.a = 1.0
+        self._graph_node_markers.markers.append(m)
+        if (now_t - self._graph_nodes_last_pub_t) >= 0.5:
+            self.graph_nodes_pub.publish(self._graph_node_markers)
+            self._graph_nodes_last_pub_t = now_t
+
+        # --- GMM component eigenvalue markers ---
+        self._publish_gmm_markers(stamp, T)
+
+    def _publish_gmm_markers(self, stamp, T: np.ndarray):
+        """Publish a MarkerArray of ellipsoids representing the most recent local GMM.
+
+        Each SPHERE marker is scaled along its three principal axes by 2·√λᵢ
+        (1-σ extent) and oriented by the eigenvectors of the 3×3 covariance,
+        giving a true covariance ellipsoid in RViz.  The mean is transformed
+        into odom_frame via the current pose.
+        Color encodes λ₁ (largest eigenvalue): blue = compact, red = spread out.
+        """
+        if not self.local_gmms:
+            return
+        _, gmm = self.local_gmms[-1]
+        K = gmm.n_components_ if hasattr(gmm, "n_components_") else gmm.n_components
+
+        # Covariances may be stored as (K, D, D) or flattened (K, D*D).
+        D = gmm.means_.shape[1]
+        covs_raw = gmm.covariances_
+        if covs_raw.ndim == 2:  # flattened (K, D*D)
+            covs_raw = covs_raw.reshape(K, D, D)
+
+        R_world = T[:3, :3]
+
+        # Pre-scan λ₁ for color normalization.
+        lambda1_all = np.empty(K, dtype=np.float64)
+        for k in range(K):
+            eigvals = np.linalg.eigvalsh(covs_raw[k, :3, :3])
+            lambda1_all[k] = max(float(eigvals[-1]), 1e-9)
+        lmin, lmax = lambda1_all.min(), lambda1_all.max()
+        lrange = max(lmax - lmin, 1e-12)
+
+        ma = MarkerArray()
+        for k in range(K):
+            cov3 = covs_raw[k, :3, :3]
+            # Symmetrize to guard against floating-point asymmetry.
+            cov3 = 0.5 * (cov3 + cov3.T)
+            eigvals, eigvecs = np.linalg.eigh(cov3)  # ascending; eigvecs are columns
+            eigvals = np.maximum(eigvals, 1e-9)
+
+            # Rotate eigenvectors into world frame and build a quaternion.
+            # eigvecs columns form a rotation matrix R_local (cov frame → sensor frame).
+            # Ensure right-handed by fixing determinant.
+            R_local = eigvecs.copy()
+            if np.linalg.det(R_local) < 0:
+                R_local[:, 0] *= -1
+            R_marker = R_world @ R_local
+            q = Rotation.from_matrix(R_marker).as_quat()  # [x, y, z, w]
+
+            mu_h = np.array([*gmm.means_[k, :3], 1.0], dtype=np.float64)
+            mu_w = (T @ mu_h)[:3]
+
+            t_norm = (lambda1_all[k] - lmin) / lrange  # 0..1
+
+            m = Marker()
+            m.header.stamp = stamp
+            m.header.frame_id = self.odom_frame
+            m.ns = "gmm_ellipsoids"
+            m.id = k
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+            m.pose.position.x = float(mu_w[0])
+            m.pose.position.y = float(mu_w[1])
+            m.pose.position.z = float(mu_w[2])
+            m.pose.orientation.x = float(q[0])
+            m.pose.orientation.y = float(q[1])
+            m.pose.orientation.z = float(q[2])
+            m.pose.orientation.w = float(q[3])
+            # Scale = 2·√λ per axis (1-σ ellipsoid diameters).
+            # eigvals are in ascending order; assign to x/y/z of the marker axes.
+            s = 2.0 * self.gmm_marker_sigma
+            m.scale.x = max(s * np.sqrt(eigvals[0]), 0.02)
+            m.scale.y = max(s * np.sqrt(eigvals[1]), 0.02)
+            m.scale.z = max(s * np.sqrt(eigvals[2]), 0.02)
+            m.color.r = float(t_norm)
+            m.color.g = 0.2
+            m.color.b = float(1.0 - t_norm)
+            m.color.a = float(min(max(gmm.weights_[k] * K, 0.1), 1.0))
+            m.lifetime = rospy.Duration(2.0)
+            ma.markers.append(m)
+
+        self.gmm_markers_pub.publish(ma)
 
 
 def main():
