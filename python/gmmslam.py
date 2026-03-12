@@ -568,7 +568,7 @@ class GMMSLAMNode:
             rospy.get_param("~keyframe_rotation_thresh_deg", 5.0)
         )
         self.keyframe_max_interval_s = float(
-            rospy.get_param("~keyframe_max_interval_s", 0.35)
+            rospy.get_param("~keyframe_max_interval_s", 7.0)
         )
         self.enable_global_pose_graph = bool(
             rospy.get_param("~enable_global_pose_graph", True)
@@ -580,7 +580,7 @@ class GMMSLAMNode:
             rospy.get_param("~submap_rotation_thresh_deg", 15.0)
         )
         self.submap_max_interval_s = float(
-            rospy.get_param("~submap_max_interval_s", 2.0)
+            rospy.get_param("~submap_max_interval_s", 4.0)
         )
         self.submap_between_sigma_t = float(
             rospy.get_param("~submap_between_sigma_t", 0.08)
@@ -644,7 +644,7 @@ class GMMSLAMNode:
             rospy.get_param("~enable_loop_closure_detection", True)
         )
         self.loop_closure_search_radius_m = float(
-            rospy.get_param("~loop_closure_search_radius_m", 3.0)
+            rospy.get_param("~loop_closure_search_radius_m", 2.0)
         )
         # min keyframe gap : how many keyframes to skip before requesting a loop closure
         self.loop_closure_min_keyframe_gap = max(
@@ -654,7 +654,16 @@ class GMMSLAMNode:
             1, int(rospy.get_param("~loop_closure_max_candidates", 100))
         )
         self.loop_closure_request_every_n_keyframes = max(
-            1, int(rospy.get_param("~loop_closure_request_every_n_keyframes", 2))
+            1, int(rospy.get_param("~loop_closure_request_every_n_keyframes", 5))
+        )
+        self.loop_closure_search_cooldown_keyframes = max(
+            1, int(rospy.get_param("~loop_closure_search_cooldown_keyframes", 5))
+        )
+        self.loop_closure_min_separation_m = float(
+            rospy.get_param("~loop_closure_min_separation_m", 0.8)
+        )
+        self.loop_closure_min_separation_deg = float(
+            rospy.get_param("~loop_closure_min_separation_deg", 20.0)
         )
         self.loop_closure_max_age_s = float(
             rospy.get_param("~loop_closure_max_age_s", 520.0)
@@ -666,7 +675,7 @@ class GMMSLAMNode:
             600, int(rospy.get_param("~pose_history_keep_keyframes", 5000))
         )
         self.loop_closure_detect_score_threshold = float(
-            rospy.get_param("~loop_closure_detect_score_threshold", 0.6)
+            rospy.get_param("~loop_closure_detect_score_threshold", 0.8)
         )
         self.loop_closure_super_sigma_t = float(
             rospy.get_param("~loop_closure_super_sigma_t", 0.0005)
@@ -702,6 +711,9 @@ class GMMSLAMNode:
         self.gt_factor_sigma_t = rospy.get_param("~gt_factor_sigma_t", 0.0001)
         self.gt_factor_sigma_r = rospy.get_param("~gt_factor_sigma_r", 0.0001)
         self.gt_noise_seed = rospy.get_param("~gt_noise_seed", -1)
+        self.noisy_gt_topic = rospy.get_param(
+            "~noisy_gt_topic", "/gmmslam_node/noisy_gt_pose"
+        )
 
         rospy.loginfo(f"[gmmslam] lidar_topic  : {self.lidar_topic}")
         rospy.loginfo(f"[gmmslam] sensor_frame : {self.sensor_frame}")
@@ -773,9 +785,16 @@ class GMMSLAMNode:
             f"pose_keep={self.pose_history_keep_keyframes}"
         )
         rospy.loginfo(
+            f"[gmmslam] loop trigger: min_gap={self.loop_closure_min_keyframe_gap} | "
+            f"cooldown={self.loop_closure_search_cooldown_keyframes} keyframes | "
+            f"min_sep={self.loop_closure_min_separation_m:.2f} m / "
+            f"{self.loop_closure_min_separation_deg:.1f} deg"
+        )
+        rospy.loginfo(
             f"[gmmslam] odom noise (t/r) : {self.odom_noise_sigma_t} / {self.odom_noise_sigma_r}"
         )
         rospy.loginfo(f"[gmmslam] noisy GT factor : {self.use_noisy_gt_factor}")
+        rospy.loginfo(f"[gmmslam] noisy GT topic  : {self.noisy_gt_topic}")
         if self.use_noisy_gt_factor:
             rospy.loginfo(
                 f"[gmmslam] GT noise (t/r)   : {self.gt_noise_sigma_t} / {self.gt_noise_sigma_r}"
@@ -830,6 +849,7 @@ class GMMSLAMNode:
         self._gmm_paths_by_idx = {}
         self._pending_loop_requests = set()
         self._loop_edges_added = set()
+        self._last_loop_search_idx = -1000000
         self._key_to_submap = {}
         self._submap_pose_by_idx = {}
         self._submap_ids = []
@@ -994,6 +1014,7 @@ class GMMSLAMNode:
         self._gt_path.header.frame_id = self.odom_frame
         self._latest_gt_pose = None
         self._latest_gt_pose_raw = None
+        self._latest_noisy_gt_pose_msg = None
         self._gt_origin_inv = None
         self._gt_init_start_time = None
         self._graph_node_markers = MarkerArray()
@@ -1044,6 +1065,12 @@ class GMMSLAMNode:
             String,
             self._registration_result_callback,
             queue_size=50,
+        )
+        rospy.Subscriber(
+            self.noisy_gt_topic,
+            PoseStamped,
+            self._noisy_gt_input_callback,
+            queue_size=1,
         )
 
         rospy.Subscriber(self.imu_topic, Imu, self._imu_callback, queue_size=1)
@@ -1119,6 +1146,10 @@ class GMMSLAMNode:
         self.gt_pose_pub.publish(ps)
         self.gt_path_pub.publish(self._gt_path)
 
+    def _noisy_gt_input_callback(self, msg: PoseStamped):
+        """Receive externally published noisy GT pose (in odom frame)."""
+        self._latest_noisy_gt_pose_msg = msg
+
     def _ensure_gt_origin_initialized(self, stamp) -> bool:
         """Initialize GT origin after configured startup wait."""
         if self._gt_origin_inv is not None:
@@ -1186,6 +1217,11 @@ class GMMSLAMNode:
             return
         if (curr_idx % self.loop_closure_request_every_n_keyframes) != 0:
             return
+        if (
+            curr_idx - self._last_loop_search_idx
+        ) < self.loop_closure_search_cooldown_keyframes:
+            return
+        self._last_loop_search_idx = curr_idx
 
         with self._graph_lock:
             T_curr = self._pose_by_idx.get(curr_idx)
@@ -1208,6 +1244,7 @@ class GMMSLAMNode:
         near = []
         n_age_filtered = 0
         n_radius_filtered = 0
+        n_separation_filtered = 0
         for idx, target_path in gmm_snapshot.items():
             if idx >= curr_idx:
                 continue
@@ -1224,9 +1261,19 @@ class GMMSLAMNode:
             T_idx = pose_snapshot.get(idx)
             if T_idx is None:
                 continue
+            T_rel = np.linalg.inv(T_idx) @ T_curr
+            drot_deg = float(
+                np.degrees(Rotation.from_matrix(T_rel[:3, :3]).magnitude())
+            )
             d = float(np.linalg.norm(T_idx[:3, 3] - curr_pos))
             if d > self.loop_closure_search_radius_m:
                 n_radius_filtered += 1
+                continue
+            if (
+                d < self.loop_closure_min_separation_m
+                and drot_deg < self.loop_closure_min_separation_deg
+            ):
+                n_separation_filtered += 1
                 continue
             edge = (min(idx, curr_idx), max(idx, curr_idx))
             if edge in pending_snapshot or edge in added_snapshot:
@@ -1238,6 +1285,7 @@ class GMMSLAMNode:
                 f"[gmmslam] loop search @key {curr_idx}: 0 candidates in "
                 f"{self.loop_closure_search_radius_m:.2f} m sphere "
                 f"(age_filtered={n_age_filtered}, radius_filtered={n_radius_filtered}, "
+                f"sep_filtered={n_separation_filtered}, "
                 f"tracked_gmms={len(gmm_snapshot)}, tracked_poses={len(pose_snapshot)})"
             )
             return
@@ -1819,16 +1867,33 @@ class GMMSLAMNode:
         return T
 
     def _sample_noisy_gt_relative_pose3(self, stamp):
-        """Build a noisy relative GT motion matrix for a BetweenFactor."""
+        """Build GT-relative motion matrix for BetweenFactor.
+
+        Prefers externally published noisy GT topic. Falls back to internally
+        sampled noisy GT if external topic is unavailable.
+        """
         _ = stamp
         if not self.use_noisy_gt_factor:
             return None
+        # Primary path: use external noisy GT topic as the exact input signal.
+        if self._latest_noisy_gt_pose_msg is not None:
+            T_curr = self._pose_msg_to_matrix(self._latest_noisy_gt_pose_msg.pose)
+            if self._last_gt_T_for_factor is None:
+                self._last_gt_T_for_factor = T_curr
+                return None
+            T_prev = self._last_gt_T_for_factor
+            self._last_gt_T_for_factor = T_curr
+            return np.linalg.inv(T_prev) @ T_curr
+
+        # Fallback path: internal noisy GT sampling from zeroed GT trajectory.
         if self._latest_gt_pose is None:
             return None
-
+        rospy.logwarn_throttle(
+            5.0,
+            "[gmmslam] noisy_gt_topic unavailable; falling back to internal GT noise sampling",
+        )
         T_curr_gt = self._pose_msg_to_matrix(self._latest_gt_pose.pose)
         if self._last_gt_T_for_factor is None:
-            # Need two GT poses to form a relative constraint.
             self._last_gt_T_for_factor = T_curr_gt
             return None
         T_prev_gt = self._last_gt_T_for_factor
@@ -2189,7 +2254,9 @@ class GMMSLAMNode:
         if t_prev is None or t_curr is None:
             return
         t_latest = self._key_t_sec.get(self._latest_key_idx, 0.0)
-        if (t_latest - t_prev) > self.fixed_lag_s * 1.1:  # 10% margin
+        if (t_latest - t_prev) > self.fixed_lag_s * 1.1 or (
+            t_latest - t_curr
+        ) > self.fixed_lag_s * 1.1:  # 10% margin
             rospy.logdebug(
                 f"[gmmslam] skipping stale registration factor X({prev_idx})->X({curr_idx}): "
                 f"key already outside lag window"

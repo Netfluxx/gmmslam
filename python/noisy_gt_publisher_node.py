@@ -48,8 +48,6 @@ class NoisyGTPublisherNode:
         self._latest_gt_pose_raw = None
         self._gt_origin_inv = None
         self._gt_init_start_time = rospy.Time.now()
-        self._last_gt_odom = None
-        self._noisy_pose = np.eye(4, dtype=np.float64)
         self._noisy_path = Path()
         self._noisy_path.header.frame_id = self.odom_frame
 
@@ -99,11 +97,11 @@ class NoisyGTPublisherNode:
         try:
             T0 = self._pose_msg_to_matrix(self._latest_gt_pose_raw.pose)
             self._gt_origin_inv = np.linalg.inv(T0)
-            self._last_gt_odom = None
-            self._noisy_pose = np.eye(4, dtype=np.float64)
             self._noisy_path = Path()
             self._noisy_path.header.frame_id = self.odom_frame
-            rospy.loginfo("[noisy_gt_pub] GT origin initialized and noisy odometry reset")
+            rospy.loginfo(
+                "[noisy_gt_pub] GT origin initialized and noisy absolute pose stream reset"
+            )
             return True
         except Exception as e:
             rospy.logwarn_throttle(2.0, f"[noisy_gt_pub] failed to init GT origin: {e}")
@@ -120,26 +118,16 @@ class NoisyGTPublisherNode:
             rospy.logwarn_throttle(2.0, f"[noisy_gt_pub] invalid GT pose: {e}")
             return
 
-        if self._last_gt_odom is None:
-            self._last_gt_odom = T_gt_odom
-            ps0 = pose_to_pose_stamped(self._noisy_pose, msg.header.stamp, self.odom_frame)
-            self._noisy_path.header.stamp = msg.header.stamp
-            self._noisy_path.poses.append(ps0)
-            self.noisy_pose_pub.publish(ps0)
-            self.noisy_path_pub.publish(self._noisy_path)
-            return
-
-        T_rel = np.linalg.inv(self._last_gt_odom) @ T_gt_odom
-        self._last_gt_odom = T_gt_odom
-
+        # Fresh absolute Gaussian noise each frame (no accumulation).
         rot_noise_vec = self._rng.normal(0.0, self.gt_noise_sigma_r, size=3)
         trans_noise = self._rng.normal(0.0, self.gt_noise_sigma_t, size=3)
-        T_noisy_rel = np.eye(4, dtype=np.float64)
-        T_noisy_rel[:3, :3] = Rotation.from_rotvec(rot_noise_vec).as_matrix() @ T_rel[:3, :3]
-        T_noisy_rel[:3, 3] = T_rel[:3, 3] + trans_noise
+        T_noisy_abs = np.eye(4, dtype=np.float64)
+        T_noisy_abs[:3, :3] = (
+            Rotation.from_rotvec(rot_noise_vec).as_matrix() @ T_gt_odom[:3, :3]
+        )
+        T_noisy_abs[:3, 3] = T_gt_odom[:3, 3] + trans_noise
 
-        self._noisy_pose = self._noisy_pose @ T_noisy_rel
-        ps = pose_to_pose_stamped(self._noisy_pose, msg.header.stamp, self.odom_frame)
+        ps = pose_to_pose_stamped(T_noisy_abs, msg.header.stamp, self.odom_frame)
         self._noisy_path.header.stamp = msg.header.stamp
         self._noisy_path.poses.append(ps)
         self.noisy_pose_pub.publish(ps)

@@ -17,6 +17,9 @@
   <arg name="loop_closure_min_keyframe_gap" default="10"/>
   <arg name="loop_closure_max_candidates" default="3"/>
   <arg name="loop_closure_request_every_n_keyframes" default="2"/>
+  <arg name="loop_closure_search_cooldown_keyframes" default="5"/>
+  <arg name="loop_closure_min_separation_m" default="0.8"/>
+  <arg name="loop_closure_min_separation_deg" default="20.0"/>
   <arg name="loop_closure_max_age_s" default="720.0"/>
   <arg name="loop_closure_gmm_keep_keyframes" default="2000"/>
   <arg name="pose_history_keep_keyframes" default="5000"/>
@@ -35,9 +38,10 @@
   <arg name="submap_prior_sigma_r" default="0.02"/>
   <arg name="gt_topic" default="/m500_1/mavros/local_position/pose"/>
   <arg name="gt_init_wait_s" default="3.0"/>
-  <arg name="gt_noise_sigma_t" default="0.0"/>
-  <arg name="gt_noise_sigma_r" default="0.0"/>
+  <arg name="gt_noise_sigma_t" default="0.03"/>
+  <arg name="gt_noise_sigma_r" default="0.03"/>
   <arg name="gt_noise_seed" default="-1"/>
+  <arg name="noisy_gt_topic" default="/gmmslam_node/noisy_gt_pose"/>
 
   <!-- Preprocessing -->
   <arg name="min_range"        default="0.1"/>
@@ -85,6 +89,9 @@
     <param name="loop_closure_min_keyframe_gap" value="$(arg loop_closure_min_keyframe_gap)"/>
     <param name="loop_closure_max_candidates" value="$(arg loop_closure_max_candidates)"/>
     <param name="loop_closure_request_every_n_keyframes" value="$(arg loop_closure_request_every_n_keyframes)"/>
+    <param name="loop_closure_search_cooldown_keyframes" value="$(arg loop_closure_search_cooldown_keyframes)"/>
+    <param name="loop_closure_min_separation_m" value="$(arg loop_closure_min_separation_m)"/>
+    <param name="loop_closure_min_separation_deg" value="$(arg loop_closure_min_separation_deg)"/>
     <param name="loop_closure_max_age_s" value="$(arg loop_closure_max_age_s)"/>
     <param name="loop_closure_gmm_keep_keyframes" value="$(arg loop_closure_gmm_keep_keyframes)"/>
     <param name="pose_history_keep_keyframes" value="$(arg pose_history_keep_keyframes)"/>
@@ -107,6 +114,7 @@
     <param name="gt_noise_sigma_t" value="$(arg gt_noise_sigma_t)"/>
     <param name="gt_noise_sigma_r" value="$(arg gt_noise_sigma_r)"/>
     <param name="gt_noise_seed" value="$(arg gt_noise_seed)"/>
+    <param name="noisy_gt_topic" value="$(arg noisy_gt_topic)"/>
 
     <param name="min_range"        value="$(arg min_range)"/>
     <param name="max_range"        value="$(arg max_range)"/>
@@ -141,7 +149,7 @@
     <param name="gt_noise_sigma_t" value="$(arg gt_noise_sigma_t)"/>
     <param name="gt_noise_sigma_r" value="$(arg gt_noise_sigma_r)"/>
     <param name="gt_noise_seed" value="$(arg gt_noise_seed)"/>
-    <param name="pose_topic" value="/gmmslam_node/noisy_gt_pose"/>
+    <param name="pose_topic" value="$(arg noisy_gt_topic)"/>
     <param name="path_topic" value="/gmmslam_node/noisy_gt_path"/>
   </node>
 
