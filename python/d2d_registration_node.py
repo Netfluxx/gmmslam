@@ -70,6 +70,7 @@ class D2DRegistrationNode:
             source_path = str(req["source_path"])
             target_path = str(req["target_path"])
             is_loop_closure = bool(req.get("is_loop_closure", False))
+            is_submap_registration = bool(req.get("is_submap_registration", False))
         except Exception as e:
             rospy.logwarn_throttle(2.0, f"[d2d_reg] malformed request: {e}")
             return
@@ -82,6 +83,7 @@ class D2DRegistrationNode:
             "score": float("-inf"),
             "transform": np.eye(4, dtype=np.float64).reshape(-1).tolist(),
             "is_loop_closure": is_loop_closure,
+            "is_submap_registration": is_submap_registration,
         }
 
         if not HAS_GMM_REGISTRATION:
@@ -129,10 +131,18 @@ class D2DRegistrationNode:
             result["score"] = score_final
             result["transform"] = T_final.reshape(-1).tolist()
 
-            rospy.loginfo_throttle(
-                5.0,
-                f"[d2d_reg] registration success | prev={prev_idx} curr={curr_idx} score={score_final:.4f}",
-            )
+            tag = "submap" if is_submap_registration else "keyframe"
+            if is_submap_registration:
+                rospy.loginfo(
+                    f"[d2d_reg] {tag} registration success | "
+                    f"prev={prev_idx} curr={curr_idx} score={score_final:.4f}"
+                )
+            else:
+                rospy.loginfo_throttle(
+                    5.0,
+                    f"[d2d_reg] {tag} registration success | "
+                    f"prev={prev_idx} curr={curr_idx} score={score_final:.4f}",
+                )
             self.result_pub.publish(String(data=json.dumps(result)))
         except Exception as e:
             rospy.logwarn_throttle(2.0, f"[d2d_reg] registration failed: {e}")

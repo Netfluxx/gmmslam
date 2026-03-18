@@ -12,30 +12,53 @@
   <arg name="strong_factor_score_threshold" default="2.0"/>
   <arg name="strong_factor_sigma_t" default="0.01"/>
   <arg name="strong_factor_sigma_r" default="0.01"/>
+  <!-- Loop closure detection -->
   <arg name="enable_loop_closure_detection" default="true"/>
   <arg name="loop_closure_search_radius_m" default="2.5"/>
   <arg name="loop_closure_min_keyframe_gap" default="10"/>
   <arg name="loop_closure_max_candidates" default="3"/>
-  <arg name="loop_closure_request_every_n_keyframes" default="2"/>
-  <arg name="loop_closure_search_cooldown_keyframes" default="5"/>
+  <arg name="loop_closure_request_every_n_keyframes" default="1"/>
+  <arg name="loop_closure_search_cooldown_keyframes" default="2"/>
   <arg name="loop_closure_min_separation_m" default="0.8"/>
   <arg name="loop_closure_min_separation_deg" default="20.0"/>
   <arg name="loop_closure_max_age_s" default="720.0"/>
   <arg name="loop_closure_gmm_keep_keyframes" default="2000"/>
   <arg name="pose_history_keep_keyframes" default="5000"/>
-  <arg name="loop_closure_detect_score_threshold" default="0.6"/>
+  <arg name="loop_closure_detect_score_threshold" default="1.1"/>
   <arg name="loop_closure_super_sigma_t" default="0.001"/>
   <arg name="loop_closure_super_sigma_r" default="0.001"/>
+  <arg name="score_sigma_low" default="1.1"/>
+  <arg name="score_sigma_high" default="2.0"/>
+  <arg name="seq_sigma_t_min" default="0.02"/>
+  <arg name="seq_sigma_t_max" default="0.20"/>
+  <arg name="seq_sigma_r_min" default="0.01"/>
+  <arg name="seq_sigma_r_max" default="0.15"/>
+  <arg name="loop_sigma_t_min" default="0.03"/>
+  <arg name="loop_sigma_t_max" default="0.40"/>
+  <arg name="loop_sigma_r_min" default="0.02"/>
+  <arg name="loop_sigma_r_max" default="0.25"/>
+  <arg name="submap_loop_sigma_t_min" default="0.05"/>
+  <arg name="submap_loop_sigma_t_max" default="0.50"/>
+  <arg name="submap_loop_sigma_r_min" default="0.03"/>
+  <arg name="submap_loop_sigma_r_max" default="0.30"/>
   <arg name="solve_after_registration_factor" default="false"/>
-  <arg name="registration_workers" default="4"/>
+  <arg name="registration_workers" default="6"/>
+  <!-- Keyframe parameters -->
+  <arg name="keyframe_translation_thresh_m" default="0.3"/>
+  <arg name="keyframe_rotation_thresh_deg" default="5.0"/>
+  <arg name="keyframe_use_time_trigger" default="false"/>
+  <arg name="compensate_fit_latency_in_map" default="true"/>
+  <!-- Submap parameters -->
   <arg name="enable_global_pose_graph" default="true"/>
-  <arg name="submap_translation_thresh_m" default="0.75"/>
-  <arg name="submap_rotation_thresh_deg" default="15.0"/>
-  <arg name="submap_max_interval_s" default="2.0"/>
+  <arg name="submap_keyframes_per_submap" default="10"/>
+  <arg name="submap_translation_thresh_m" default="0.3"/>
+  <arg name="submap_rotation_thresh_deg" default="5.0"/>
   <arg name="submap_between_sigma_t" default="0.08"/>
   <arg name="submap_between_sigma_r" default="0.08"/>
   <arg name="submap_prior_sigma_t" default="0.02"/>
   <arg name="submap_prior_sigma_r" default="0.02"/>
+  <arg name="submap_overlap_radius_m" default="1.0"/>
+  <arg name="submap_reg_score_threshold" default="0.5"/>
   <arg name="gt_topic" default="/m500_1/mavros/local_position/pose"/>
   <arg name="gt_init_wait_s" default="3.0"/>
   <arg name="gt_noise_sigma_t" default="0.03"/>
@@ -49,16 +72,39 @@
   <arg name="voxel_leaf_size"  default="0.05"/>
 
   <!-- GMM -->
-  <arg name="sogmm_max_points" default="400"/>
-  <arg name="sogmm_n_components" default="100"/>
+  <arg name="sogmm_bandwidth"    default="0.015"/>
+  <!-- depth cam in sim has 424x240=101760 pixels -->
+  <arg name="sogmm_max_points"   default="500"/>
+  <arg name="sogmm_n_components" default="50"/>
   <!-- Deprecated legacy args kept only for compatibility; not used by gmmslam.py -->
   <arg name="n_components"     default="50"/>
   <arg name="covariance_mode"  default="isoplanar"/>
 
   <!-- iSAM2 -->
-  <arg name="lag"              default="1.0"/>
+  <arg name="lag"              default="3.0"/>
   <arg name="odom_noise_rot"   default="0.03"/>
   <arg name="odom_noise_trans" default="0.03"/>
+  <arg name="enable_imu_preintegration" default="true"/>
+  <arg name="imu_gravity_mps2" default="9.81"/>
+  <arg name="imu_buffer_keep_s" default="30.0"/>
+  <arg name="imu_acc_noise_sigma" default="0.2"/>
+  <arg name="imu_gyro_noise_sigma" default="0.05"/>
+  <arg name="imu_integration_sigma" default="0.0001"/>
+  <arg name="imu_bias_acc_rw_sigma" default="0.001"/>
+  <arg name="imu_bias_gyro_rw_sigma" default="0.0001"/>
+  <arg name="imu_velocity_prior_sigma" default="1.0"/>
+  <arg name="imu_bias_prior_sigma" default="0.1"/>
+  <arg name="submap_imu_sigma_t" default="0.3"/>
+  <arg name="submap_imu_sigma_r" default="0.3"/>
+  <arg name="submap_traj_sigma_t" default="0.15"/>
+  <arg name="submap_traj_sigma_r" default="0.15"/>
+  <arg name="submap_imu_max_span_s" default="8.0"/>
+  <arg name="submap_imu_max_gap_s" default="0.08"/>
+  <arg name="submap_imu_reset_trans_m" default="4.0"/>
+  <arg name="submap_aux_gate_abs_trans_m" default="4.0"/>
+  <arg name="submap_aux_gate_abs_rot_deg" default="75.0"/>
+  <arg name="submap_aux_gate_consistency_trans_m" default="2.0"/>
+  <arg name="submap_aux_gate_consistency_rot_deg" default="35.0"/>
 
   <!-- Minimum valid points per cloud (below this the frame is skipped) -->
   <arg name="min_points"       default="50"/>
@@ -84,6 +130,7 @@
     <param name="strong_factor_score_threshold" value="$(arg strong_factor_score_threshold)"/>
     <param name="strong_factor_sigma_t" value="$(arg strong_factor_sigma_t)"/>
     <param name="strong_factor_sigma_r" value="$(arg strong_factor_sigma_r)"/>
+    <!-- Loop closure detection -->
     <param name="enable_loop_closure_detection" value="$(arg enable_loop_closure_detection)"/>
     <param name="loop_closure_search_radius_m" value="$(arg loop_closure_search_radius_m)"/>
     <param name="loop_closure_min_keyframe_gap" value="$(arg loop_closure_min_keyframe_gap)"/>
@@ -98,17 +145,41 @@
     <param name="loop_closure_detect_score_threshold" value="$(arg loop_closure_detect_score_threshold)"/>
     <param name="loop_closure_super_sigma_t" value="$(arg loop_closure_super_sigma_t)"/>
     <param name="loop_closure_super_sigma_r" value="$(arg loop_closure_super_sigma_r)"/>
+    <param name="score_sigma_low" value="$(arg score_sigma_low)"/>
+    <param name="score_sigma_high" value="$(arg score_sigma_high)"/>
+    <param name="seq_sigma_t_min" value="$(arg seq_sigma_t_min)"/>
+    <param name="seq_sigma_t_max" value="$(arg seq_sigma_t_max)"/>
+    <param name="seq_sigma_r_min" value="$(arg seq_sigma_r_min)"/>
+    <param name="seq_sigma_r_max" value="$(arg seq_sigma_r_max)"/>
+    <param name="loop_sigma_t_min" value="$(arg loop_sigma_t_min)"/>
+    <param name="loop_sigma_t_max" value="$(arg loop_sigma_t_max)"/>
+    <param name="loop_sigma_r_min" value="$(arg loop_sigma_r_min)"/>
+    <param name="loop_sigma_r_max" value="$(arg loop_sigma_r_max)"/>
+    <param name="submap_loop_sigma_t_min" value="$(arg submap_loop_sigma_t_min)"/>
+    <param name="submap_loop_sigma_t_max" value="$(arg submap_loop_sigma_t_max)"/>
+    <param name="submap_loop_sigma_r_min" value="$(arg submap_loop_sigma_r_min)"/>
+    <param name="submap_loop_sigma_r_max" value="$(arg submap_loop_sigma_r_max)"/>
     <param name="solve_after_registration_factor" value="$(arg solve_after_registration_factor)"/>
     <param name="registration_request_topic" value="/gmmslam_node/registration/request"/>
     <param name="registration_result_topic"  value="/gmmslam_node/registration/result"/>
     <param name="enable_global_pose_graph" value="$(arg enable_global_pose_graph)"/>
+
+    <!-- Keyframe parameters -->
+    <param name="keyframe_translation_thresh_m" value="$(arg keyframe_translation_thresh_m)"/>
+    <param name="keyframe_rotation_thresh_deg" value="$(arg keyframe_rotation_thresh_deg)"/>
+    <param name="keyframe_use_time_trigger" value="$(arg keyframe_use_time_trigger)"/>
+    <param name="compensate_fit_latency_in_map" value="$(arg compensate_fit_latency_in_map)"/>
+
+    <!-- Submap parameters -->
+    <param name="submap_keyframes_per_submap" value="$(arg submap_keyframes_per_submap)"/>
     <param name="submap_translation_thresh_m" value="$(arg submap_translation_thresh_m)"/>
     <param name="submap_rotation_thresh_deg" value="$(arg submap_rotation_thresh_deg)"/>
-    <param name="submap_max_interval_s" value="$(arg submap_max_interval_s)"/>
     <param name="submap_between_sigma_t" value="$(arg submap_between_sigma_t)"/>
     <param name="submap_between_sigma_r" value="$(arg submap_between_sigma_r)"/>
     <param name="submap_prior_sigma_t" value="$(arg submap_prior_sigma_t)"/>
     <param name="submap_prior_sigma_r" value="$(arg submap_prior_sigma_r)"/>
+    <param name="submap_overlap_radius_m" value="$(arg submap_overlap_radius_m)"/>
+    <param name="submap_reg_score_threshold" value="$(arg submap_reg_score_threshold)"/>
     <param name="gt_topic" value="$(arg gt_topic)"/>
     <param name="gt_init_wait_s" value="$(arg gt_init_wait_s)"/>
     <param name="gt_noise_sigma_t" value="$(arg gt_noise_sigma_t)"/>
@@ -116,10 +187,12 @@
     <param name="gt_noise_seed" value="$(arg gt_noise_seed)"/>
     <param name="noisy_gt_topic" value="$(arg noisy_gt_topic)"/>
 
+    <!-- GMM parameters -->
     <param name="min_range"        value="$(arg min_range)"/>
     <param name="max_range"        value="$(arg max_range)"/>
     <param name="voxel_leaf_size"  value="$(arg voxel_leaf_size)"/>
-    <param name="sogmm_max_points" value="$(arg sogmm_max_points)"/>
+    <param name="sogmm_bandwidth"    value="$(arg sogmm_bandwidth)"/>
+    <param name="sogmm_max_points"   value="$(arg sogmm_max_points)"/>
     <param name="sogmm_n_components" value="$(arg sogmm_n_components)"/>
 
     <!-- legacy compatibility params (ignored by current gmmslam.py) -->
@@ -129,6 +202,27 @@
     <param name="lag"              value="$(arg lag)"/>
     <param name="odom_noise_rot"   value="$(arg odom_noise_rot)"/>
     <param name="odom_noise_trans" value="$(arg odom_noise_trans)"/>
+    <param name="enable_imu_preintegration" value="$(arg enable_imu_preintegration)"/>
+    <param name="imu_gravity_mps2" value="$(arg imu_gravity_mps2)"/>
+    <param name="imu_buffer_keep_s" value="$(arg imu_buffer_keep_s)"/>
+    <param name="imu_acc_noise_sigma" value="$(arg imu_acc_noise_sigma)"/>
+    <param name="imu_gyro_noise_sigma" value="$(arg imu_gyro_noise_sigma)"/>
+    <param name="imu_integration_sigma" value="$(arg imu_integration_sigma)"/>
+    <param name="imu_bias_acc_rw_sigma" value="$(arg imu_bias_acc_rw_sigma)"/>
+    <param name="imu_bias_gyro_rw_sigma" value="$(arg imu_bias_gyro_rw_sigma)"/>
+    <param name="imu_velocity_prior_sigma" value="$(arg imu_velocity_prior_sigma)"/>
+    <param name="imu_bias_prior_sigma" value="$(arg imu_bias_prior_sigma)"/>
+    <param name="submap_imu_sigma_t" value="$(arg submap_imu_sigma_t)"/>
+    <param name="submap_imu_sigma_r" value="$(arg submap_imu_sigma_r)"/>
+    <param name="submap_traj_sigma_t" value="$(arg submap_traj_sigma_t)"/>
+    <param name="submap_traj_sigma_r" value="$(arg submap_traj_sigma_r)"/>
+    <param name="submap_imu_max_span_s" value="$(arg submap_imu_max_span_s)"/>
+    <param name="submap_imu_max_gap_s" value="$(arg submap_imu_max_gap_s)"/>
+    <param name="submap_imu_reset_trans_m" value="$(arg submap_imu_reset_trans_m)"/>
+    <param name="submap_aux_gate_abs_trans_m" value="$(arg submap_aux_gate_abs_trans_m)"/>
+    <param name="submap_aux_gate_abs_rot_deg" value="$(arg submap_aux_gate_abs_rot_deg)"/>
+    <param name="submap_aux_gate_consistency_trans_m" value="$(arg submap_aux_gate_consistency_trans_m)"/>
+    <param name="submap_aux_gate_consistency_rot_deg" value="$(arg submap_aux_gate_consistency_rot_deg)"/>
 
     <param name="min_points"       value="$(arg min_points)"/>
   </node>
