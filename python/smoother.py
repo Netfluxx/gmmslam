@@ -131,12 +131,17 @@ class FixedLagBackend:
         self.velocity_by_idx: dict = {}
         self.bias_by_idx: dict = {}
         self.key_t_sec: dict = {}
+        self._inserted_pose_keys: set = set()
         self.latest_key_idx: int = 0
         self.graph_lock = threading.Lock()
 
         # GTSAM solve thread queue (maxsize=2 keeps latency low)
         self._gtsam_queue: queue.Queue = queue.Queue(maxsize=2)
         self._deferred_batches = 0
+
+        # Backend failure tracking for automatic reset
+        self._consecutive_failures = 0
+        self._max_consecutive_failures = 5
 
         rospy.loginfo(
             f"[smoother] initialized: IncrementalFixedLagSmoother (lag={lag_s:.2f}s, "
@@ -210,66 +215,6 @@ class FixedLagBackend:
         self._safe_call(params, "setIntegrationCovariance", integ_var * np.eye(3))
         return gtsam.PreintegratedImuMeasurements(params, bias)
 
-    def compute_imu_delta_pose(self, imu_measurements, bias_vec=None):
-        """Compute a relative pose from IMU samples using GTSAM preintegration."""
-        if not self.enable_imu_preintegration:
-            return None
-        if imu_measurements is None or len(imu_measurements) == 0:
-            return None
-
-        if bias_vec is None:
-            b = self._zero_bias()
-        else:
-            bv = np.asarray(bias_vec, dtype=np.float64).reshape(-1)
-            if bv.size >= 6:
-                b = gtsam.imuBias.ConstantBias(bv[:3], bv[3:6])
-            else:
-                b = self._zero_bias()
-
-        preint = self._build_preintegrator(b)
-        n_imu = 0
-        for dt, acc, gyro in imu_measurements:
-            dt_f = float(dt)
-            if dt_f <= 0.0:
-                continue
-            preint.integrateMeasurement(
-                np.asarray(acc, dtype=np.float64),
-                np.asarray(gyro, dtype=np.float64),
-                dt_f,
-            )
-            n_imu += 1
-        if n_imu == 0:
-            return None
-
-        # Preferred: use deltaXij() NavState increment when available.
-        try:
-            if hasattr(preint, "deltaXij"):
-                dx = preint.deltaXij()
-                if hasattr(dx, "pose"):
-                    return self.matrix_from_pose3(dx.pose())
-        except Exception:
-            pass
-
-        # Fallback: compose from deltaRij()/deltaPij().
-        try:
-            T = np.eye(4, dtype=np.float64)
-            dR = preint.deltaRij()
-            dp = preint.deltaPij()
-            T[:3, :3] = np.array(dR.matrix(), dtype=np.float64)
-            dp_arr = np.array(dp, dtype=np.float64).reshape(-1)
-            if dp_arr.size >= 3:
-                T[:3, 3] = dp_arr[:3]
-            else:
-                T[:3, 3] = np.array(
-                    [float(dp.x()), float(dp.y()), float(dp.z())], dtype=np.float64
-                )
-            return T
-        except Exception as e:
-            rospy.logwarn_throttle(
-                2.0, f"[smoother] failed to build IMU delta pose from preintegration: {e}"
-            )
-            return None
-
     def _reset_new_data(self):
         self._new_factors.resize(0)
         self._new_values.clear()
@@ -280,6 +225,106 @@ class FixedLagBackend:
             self._new_timestamps.insert((key, float(t_sec)))
         except TypeError:
             self._new_timestamps.insert(key, float(t_sec))
+
+    def _filter_stale_factors(self, factors, new_values, t_latest):
+        """Drop factors that reference keys already marginalized out of the
+        fixed-lag window.  This prevents crashes from late-arriving async
+        registration factors that reference old keyframe indices."""
+        t_cutoff = t_latest - self.fixed_lag_s * 0.85
+        clean = gtsam.NonlinearFactorGraph()
+        n_dropped = 0
+        for i in range(factors.size()):
+            f = factors.at(i)
+            stale = False
+            for key in f.keys():
+                if new_values.exists(key):
+                    continue
+                try:
+                    idx = gtsam.Symbol(key).index()
+                except Exception:
+                    continue
+                t_key = self.key_t_sec.get(idx)
+                if t_key is not None and t_key < t_cutoff:
+                    stale = True
+                    break
+            if stale:
+                n_dropped += 1
+            else:
+                clean.push_back(f)
+        if n_dropped > 0:
+            rospy.logwarn(
+                f"[smoother] dropped {n_dropped} stale factor(s) referencing "
+                "keys outside the lag window"
+            )
+        return clean
+
+    def _rebuild_smoother(self, anchor_idx):
+        """Destroy and recreate the fixed-lag smoother, re-anchoring at
+        anchor_idx with a prior.  Called after consecutive backend failures
+        indicate that GTSAM's internal state is unrecoverable."""
+        pose = self.pose_by_idx.get(anchor_idx, self.pose).copy()
+        t_sec = self.key_t_sec.get(anchor_idx, 0.0)
+
+        self._fixed_lag = gtsam_unstable.IncrementalFixedLagSmoother(
+            self.fixed_lag_s
+        )
+
+        factors = gtsam.NonlinearFactorGraph()
+        values = gtsam.Values()
+        timestamps = self._map_ctor()
+
+        key0 = X(anchor_idx)
+        pose3 = self.pose3_from_matrix(pose)
+        factors.push_back(gtsam.PriorFactorPose3(key0, pose3, self.prior_noise))
+        values.insert(key0, pose3)
+        try:
+            timestamps.insert((key0, t_sec))
+        except TypeError:
+            timestamps.insert(key0, t_sec)
+
+        if self.enable_imu_preintegration:
+            kv = self._key_v(anchor_idx)
+            kb = self._key_b(anchor_idx)
+            v = np.asarray(
+                self.velocity_by_idx.get(anchor_idx, np.zeros(3)),
+                dtype=np.float64,
+            )
+            bvec = self.bias_by_idx.get(anchor_idx, np.zeros(6, dtype=np.float64))
+            b = gtsam.imuBias.ConstantBias(bvec[:3], bvec[3:])
+            values.insert(kv, v)
+            values.insert(kb, b)
+            try:
+                timestamps.insert((kv, t_sec))
+            except TypeError:
+                timestamps.insert(kv, t_sec)
+            try:
+                timestamps.insert((kb, t_sec))
+            except TypeError:
+                timestamps.insert(kb, t_sec)
+            factors.push_back(
+                gtsam.PriorFactorVector(kv, v, self.vel_prior_noise)
+            )
+            if hasattr(gtsam, "PriorFactorConstantBias"):
+                factors.push_back(
+                    gtsam.PriorFactorConstantBias(kb, b, self.bias_prior_noise)
+                )
+
+        self._fixed_lag.update(factors, values, timestamps)
+        self._inserted_pose_keys = {anchor_idx}
+
+        while not self._gtsam_queue.empty():
+            try:
+                self._gtsam_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self._reset_new_data()
+
+        rospy.logwarn(
+            f"[smoother] RESET smoother after "
+            f"{self._max_consecutive_failures} consecutive failures; "
+            f"re-anchored at X({anchor_idx})"
+        )
 
     # ------------------------------------------------------------------
     # Public API
@@ -330,6 +375,7 @@ class FixedLagBackend:
                 self._reset_new_data()
                 self.pose_by_idx[0] = pose.copy()
                 self.key_t_sec[0] = t0
+                self._inserted_pose_keys = {0}
                 if self.enable_imu_preintegration:
                     self.velocity_by_idx[0] = np.zeros(3, dtype=np.float64)
                     self.bias_by_idx[0] = np.zeros(6, dtype=np.float64)
@@ -359,8 +405,9 @@ class FixedLagBackend:
         t_sec = stamp_to_sec(stamp)
         key_prev = X(prev_idx)
         key_curr = X(curr_idx)
+        prev_exists_in_graph = prev_idx in self._inserted_pose_keys
 
-        if gt_rel_mat is not None:
+        if prev_exists_in_graph and gt_rel_mat is not None:
             # Accurate between-factor from odometry / GT measurement
             self._new_factors.push_back(
                 gtsam.BetweenFactorPose3(
@@ -370,7 +417,7 @@ class FixedLagBackend:
                     self.gt_factor_noise,
                 )
             )
-        else:
+        elif prev_exists_in_graph:
             # No odometry available: identity with inflated noise
             self._new_factors.push_back(
                 gtsam.BetweenFactorPose3(
@@ -379,6 +426,21 @@ class FixedLagBackend:
                     gtsam.Pose3.Identity(),
                     self.odom_noise_lost,
                 )
+            )
+        else:
+            # Recovery path: predecessor key never entered fixed-lag graph
+            # (e.g., due previous backend failure). Re-anchor curr with prior.
+            self._new_factors.push_back(
+                gtsam.PriorFactorPose3(
+                    key_curr,
+                    self.pose3_from_matrix(predicted_pose),
+                    self.prior_noise,
+                )
+            )
+            rospy.logwarn_throttle(
+                2.0,
+                f"[smoother] missing predecessor X({prev_idx}); "
+                f"re-anchoring X({curr_idx}) with prior",
             )
 
         self._new_values.insert(key_curr, self.pose3_from_matrix(predicted_pose))
@@ -399,7 +461,7 @@ class FixedLagBackend:
 
             preint = self._build_preintegrator(prev_bias)
             n_imu = 0
-            if imu_measurements is not None:
+            if prev_exists_in_graph and imu_measurements is not None:
                 for dt, acc, gyro in imu_measurements:
                     dt_f = float(dt)
                     if dt_f <= 0.0:
@@ -411,7 +473,8 @@ class FixedLagBackend:
                     )
                     n_imu += 1
 
-            if n_imu > 0:
+            has_imu_link_factor = prev_exists_in_graph and (n_imu > 0)
+            if has_imu_link_factor:
                 if self._has_combined_imu:
                     self._new_factors.push_back(
                         gtsam.CombinedImuFactor(
@@ -459,10 +522,39 @@ class FixedLagBackend:
             self._timestamps_insert(key_b_curr, t_sec)
             self.velocity_by_idx[curr_idx] = np.asarray(vel_guess, dtype=np.float64)
             self.bias_by_idx[curr_idx] = prev_bias_vec.copy()
+            if not has_imu_link_factor:
+                # Keep V/B bounded whenever IMU chain is missing
+                # (either predecessor missing OR zero IMU samples in interval).
+                self._new_factors.push_back(
+                    gtsam.PriorFactorVector(
+                        key_v_curr,
+                        np.asarray(vel_guess, dtype=np.float64),
+                        self.vel_prior_noise,
+                    )
+                )
+                if hasattr(gtsam, "PriorFactorConstantBias"):
+                    self._new_factors.push_back(
+                        gtsam.PriorFactorConstantBias(
+                            key_b_curr,
+                            prev_bias,
+                            self.bias_prior_noise,
+                        )
+                    )
+                rospy.logwarn_throttle(
+                    2.0,
+                    f"[smoother] weakly-anchored V/B at X({curr_idx}) "
+                    f"(imu_link={'yes' if has_imu_link_factor else 'no'}, "
+                    f"samples={n_imu})",
+                )
 
             rospy.logdebug(
                 f"[smoother] IMU preintegration at X({curr_idx}): samples={n_imu}"
             )
+
+        # Drop factors that reference keys already marginalized out
+        self._new_factors = self._filter_stale_factors(
+            self._new_factors, self._new_values, t_sec
+        )
 
         # Snapshot containers and hand off to GTSAM thread
         factors_snap = self._new_factors
@@ -513,9 +605,32 @@ class FixedLagBackend:
             try:
                 self._fixed_lag.update(factors, values, timestamps)
                 estimate = self._fixed_lag.calculateEstimate()
-                new_pose = self.matrix_from_pose3(estimate.atPose3(X(curr_idx)))
+                key_curr = X(curr_idx)
+                has_curr = False
+                try:
+                    if hasattr(estimate, "exists"):
+                        has_curr = bool(estimate.exists(key_curr))
+                    else:
+                        _ = estimate.atPose3(key_curr)
+                        has_curr = True
+                except Exception:
+                    has_curr = False
+
+                if has_curr:
+                    new_pose = self.matrix_from_pose3(estimate.atPose3(key_curr))
+                else:
+                    # Avoid hard failure when curr key is not present in estimate.
+                    # This can happen around lag-window boundaries or timestamp
+                    # irregularities; keep last available pose and continue.
+                    new_pose = self.pose_by_idx.get(curr_idx, self.pose).copy()
+                    rospy.logwarn_throttle(
+                        2.0,
+                        f"[smoother] estimate missing X({curr_idx}) after update; "
+                        "keeping previous pose",
+                    )
                 with self.graph_lock:
                     latest_t = self.key_t_sec.get(curr_idx, None)
+                    self._inserted_pose_keys.add(curr_idx)
                     for k_idx, k_t in list(self.key_t_sec.items()):
                         if (
                             latest_t is not None
@@ -560,8 +675,18 @@ class FixedLagBackend:
                             del self.velocity_by_idx[k]
                         if k in self.bias_by_idx:
                             del self.bias_by_idx[k]
+                self._consecutive_failures = 0
                 rospy.logdebug(f"[smoother] GTSAM backend solved at X({curr_idx})")
             except Exception as e:
+                self._consecutive_failures += 1
                 rospy.logwarn(
                     f"[smoother] GTSAM backend failed at X({curr_idx}): {e}"
                 )
+                if self._consecutive_failures >= self._max_consecutive_failures:
+                    try:
+                        self._rebuild_smoother(curr_idx)
+                        self._consecutive_failures = 0
+                    except Exception as reset_err:
+                        rospy.logerr(
+                            f"[smoother] reset also failed: {reset_err}"
+                        )

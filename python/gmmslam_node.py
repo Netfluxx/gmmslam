@@ -60,15 +60,6 @@ class GMMSLAMNode:
         self._latest_imu = None
         self._last_cloud_stamp_for_imu = None
         self.imu_buffer_keep_s = float(rospy.get_param("~imu_buffer_keep_s", 30.0))
-        self.submap_imu_max_span_s = float(
-            rospy.get_param("~submap_imu_max_span_s", 8.0)
-        )
-        self.submap_imu_max_gap_s = float(
-            rospy.get_param("~submap_imu_max_gap_s", 0.08)
-        )
-        self.submap_imu_reset_trans_m = float(
-            rospy.get_param("~submap_imu_reset_trans_m", 4.0)
-        )
         self.sensor_frame = rospy.get_param("~sensor_frame", "depth_camera_1")
         self.odom_frame = rospy.get_param("~odom_frame", "world")
         self.base_frame = rospy.get_param("~base_frame", "m500_1_base_link")
@@ -151,8 +142,6 @@ class GMMSLAMNode:
         self.submap_prior_sigma_r = float(
             rospy.get_param("~submap_prior_sigma_r", 0.02)
         )
-        self.submap_imu_sigma_t = float(rospy.get_param("~submap_imu_sigma_t", 0.3))
-        self.submap_imu_sigma_r = float(rospy.get_param("~submap_imu_sigma_r", 0.3))
         self.submap_traj_sigma_t = float(rospy.get_param("~submap_traj_sigma_t", 0.15))
         self.submap_traj_sigma_r = float(rospy.get_param("~submap_traj_sigma_r", 0.15))
         self.submap_aux_gate_abs_trans_m = float(
@@ -342,6 +331,7 @@ class GMMSLAMNode:
         self._first_cloud_seen = False
         self._reg_enqueue_resume_frame = 0
         self._last_backpressure_log_t = 0.0
+        self._last_cloud_t_sec_processed = None
 
         # GT state
         self._latest_gt_pose_raw = None
@@ -426,7 +416,6 @@ class GMMSLAMNode:
             path_pub=global_graph_path_pub,
             get_pose_fn=lambda idx: self.smoother.pose_by_idx.get(idx),
             get_gmm_fn=lambda idx: self._get_keyframe_gmm(idx),
-            get_submap_imu_delta_fn=self._submap_imu_delta_between,
             get_submap_traj_delta_fn=self._submap_traj_delta_between,
             reg_request_pub=reg_request_pub,
             gmm_dir=rospy.get_param("~gmm_dir", "/tmp/gmmslam_gmms"),
@@ -434,8 +423,6 @@ class GMMSLAMNode:
             submap_reg_score_threshold=float(
                 rospy.get_param("~submap_reg_score_threshold", 0.5)
             ),
-            submap_imu_sigma_t=self.submap_imu_sigma_t,
-            submap_imu_sigma_r=self.submap_imu_sigma_r,
             submap_traj_sigma_t=self.submap_traj_sigma_t,
             submap_traj_sigma_r=self.submap_traj_sigma_r,
             submap_aux_gate_abs_trans_m=self.submap_aux_gate_abs_trans_m,
@@ -719,58 +706,6 @@ class GMMSLAMNode:
             return None
         return np.linalg.inv(T_prev) @ T_curr
 
-    def _submap_imu_delta_between(
-        self, prev_anchor_key, _curr_anchor_key, prev_anchor_t, curr_anchor_t
-    ):
-        """GTSAM-preintegrated IMU relative motion between anchor times."""
-        if prev_anchor_t is None or curr_anchor_t is None:
-            return None
-        span_s = float(curr_anchor_t - prev_anchor_t)
-        if span_s <= 0.0:
-            return None
-        if span_s > self.submap_imu_max_span_s:
-            rospy.logwarn(
-                f"[gmmslam] reset submap IMU delta: span {span_s:.3f}s exceeds "
-                f"{self.submap_imu_max_span_s:.3f}s"
-            )
-            return None
-        meas = self._imu_measurements_between_secs(
-            float(prev_anchor_t), float(curr_anchor_t)
-        )
-        if not meas:
-            rospy.logwarn_throttle(
-                2.0,
-                "[gmmslam] reset submap IMU delta: insufficient boundary IMU samples",
-            )
-            return None
-
-        max_dt = max(float(dt) for dt, _, _ in meas)
-        if max_dt > self.submap_imu_max_gap_s:
-            rospy.logwarn(
-                f"[gmmslam] reset submap IMU delta: max imu gap {max_dt:.3f}s exceeds "
-                f"{self.submap_imu_max_gap_s:.3f}s"
-            )
-            return None
-
-        bias_vec = self.smoother.bias_by_idx.get(
-            int(prev_anchor_key), np.zeros(6, dtype=np.float64)
-        )
-        T = self.smoother.compute_imu_delta_pose(meas, bias_vec=bias_vec)
-        if T is None:
-            rospy.logwarn_throttle(
-                2.0,
-                "[gmmslam] submap IMU delta unavailable from GTSAM preintegration",
-            )
-            return None
-        d = float(np.linalg.norm(T[:3, 3]))
-        if d > self.submap_imu_reset_trans_m:
-            rospy.logwarn(
-                f"[gmmslam] reset submap IMU delta: |t|={d:.3f}m exceeds "
-                f"{self.submap_imu_reset_trans_m:.3f}m"
-            )
-            return None
-        return T
-
     def _get_keyframe_gmm(self, key_idx):
         """Retrieve (gmm, capture_pose) for a keyframe, or None."""
         with self.registration.lock:
@@ -800,6 +735,18 @@ class GMMSLAMNode:
             self._first_cloud_seen = True
 
         stamp = msg.header.stamp
+        t_cloud = stamp_to_sec(stamp)
+        if (
+            self._last_cloud_t_sec_processed is not None
+            and t_cloud <= self._last_cloud_t_sec_processed
+        ):
+            rospy.logwarn_throttle(
+                2.0,
+                f"[gmmslam] non-monotonic cloud stamp "
+                f"({t_cloud:.6f} <= {self._last_cloud_t_sec_processed:.6f}); skipping frame",
+            )
+            return
+        self._last_cloud_t_sec_processed = t_cloud
         if not self._ensure_gt_origin_initialized(stamp):
             return
 

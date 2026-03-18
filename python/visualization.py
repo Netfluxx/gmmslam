@@ -326,11 +326,16 @@ class Visualizer:
                     for sid in submap_ids
                 }
                 submap_components = dict(gg.submap_gmm_components)
+                frozen_submap_poses = dict(gg.submap_frozen_pose_by_idx)
 
             for sid in submap_ids:
-                T_sid = submap_poses.get(sid)
                 components = submap_components.get(sid)
-                if T_sid is None or components is None:
+                if components is None:
+                    continue
+                # Finalized submaps are rendered at a frozen pose captured
+                # at finalization time to avoid post-hoc skew from later graph updates.
+                T_sid = frozen_submap_poses.get(sid, submap_poses.get(sid))
+                if T_sid is None:
                     continue
                 color = gg.submap_color(sid)
                 ma_i = self._make_markers_from_cache(

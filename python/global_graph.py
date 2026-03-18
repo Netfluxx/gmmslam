@@ -40,14 +40,11 @@ class GlobalPoseGraph:
         path_pub,
         get_pose_fn,
         get_gmm_fn=None,
-        get_submap_imu_delta_fn=None,
         get_submap_traj_delta_fn=None,
         reg_request_pub=None,
         gmm_dir: str = "/tmp/gmmslam_gmms",
         overlap_radius_m: float = 5.0,
         submap_reg_score_threshold: float = 0.5,
-        submap_imu_sigma_t: float = 0.3,
-        submap_imu_sigma_r: float = 0.3,
         submap_traj_sigma_t: float = 0.15,
         submap_traj_sigma_r: float = 0.15,
         score_sigma_low: float = 1.0,
@@ -70,7 +67,6 @@ class GlobalPoseGraph:
         self.submap_keyframes_per_submap = submap_keyframes_per_submap
         self._get_pose = get_pose_fn
         self._get_gmm = get_gmm_fn
-        self._get_submap_imu_delta = get_submap_imu_delta_fn
         self._get_submap_traj_delta = get_submap_traj_delta_fn
         self._reg_pub = reg_request_pub
         self._path_pub = path_pub
@@ -104,11 +100,6 @@ class GlobalPoseGraph:
             dtype=np.float64,
         )
         self._between_noise = gtsam.noiseModel.Diagonal.Sigmas(sub_sigmas)
-        imu_sigmas = np.array(
-            [submap_imu_sigma_r] * 3 + [submap_imu_sigma_t] * 3,
-            dtype=np.float64,
-        )
-        self._submap_imu_noise = gtsam.noiseModel.Diagonal.Sigmas(imu_sigmas)
         traj_sigmas = np.array(
             [submap_traj_sigma_r] * 3 + [submap_traj_sigma_t] * 3,
             dtype=np.float64,
@@ -146,6 +137,8 @@ class GlobalPoseGraph:
         self.submap_gmm: dict = {}
         self.submap_gmm_path: dict = {}
         self.submap_gmm_components: dict = {}
+        # Frozen display pose captured at submap finalization time.
+        self.submap_frozen_pose_by_idx: dict = {}
 
         # Loop-edge tracking at the global (submap) level
         self.loop_edges_added: set = set()
@@ -322,34 +315,9 @@ class GlobalPoseGraph:
         prev_anchor_t,
         curr_anchor_t,
     ):
-        """Add optional transition factors from IMU and fixed-lag trajectory."""
+        """Add optional transition factors from the fixed-lag trajectory."""
         if prev_anchor_key is None or curr_anchor_key is None:
             return
-
-        if self._get_submap_imu_delta is not None:
-            try:
-                T_imu = self._get_submap_imu_delta(
-                    prev_anchor_key, curr_anchor_key, prev_anchor_t, curr_anchor_t
-                )
-                if self._passes_aux_gate("imu", T_imu, T_ref_rel):
-                    self._new_factors.push_back(
-                        gtsam.BetweenFactorPose3(
-                            X(prev_sid),
-                            X(curr_sid),
-                            self._p3(T_imu),
-                            self._submap_imu_noise,
-                        )
-                    )
-                    pos = T_imu[:3, 3]
-                    rospy.loginfo(
-                        f"[global_graph] ADDED BetweenFactor (submap imu) "
-                        f"S({prev_sid})->S({curr_sid}) "
-                        f"t=[{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}]"
-                    )
-            except Exception as e:
-                rospy.logwarn_throttle(
-                    2.0, f"[global_graph] failed IMU submap factor S({prev_sid})->S({curr_sid}): {e}"
-                )
 
         if self._get_submap_traj_delta is not None:
             try:
@@ -418,6 +386,8 @@ class GlobalPoseGraph:
 
         self.submap_gmm[sid] = merged
         self.submap_gmm_components[sid] = precompute_gmm_local_data(merged)
+        # Freeze rendering pose at finalize time (before further registrations).
+        self.submap_frozen_pose_by_idx[sid] = T_ref.copy()
 
         n_comp = merged.n_components_ if hasattr(merged, "n_components_") else merged.n_components
         rospy.loginfo(
