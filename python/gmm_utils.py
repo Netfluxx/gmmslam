@@ -55,7 +55,7 @@ def filter_well_conditioned_gmm(gmm_3d, reg: float = 1e-4):
     if hasattr(gmm_3d, "means_"):
         K = int(gmm_3d.means_.shape[0])
     else:
-        K = int(getattr(gmm_3d, "n_components_", getattr(gmm_3d, "n_components")))
+        K = int(gmm_3d.n_components_)
     keep = []
     dropped_bad = []
 

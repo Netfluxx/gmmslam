@@ -9,7 +9,7 @@ with open(path) as f:
     lines = f.readlines()
 
 insert = (
-    '\noption(OPEN3D_CUDA_ARCHS "CUDA architectures to target (e.g., 75;86)" "75")\n'
+    '\noption(OPEN3D_CUDA_ARCHS "CUDA architectures to target (e.g., 75;86)" "89")\n'
     "if(BUILD_CUDA_MODULE)\n"
     '    set(CMAKE_CUDA_ARCHITECTURES "${OPEN3D_CUDA_ARCHS}" CACHE STRING "CUDA architectures" FORCE)\n'
     '    message(STATUS "Using CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")\n'

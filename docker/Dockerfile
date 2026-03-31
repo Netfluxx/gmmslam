@@ -5,7 +5,7 @@
 
 # run: docker compose run --rm disal_slam OR docker compose up -d disal_slam && docker exec -it disal_slam bash
 
-FROM nvidia/cuda:12.1.0-devel-ubuntu20.04
+FROM nvidia/cuda:11.8.0-devel-ubuntu20.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV ROS_DISTRO noetic
@@ -50,8 +50,23 @@ RUN /bin/bash -c "source /opt/ros/${ROS_DISTRO}/setup.bash && catkin_make"
 # --- GIRA3D system dependencies ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.8 python3.8-venv python3.8-dev \
-    libboost-all-dev libblas-dev && \
+    libboost-all-dev libblas-dev \
+    libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
+    libxext-dev libx11-dev libgl1-mesa-dev \
+    libc++-dev libc++abi-dev && \
     rm -rf /var/lib/apt/lists/*
+
+# --- Update SSL certs (needed for GitHub downloads during Open3D build) ---
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libssl-dev && \
+    update-ca-certificates && \
+    rm -rf /var/lib/apt/lists/*
+
+# --- CMake 3.24 (Open3D needs >=3.20; <=3.26 avoids breaking old cmake_minimum_required) ---
+RUN wget -qO /tmp/cmake.tar.gz https://github.com/Kitware/CMake/releases/download/v3.24.4/cmake-3.24.4-linux-x86_64.tar.gz && \
+    tar -xzf /tmp/cmake.tar.gz -C /usr/local --strip-components=1 && \
+    rm /tmp/cmake.tar.gz && \
+    cmake --version
 
 # --- Eigen 3.4.0 from source (gira3d-reconstruction needs 3.4) ---
 RUN git clone --branch 3.4.0 https://gitlab.com/libeigen/eigen.git /tmp/eigen && \
@@ -79,13 +94,30 @@ RUN git clone https://github.com/gira3d/gira3d-reconstruction.git ${GIRA_WS}/gir
 COPY docker/patch_open3d_colcon.py docker/patch_open3d.py /tmp/
 RUN python3 /tmp/patch_open3d_colcon.py && python3 /tmp/patch_open3d.py
 
+# Strip trailing C++ comment from thrust/version.h so stdgpu's Findthrust.cmake can parse it
+RUN sed -i 's|^\(#define THRUST_VERSION [0-9]*\) //.*|\1|' /usr/local/cuda/include/thrust/version.h
+
 # Install Python deps and build
 RUN cd ${GIRA_WS}/gira3d-reconstruction && \
     python3.8 -m venv .venv && \
     .venv/bin/pip install --upgrade pip && \
     .venv/bin/pip install colcon-common-extensions wheel && \
     .venv/bin/pip install 'numpy>=1.19,<2.0' 'scipy>=1.5' scikit-learn opencv-python scikit-image future matplotlib termcolor 'open3d>=0.13' && \
-    bash -c "source .venv/bin/activate && CMAKE_POLICY_VERSION_MINIMUM=3.5 ./build"
+    bash -c "source .venv/bin/activate && \
+    cd dry/ && \
+    colcon build --symlink-install --cmake-args \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+      -DBUILD_CUDA_MODULE=ON \
+      -DBUILD_ISPC_MODULE=OFF \
+      -DCMAKE_CUDA_ARCHITECTURES=89 && \
+    cd .. && source workon && \
+    cd wet/ && \
+    colcon build --symlink-install --cmake-args \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_EXPORT_COMPILE_COMMANDS=ON && \
+    cd .. && source workon && \
+    cd dry/build/open3d_colcon/ && make install-pip-package -j\$(nproc)"
 
 # --- X11 / display libs ---
 ENV DISPLAY=:0

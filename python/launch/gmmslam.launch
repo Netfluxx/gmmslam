@@ -76,8 +76,8 @@
   <!-- GMM -->
   <arg name="sogmm_bandwidth"    default="0.015"/>
   <!-- depth cam in sim has 424x240=101760 pixels -->
-  <arg name="sogmm_max_points"   default="500"/>
-  <arg name="sogmm_n_components" default="50"/>
+  <arg name="sogmm_max_points"   default="1500"/>
+  <arg name="sogmm_n_components" default="0"/>
 
   <!-- iSAM2 -->
   <arg name="lag"              default="8.0"/>

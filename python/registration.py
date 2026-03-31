@@ -77,7 +77,7 @@ class RegistrationManager:
 
         # Configuration
         self.sogmm_bandwidth = cfg.get("sogmm_bandwidth", 0.1)
-        self.sogmm_compute = cfg.get("sogmm_compute", "CPU")
+        self.sogmm_compute = cfg.get("sogmm_compute", "GPU")
         self.sogmm_max_points = cfg.get("sogmm_max_points", 2000)
         self.sogmm_n_components = cfg.get("sogmm_n_components", 0)
         self.gmm_dir = cfg.get("gmm_dir", "/tmp/gmmslam_gmms")
@@ -249,7 +249,7 @@ class RegistrationManager:
             for k in stale:
                 del self.local_gmms_by_idx[k]
 
-        n_local = getattr(local_model, "n_components_", local_model.n_components)
+        n_local = local_model.n_components_
         rospy.loginfo(
             f"[registration] frame {frame_idx:4d} | "
             f"local GMM: {n_local:3d} components"
@@ -652,7 +652,7 @@ class RegistrationManager:
                     pose_snap = dict(self.smoother.pose_by_idx)
                     stamp_msg = rospy.Time.from_sec(result_stamp_sec)
                 self.global_graph.add_loop_factor(
-                        prev_idx, curr_idx, T, stamp_msg, pose_snap, score=score
+                    prev_idx, curr_idx, T, stamp_msg, pose_snap, score=score
                 )
 
         try:
@@ -833,9 +833,7 @@ class RegistrationManager:
                 sigma_r_max=self.seq_sigma_r_max,
             )
             sm.stage_factor(
-                gtsam.BetweenFactorPose3(
-                    X(prev_idx), X(curr_idx), rel_pose, noise
-                )
+                gtsam.BetweenFactorPose3(X(prev_idx), X(curr_idx), rel_pose, noise)
             )
             rospy.loginfo(
                 f"[registration] staged between factor X({prev_idx})->X({curr_idx}) "

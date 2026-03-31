@@ -20,10 +20,8 @@ new = (
     "    open3d_make_cuda_architectures(CUDA_ARCHS)\n"
     '    set(OPEN3D_CUDA_ARCHS "${CUDA_ARCHS}")\n'
     "endif()\n"
-    'if("${OPEN3D_CUDA_ARCHS}" MATCHES ".*86.*")\n'
-    '    set(OPEN3D_CUDA_ARCHS "75" CACHE STRING "CUDA architectures override" FORCE)\n'
-    '    message(WARNING "Overriding CUDA architectures to 75 to avoid unsupported compute_86.")\n'
-    "endif()\n"
+    'set(OPEN3D_CUDA_ARCHS "89" CACHE STRING "CUDA architectures override" FORCE)\n'
+    'message(STATUS "CUDA architectures set to ${OPEN3D_CUDA_ARCHS}")\n'
     "set(CMAKE_CUDA_ARCHITECTURES ${OPEN3D_CUDA_ARCHS})"
 )
 

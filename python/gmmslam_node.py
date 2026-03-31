@@ -77,7 +77,7 @@ class GMMSLAMNode:
 
         # SOGMM
         self.sogmm_bandwidth = rospy.get_param("~sogmm_bandwidth", 0.1)
-        self.sogmm_compute = rospy.get_param("~sogmm_compute", "CPU")
+        self.sogmm_compute = rospy.get_param("~sogmm_compute", "GPU")
         self.sogmm_max_points = rospy.get_param("~sogmm_max_points", 2000)
         self.sogmm_n_components = rospy.get_param("~sogmm_n_components", 0)
         self.gmm_marker_sigma = float(rospy.get_param("~gmm_marker_sigma", 3.0))
