@@ -374,11 +374,17 @@ class Visualizer:
 
         with self.smoother.graph_lock:
             pose_snap = {k: v.copy() for k, v in self.smoother.pose_by_idx.items()}
+        with reg.lock:
+            map_pose_snap = {
+                k: entry[2].copy()
+                for k, entry in reg.local_gmms_by_idx.items()
+                if len(entry) > 2 and entry[2] is not None
+            }
 
         for idx, components in self._global_gmm_cache:
             if idx in finalized_keys:
                 continue
-            T_i = pose_snap.get(idx)
+            T_i = pose_snap.get(idx, map_pose_snap.get(idx))
             if T_i is None:
                 continue
             # Use the current open submap's color if available

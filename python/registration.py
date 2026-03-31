@@ -279,17 +279,13 @@ class RegistrationManager:
                     frame_idx, self.smoother.pose
                 ).copy()
 
-        if self.compensate_fit_latency_in_map:
-            with self.smoother.graph_lock:
-                map_pose = self.smoother.pose_by_idx.get(frame_idx)
-                if map_pose is not None:
-                    map_pose = map_pose.copy()
-                else:
-                    T_now = self.smoother.pose.copy()
-                    map_pose = T_now @ np.linalg.inv(capture_pose) @ capture_pose
-        else:
-            with self.smoother.graph_lock:
-                map_pose = self.smoother.pose_by_idx.get(frame_idx, capture_pose).copy()
+        with self.smoother.graph_lock:
+            optimized = self.smoother.pose_by_idx.get(frame_idx)
+            if optimized is not None:
+                map_pose = optimized.copy()
+                capture_pose = optimized.copy()
+            else:
+                map_pose = capture_pose.copy()
 
         with self.lock:
             self.gmm_paths_by_idx[frame_idx] = gmm_path

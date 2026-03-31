@@ -84,9 +84,13 @@ class GMMSLAMNode:
         self.plot_first_frame = rospy.get_param("~plot_first_frame", False)
 
         # Backend
-        self.fixed_lag_s = rospy.get_param("~fixed_lag_s", 10.0)
-        self.odom_noise_sigma_t = rospy.get_param("~odom_noise_sigma_t", 0.06)
-        self.odom_noise_sigma_r = rospy.get_param("~odom_noise_sigma_r", 0.06)
+        self.fixed_lag_s = float(_pa("~fixed_lag_s", "~lag", 10.0))
+        self.odom_noise_sigma_t = float(
+            _pa("~odom_noise_sigma_t", "~odom_noise_trans", 0.06)
+        )
+        self.odom_noise_sigma_r = float(
+            _pa("~odom_noise_sigma_r", "~odom_noise_rot", 0.06)
+        )
         self.enable_imu_preintegration = bool(
             rospy.get_param("~enable_imu_preintegration", True)
         )
@@ -173,7 +177,7 @@ class GMMSLAMNode:
                     _pa(
                         "~registration_request_stride",
                         "~registration_fit_stride",
-                        2,
+                        3,
                     ),
                 )
             ),
@@ -299,10 +303,27 @@ class GMMSLAMNode:
         # GT factors
         self.gt_init_wait_s = float(rospy.get_param("~gt_init_wait_s", 3.0))
         self.use_noisy_gt_factor = rospy.get_param("~use_noisy_gt_factor", True)
-        self.gt_noise_sigma_t = rospy.get_param("~gt_noise_sigma_t", 0.00)
-        self.gt_noise_sigma_r = rospy.get_param("~gt_noise_sigma_r", 0.00)
-        self.gt_factor_sigma_t = rospy.get_param("~gt_factor_sigma_t", 0.0001)
-        self.gt_factor_sigma_r = rospy.get_param("~gt_factor_sigma_r", 0.0001)
+        self.gt_noise_sigma_t = float(rospy.get_param("~gt_noise_sigma_t", 0.00))
+        self.gt_noise_sigma_r = float(rospy.get_param("~gt_noise_sigma_r", 0.00))
+        # GT factor noise should reflect actual measurement noise: differencing
+        # two absolute noisy poses gives relative noise ~sqrt(2)*sigma_abs.
+        # A hard-coded 0.0001 starves the smoother and prevents D2D corrections.
+        _default_gt_factor_sigma_t = (
+            max(0.001, float(np.sqrt(2) * self.gt_noise_sigma_t))
+            if self.gt_noise_sigma_t > 0
+            else 0.0001
+        )
+        _default_gt_factor_sigma_r = (
+            max(0.001, float(np.sqrt(2) * self.gt_noise_sigma_r))
+            if self.gt_noise_sigma_r > 0
+            else 0.0001
+        )
+        self.gt_factor_sigma_t = float(
+            rospy.get_param("~gt_factor_sigma_t", _default_gt_factor_sigma_t)
+        )
+        self.gt_factor_sigma_r = float(
+            rospy.get_param("~gt_factor_sigma_r", _default_gt_factor_sigma_r)
+        )
         self.gt_noise_seed = rospy.get_param("~gt_noise_seed", -1)
         self.noisy_gt_topic = rospy.get_param(
             "~noisy_gt_topic", "/gmmslam_node/noisy_gt_pose"
@@ -312,6 +333,11 @@ class GMMSLAMNode:
         rospy.loginfo(f"[gmmslam] lidar_topic  : {self.lidar_topic}")
         rospy.loginfo(f"[gmmslam] odom_frame   : {self.odom_frame}")
         rospy.loginfo(f"[gmmslam] fixed_lag_s  : {self.fixed_lag_s}")
+        rospy.loginfo(
+            f"[gmmslam] gt_factor_sigma: t={self.gt_factor_sigma_t:.6f} "
+            f"r={self.gt_factor_sigma_r:.6f} "
+            f"(gt_noise: t={self.gt_noise_sigma_t:.4f} r={self.gt_noise_sigma_r:.4f})"
+        )
         rospy.loginfo(f"[gmmslam] async reg    : {self.enable_async_registration}")
         rospy.loginfo(
             f"[gmmslam] keyframe (global graph / reg only): "
@@ -337,9 +363,12 @@ class GMMSLAMNode:
         self._latest_gt_pose_raw = None
         self._latest_gt_pose = None
         self._latest_noisy_gt_pose_msg = None
+        self._noisy_gt_buffer = []  # [(t_sec, T_4x4), ...] ring buffer
+        self._noisy_gt_buffer_max = 200
         self._gt_origin_inv = None
         self._gt_init_start_time = None
         self._last_gt_T_for_factor = None
+        self._last_gt_T_stamp_sec = None
         self._gt_path = Path()
         self._gt_path.header.frame_id = self.odom_frame
         self._rng = (
@@ -574,6 +603,12 @@ class GMMSLAMNode:
 
     def _noisy_gt_input_callback(self, msg: PoseStamped):
         self._latest_noisy_gt_pose_msg = msg
+        t = stamp_to_sec(msg.header.stamp)
+        T = pose_msg_to_matrix(msg.pose)
+        buf = self._noisy_gt_buffer
+        buf.append((t, T))
+        if len(buf) > self._noisy_gt_buffer_max:
+            del buf[: len(buf) - self._noisy_gt_buffer_max]
 
     def _ensure_gt_origin_initialized(self, stamp) -> bool:
         if self._gt_origin_inv is not None:
@@ -707,14 +742,21 @@ class GMMSLAMNode:
         return np.linalg.inv(T_prev) @ T_curr
 
     def _get_keyframe_gmm(self, key_idx):
-        """Retrieve (gmm, capture_pose) for a keyframe, or None."""
+        """Retrieve (gmm, best_pose) for a keyframe, or None.
+
+        Prefers the optimized map_pose (entry[2]) computed at fit-completion
+        time over the raw capture_pose (entry[5]) which may still be the
+        un-optimized prediction from keyframe creation.
+        """
         with self.registration.lock:
             entry = self.registration.local_gmms_by_idx.get(key_idx)
         if entry is None:
             return None
         gmm = entry[1]
+        map_pose = entry[2] if len(entry) > 2 else None
         capture_pose = entry[5] if len(entry) > 5 else None
-        return (gmm, capture_pose)
+        best_pose = map_pose if map_pose is not None else capture_pose
+        return (gmm, best_pose)
 
     # ==================================================================
     # Main point-cloud callback
@@ -859,6 +901,22 @@ class GMMSLAMNode:
     # GT noise sampling
     # ==================================================================
 
+    def _lookup_noisy_gt_at(self, t_sec):
+        """Find the noisy GT pose closest to *t_sec* from the ring buffer."""
+        buf = self._noisy_gt_buffer
+        if not buf:
+            return None
+        best_i = 0
+        best_dt = abs(buf[0][0] - t_sec)
+        for i in range(1, len(buf)):
+            dt = abs(buf[i][0] - t_sec)
+            if dt < best_dt:
+                best_dt = dt
+                best_i = i
+            elif buf[i][0] > t_sec:
+                break
+        return buf[best_i][1]
+
     def _sample_noisy_gt_relative_pose3(self, stamp):
         """Build GT-relative motion matrix for BetweenFactor.
 
@@ -868,13 +926,25 @@ class GMMSLAMNode:
         if not self.use_noisy_gt_factor:
             return None
 
-        if self._latest_noisy_gt_pose_msg is not None:
-            T_curr = pose_msg_to_matrix(self._latest_noisy_gt_pose_msg.pose)
+        t_cloud = stamp_to_sec(stamp)
+
+        if self._noisy_gt_buffer:
+            T_curr = self._lookup_noisy_gt_at(t_cloud)
+            if T_curr is None:
+                T_curr = (
+                    pose_msg_to_matrix(self._latest_noisy_gt_pose_msg.pose)
+                    if self._latest_noisy_gt_pose_msg is not None
+                    else None
+                )
+            if T_curr is None:
+                return None
             if self._last_gt_T_for_factor is None:
                 self._last_gt_T_for_factor = T_curr
+                self._last_gt_T_stamp_sec = t_cloud
                 return None
             T_prev = self._last_gt_T_for_factor
             self._last_gt_T_for_factor = T_curr
+            self._last_gt_T_stamp_sec = t_cloud
             return np.linalg.inv(T_prev) @ T_curr
 
         if self._latest_gt_pose is None:

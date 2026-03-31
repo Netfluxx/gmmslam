@@ -6,9 +6,9 @@
   <arg name="odom_frame"       default="world"/>
   <arg name="base_frame"       default="m500_1_base_link"/>
   <arg name="enable_async_registration" default="true"/>
-  <arg name="registration_request_every_n_frames" default="2"/>
-  <arg name="registration_factor_every_n_frames"  default="2"/>
-  <arg name="registration_score_threshold" default="-1e9"/>
+  <arg name="registration_request_every_n_frames" default="3"/>
+  <arg name="registration_factor_every_n_frames"  default="3"/>
+  <arg name="registration_score_threshold" default="0.3"/>
   <arg name="strong_factor_score_threshold" default="2.0"/>
   <arg name="strong_factor_sigma_t" default="0.01"/>
   <arg name="strong_factor_sigma_r" default="0.01"/>
@@ -25,8 +25,8 @@
   <arg name="loop_closure_gmm_keep_keyframes" default="2000"/>
   <arg name="pose_history_keep_keyframes" default="5000"/>
   <arg name="loop_closure_detect_score_threshold" default="1.1"/>
-  <arg name="loop_closure_super_sigma_t" default="0.001"/>
-  <arg name="loop_closure_super_sigma_r" default="0.001"/>
+  <arg name="loop_closure_super_sigma_t" default="0.01"/>
+  <arg name="loop_closure_super_sigma_r" default="0.01"/>
   <!-- score sigma low => D2D reg. score value corresponding to high noise -->
   <arg name="score_sigma_low" default="0.6"/>
   <!-- score sigma high => D2D reg. score value corresponding to low noise -->
@@ -59,12 +59,17 @@
   <arg name="submap_between_sigma_r" default="0.08"/>
   <arg name="submap_prior_sigma_t" default="0.02"/>
   <arg name="submap_prior_sigma_r" default="0.02"/>
-  <arg name="submap_overlap_radius_m" default="1.0"/>
+  <arg name="submap_overlap_radius_m" default="3.0"/>
   <arg name="submap_reg_score_threshold" default="0.5"/>
   <arg name="gt_topic" default="/m500_1/mavros/local_position/pose"/>
   <arg name="gt_init_wait_s" default="3.0"/>
   <arg name="gt_noise_sigma_t" default="0.03"/>
   <arg name="gt_noise_sigma_r" default="0.03"/>
+  <!-- GT factor noise: should be >= sqrt(2)*gt_noise_sigma to match
+       the actual measurement noise from differencing noisy absolute poses.
+       Auto-derived from gt_noise_sigma if omitted in the node code. -->
+  <arg name="gt_factor_sigma_t" default="0.045"/>
+  <arg name="gt_factor_sigma_r" default="0.045"/>
   <arg name="gt_noise_seed" default="-1"/>
   <arg name="noisy_gt_topic" default="/gmmslam_node/noisy_gt_pose"/>
 
@@ -96,7 +101,7 @@
   <arg name="submap_traj_sigma_t" default="0.15"/>
   <arg name="submap_traj_sigma_r" default="0.15"/>
   <arg name="submap_aux_gate_abs_trans_m" default="2.5"/>
-  <arg name="submap_aux_gate_abs_rot_deg" default="120.0"/>
+  <arg name="submap_aux_gate_abs_rot_deg" default="50.0"/>
   <arg name="submap_aux_gate_consistency_trans_m" default="2.0"/>
   <arg name="submap_aux_gate_consistency_rot_deg" default="35.0"/>
 
@@ -178,6 +183,8 @@
     <param name="gt_init_wait_s" value="$(arg gt_init_wait_s)"/>
     <param name="gt_noise_sigma_t" value="$(arg gt_noise_sigma_t)"/>
     <param name="gt_noise_sigma_r" value="$(arg gt_noise_sigma_r)"/>
+    <param name="gt_factor_sigma_t" value="$(arg gt_factor_sigma_t)"/>
+    <param name="gt_factor_sigma_r" value="$(arg gt_factor_sigma_r)"/>
     <param name="gt_noise_seed" value="$(arg gt_noise_seed)"/>
     <param name="noisy_gt_topic" value="$(arg noisy_gt_topic)"/>
 
@@ -189,9 +196,9 @@
     <param name="sogmm_max_points"   value="$(arg sogmm_max_points)"/>
     <param name="sogmm_n_components" value="$(arg sogmm_n_components)"/>
 
-    <param name="lag"              value="$(arg lag)"/>
-    <param name="odom_noise_rot"   value="$(arg odom_noise_rot)"/>
-    <param name="odom_noise_trans" value="$(arg odom_noise_trans)"/>
+    <param name="fixed_lag_s"      value="$(arg lag)"/>
+    <param name="odom_noise_sigma_r"  value="$(arg odom_noise_rot)"/>
+    <param name="odom_noise_sigma_t"  value="$(arg odom_noise_trans)"/>
     <param name="enable_imu_preintegration" value="$(arg enable_imu_preintegration)"/>
     <param name="imu_gravity_mps2" value="$(arg imu_gravity_mps2)"/>
     <param name="imu_buffer_keep_s" value="$(arg imu_buffer_keep_s)"/>
