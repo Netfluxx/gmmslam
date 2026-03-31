@@ -85,6 +85,7 @@ class GMMSLAMNode:
 
         # Backend
         self.fixed_lag_s = float(_pa("~fixed_lag_s", "~lag", 10.0))
+        self.smoother_stride = max(1, int(rospy.get_param("~smoother_stride", 1)))
         self.odom_noise_sigma_t = float(
             _pa("~odom_noise_sigma_t", "~odom_noise_trans", 0.06)
         )
@@ -333,6 +334,7 @@ class GMMSLAMNode:
         rospy.loginfo(f"[gmmslam] lidar_topic  : {self.lidar_topic}")
         rospy.loginfo(f"[gmmslam] odom_frame   : {self.odom_frame}")
         rospy.loginfo(f"[gmmslam] fixed_lag_s  : {self.fixed_lag_s}")
+        rospy.loginfo(f"[gmmslam] smoother_stride: {self.smoother_stride}")
         rospy.loginfo(
             f"[gmmslam] gt_factor_sigma: t={self.gt_factor_sigma_t:.6f} "
             f"r={self.gt_factor_sigma_r:.6f} "
@@ -355,6 +357,9 @@ class GMMSLAMNode:
         self._last_keyframe_pose = None
         self._last_keyframe_t_sec = None
         self._first_cloud_seen = False
+        self._smoother_frame_counter = 0
+        self._last_smoother_stamp = None
+        self._accumulated_gt_rel = None
         self._reg_enqueue_resume_frame = 0
         self._last_backpressure_log_t = 0.0
         self._last_cloud_t_sec_processed = None
@@ -822,77 +827,98 @@ class GMMSLAMNode:
             else:
                 predicted = sm.pose.copy()
 
-        imu_measurements = self._imu_measurements_between(
-            self._last_cloud_stamp_for_imu, stamp
+        # 5. Accumulate GT relative motion for the next smoother update
+        if gt_rel_mat is not None:
+            if self._accumulated_gt_rel is None:
+                self._accumulated_gt_rel = gt_rel_mat.copy()
+            else:
+                self._accumulated_gt_rel = self._accumulated_gt_rel @ gt_rel_mat
+
+        # 6. Feed the fixed-lag smoother every N-th frame
+        self._smoother_frame_counter += 1
+        is_smoother_frame = (
+            self._smoother_frame_counter % self.smoother_stride == 0
         )
-        if self.enable_imu_preintegration:
-            rospy.logdebug(
-                f"[gmmslam] frame {self._frame_count}: imu samples for preintegration="
-                f"{len(imu_measurements)}"
+
+        if is_smoother_frame:
+            imu_measurements = self._imu_measurements_between(
+                self._last_smoother_stamp, stamp
             )
-
-        # 5. **EVERY FRAME**: feed the fixed-lag smoother
-        curr_odom = self._odom_idx
-        prev_odom = curr_odom - 1
-        sm.add_frame(
-            prev_idx=prev_odom,
-            curr_idx=curr_odom,
-            stamp=stamp,
-            predicted_pose=predicted,
-            gt_rel_mat=gt_rel_mat,
-            imu_measurements=imu_measurements,
-        )
-        self._last_cloud_stamp_for_imu = stamp
-        self._odom_idx += 1
-
-        if curr_odom % 10 == 0:
-            p = predicted[:3, 3]
-            has_odom = gt_rel_mat is not None
-            rospy.loginfo(
-                f"[gmmslam] X({curr_odom}) pos=[{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}] "
-                f"odom={'GT' if has_odom else 'LOST'}"
-            )
-
-        # 6. Keyframe check (global graph + registration ONLY)
-        if self._should_add_keyframe(stamp):
-            with sm.graph_lock:
-                self._last_keyframe_pose = sm.pose.copy()
-            self._last_keyframe_t_sec = stamp_to_sec(stamp)
-            self._keyframe_odom_indices.append(curr_odom)
-            self._keyframe_count += 1
-
-            with sm.graph_lock:
-                T_curr = sm.pose_by_idx.get(curr_odom, sm.pose).copy()
-            self.global_graph.update_with_keyframe(
-                curr_odom, stamp, T_curr, stamp_to_sec(stamp)
-            )
-
-            if (
-                self.enable_async_registration
-                and HAS_SOGMM
-                and (
-                    self._keyframe_count % self.registration_request_every_n_frames == 0
+            if self.enable_imu_preintegration:
+                rospy.logdebug(
+                    f"[gmmslam] frame {self._frame_count}: imu samples for "
+                    f"preintegration={len(imu_measurements)}"
                 )
-                and (curr_odom >= self._reg_enqueue_resume_frame)
-            ):
+
+            curr_odom = self._odom_idx
+            prev_odom = curr_odom - 1
+            sm.add_frame(
+                prev_idx=prev_odom,
+                curr_idx=curr_odom,
+                stamp=stamp,
+                predicted_pose=predicted,
+                gt_rel_mat=self._accumulated_gt_rel,
+                imu_measurements=imu_measurements,
+            )
+            self._last_smoother_stamp = stamp
+            self._odom_idx += 1
+            self._accumulated_gt_rel = None
+
+            if curr_odom % 10 == 0:
+                p = predicted[:3, 3]
+                has_odom = gt_rel_mat is not None
+                rospy.loginfo(
+                    f"[gmmslam] X({curr_odom}) pos=[{p[0]:.3f}, {p[1]:.3f}, {p[2]:.3f}] "
+                    f"odom={'GT' if has_odom else 'LOST'}"
+                )
+
+            # 7. Keyframe check (global graph + registration ONLY)
+            if self._should_add_keyframe(stamp):
                 with sm.graph_lock:
-                    capture_pose = sm.pose_by_idx.get(curr_odom, sm.pose).copy()
-                capture_t = stamp_to_sec(stamp)
-                ok = self.registration.enqueue_fit(
-                    curr_odom, stamp, pts, capture_t, capture_pose
-                )
-                if not ok and self.registration_enqueue_cooldown_frames > 0:
-                    self._reg_enqueue_resume_frame = (
-                        curr_odom + self.registration_enqueue_cooldown_frames
-                    )
+                    self._last_keyframe_pose = sm.pose.copy()
+                self._last_keyframe_t_sec = stamp_to_sec(stamp)
+                self._keyframe_odom_indices.append(curr_odom)
+                self._keyframe_count += 1
 
-        # 7. Publish
+                with sm.graph_lock:
+                    T_curr = sm.pose_by_idx.get(curr_odom, sm.pose).copy()
+                self.global_graph.update_with_keyframe(
+                    curr_odom, stamp, T_curr, stamp_to_sec(stamp)
+                )
+
+                if (
+                    self.enable_async_registration
+                    and HAS_SOGMM
+                    and (
+                        self._keyframe_count
+                        % self.registration_request_every_n_frames
+                        == 0
+                    )
+                    and (curr_odom >= self._reg_enqueue_resume_frame)
+                ):
+                    with sm.graph_lock:
+                        capture_pose = sm.pose_by_idx.get(
+                            curr_odom, sm.pose
+                        ).copy()
+                    capture_t = stamp_to_sec(stamp)
+                    ok = self.registration.enqueue_fit(
+                        curr_odom, stamp, pts, capture_t, capture_pose
+                    )
+                    if not ok and self.registration_enqueue_cooldown_frames > 0:
+                        self._reg_enqueue_resume_frame = (
+                            curr_odom + self.registration_enqueue_cooldown_frames
+                        )
+        else:
+            # Non-smoother frame: propagate pose prediction without GTSAM
+            with sm.graph_lock:
+                sm.pose = predicted.copy()
+
+        # 8. Publish
         try:
             with sm.graph_lock:
                 T_pub = sm.pose.copy()
-                T_cloud = sm.pose_by_idx.get(curr_odom, T_pub).copy()
             self.visualizer.publish_pose_only(T_pub, stamp)
-            self.visualizer.enqueue_frame(stamp, pts, self._frame_count, T_cloud)
+            self.visualizer.enqueue_frame(stamp, pts, self._frame_count, T_pub)
         finally:
             self._log_backpressure_periodic(stamp)
             self._frame_count += 1

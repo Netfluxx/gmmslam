@@ -16,13 +16,13 @@
   <arg name="enable_loop_closure_detection" default="true"/>
   <arg name="loop_closure_search_radius_m" default="2.5"/>
   <arg name="loop_closure_min_keyframe_gap" default="10"/>
-  <arg name="loop_closure_max_candidates" default="3"/>
-  <arg name="loop_closure_request_every_n_keyframes" default="1"/>
+  <arg name="loop_closure_max_candidates" default="5"/>
+  <arg name="loop_closure_request_every_n_keyframes" default="2"/>
   <arg name="loop_closure_search_cooldown_keyframes" default="2"/>
   <arg name="loop_closure_min_separation_m" default="0.8"/>
   <arg name="loop_closure_min_separation_deg" default="20.0"/>
   <arg name="loop_closure_max_age_s" default="720.0"/>
-  <arg name="loop_closure_gmm_keep_keyframes" default="2000"/>
+  <arg name="loop_closure_gmm_keep_keyframes" default="15000"/>
   <arg name="pose_history_keep_keyframes" default="5000"/>
   <arg name="loop_closure_detect_score_threshold" default="1.1"/>
   <arg name="loop_closure_super_sigma_t" default="0.01"/>
@@ -47,14 +47,14 @@
   <arg name="registration_workers" default="6"/>
   <!-- Keyframe parameters -->
   <arg name="keyframe_translation_thresh_m" default="0.3"/>
-  <arg name="keyframe_rotation_thresh_deg" default="5.0"/>
+  <arg name="keyframe_rotation_thresh_deg" default="7.0"/>
   <arg name="keyframe_use_time_trigger" default="false"/>
   <arg name="compensate_fit_latency_in_map" default="true"/>
   <!-- Submap parameters -->
   <arg name="enable_global_pose_graph" default="true"/>
   <arg name="submap_keyframes_per_submap" default="10"/>
   <arg name="submap_translation_thresh_m" default="0.3"/>
-  <arg name="submap_rotation_thresh_deg" default="5.0"/>
+  <arg name="submap_rotation_thresh_deg" default="7.0"/>
   <arg name="submap_between_sigma_t" default="0.08"/>
   <arg name="submap_between_sigma_r" default="0.08"/>
   <arg name="submap_prior_sigma_t" default="0.02"/>
@@ -79,16 +79,17 @@
   <arg name="voxel_leaf_size"  default="0.05"/>
 
   <!-- GMM -->
-  <arg name="sogmm_bandwidth"    default="0.015"/>
+  <arg name="sogmm_bandwidth"    default="0.02"/>
   <!-- depth cam in sim has 424x240=101760 pixels -->
-  <arg name="sogmm_max_points"   default="1500"/>
+  <arg name="sogmm_max_points"   default="2000"/>
   <arg name="sogmm_n_components" default="0"/>
 
   <!-- iSAM2 -->
-  <arg name="lag"              default="8.0"/>
+  <arg name="lag"              default="4.0"/>
+  <arg name="smoother_stride"  default="3"/>
   <arg name="odom_noise_rot"   default="0.03"/>
   <arg name="odom_noise_trans" default="0.03"/>
-  <arg name="enable_imu_preintegration" default="true"/>
+  <arg name="enable_imu_preintegration" default="false"/>
   <arg name="imu_gravity_mps2" default="9.81"/>
   <arg name="imu_buffer_keep_s" default="30.0"/>
   <arg name="imu_acc_noise_sigma" default="0.2"/>
@@ -197,6 +198,7 @@
     <param name="sogmm_n_components" value="$(arg sogmm_n_components)"/>
 
     <param name="fixed_lag_s"      value="$(arg lag)"/>
+    <param name="smoother_stride"  value="$(arg smoother_stride)"/>
     <param name="odom_noise_sigma_r"  value="$(arg odom_noise_rot)"/>
     <param name="odom_noise_sigma_t"  value="$(arg odom_noise_trans)"/>
     <param name="enable_imu_preintegration" value="$(arg enable_imu_preintegration)"/>
