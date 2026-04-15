@@ -15,6 +15,7 @@ services:
       - disal_slam:/root
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
       - ../python:/opt/gmmslam/python:rw
+      - ..:/root/catkin_ws/src/gmmslam:rw
     network_mode: host
     deploy:
       resources:

@@ -1,124 +1,170 @@
 # =============================================================================
-# GMM-SLAM parameters
+# GMM-SLAM C++ node – full parameter set
+# Default values match the Python launch file (gmmslam.launch).
 # =============================================================================
 
-# -----------------------------------------------------------------------------
-# Hardware / runtime
-# -----------------------------------------------------------------------------
-use_gpu: false          # true → GPU SOGMM + sogmm_to_gmm3f() path; false → CPU
-
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # ROS interface
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 ros:
-  lidar_topic:  "/m500_1/mpa/depth/points"   # ← drone depth point cloud
-  imu_topic:    ""                             # no IMU on m500 currently
+  lidar_topic:  "/m500_1/mpa/depth/points"
+  gt_topic:     "/m500_1/mavros/local_position/pose"
+  imu_topic:    "/m500_1/mavros/imu/data"
   sensor_frame: "depth_camera_1"
   odom_frame:   "world"
   base_frame:   "m500_1_base_link"
+  noisy_gt_topic: "/gmmslam_node/noisy_gt_pose"
+  registration_request_topic: "/gmmslam_node/registration/request"
+  registration_result_topic:  "/gmmslam_node/registration/result"
 
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 # Point-cloud pre-processing
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
 preprocess:
-  min_range:          0.1    # [m]  points closer than this are discarded
-  max_range:          10.0   # [m]  points farther than this are discarded
-  voxel_leaf_size:    0.05    # [m]  voxel-grid downsampling leaf size (0 = off)
-  deskew:             false  # motion-undistortion using IMU (not yet implemented)
+  min_range:       0.1       # [m] discard points closer than this
+  max_range:       25.0      # [m] discard points farther than this
+  voxel_leaf_size: 0.05      # [m] voxel-grid downsampling (0 = off)
+  min_points:      50        # frames with fewer points are skipped
 
-# -----------------------------------------------------------------------------
-# SOGMM fitting  (sogmm_fitting.cpp)
-# Fits one SOGMM per pre-processed scan.
-# The 4-D feature vector is [x, y, z, range].
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# SOGMM fitting
+# ---------------------------------------------------------------------------
 sogmm:
-  # Mean-shift bandwidth used by SOGMMLearner to estimate the number of
-  # Gaussian components automatically (Option A).
-  bandwidth:        0.1     # [m]  smaller → more components
+  bandwidth:    0.02         # [m] mean-shift bandwidth
+  max_points:   2000         # downsample to at most this many points
+  n_components: 0            # 0 = auto via mean-shift
+  compute:      "GPU"        # "GPU" or "CPU"
 
-  # Fixed number of components used when bypassing mean-shift (Option B).
-  # Ignored when use_fixed_k is false.
-  use_fixed_k:      false
-  n_components:     50
+# ---------------------------------------------------------------------------
+# Fixed-lag iSAM2 smoother
+# ---------------------------------------------------------------------------
+smoother:
+  fixed_lag_s:       4.0     # [s] smoothing horizon
+  smoother_stride:   3       # optimise every N frames
+  odom_noise_sigma_t: 0.03   # [m] translation odometry noise
+  odom_noise_sigma_r: 0.03   # [rad] rotation odometry noise
+  lost_scale:        10.0    # multiplier on odom noise when tracking is lost
+  prior_scale:       0.1     # multiplier on odom noise for the origin prior
+  pose_history_keep: 5000    # max keyframes kept in pose history
 
-  # 4th feature column:  "range" (L2 norm of xyz) or "intensity"
-  feature_4th:      "range"
-
-# -----------------------------------------------------------------------------
-# D2D GMM Registration  (gmm_d2d_registration.cpp)
-# Wraps gira3d MatcherD2D (dlib trust-region optimizer).
-# -----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# D2D registration (async worker pool)
+# ---------------------------------------------------------------------------
 registration:
-  # Covariance mode fed to MatcherD2D
-  #   "anisotropic"  – use full 3×3 covariance (default)
-  #   "isoplanar"    – call makeCovsIsoplanar() before matching (better for flat surfaces)
-  covariance_mode:  "anisotropic"
+  enable_async:              true
+  request_every_n_frames:    3
+  factor_every_n_frames:     3
+  score_threshold:           0.3
+  strong_factor_score_threshold: 2.0
+  strong_factor_sigma_t:     0.01
+  strong_factor_sigma_r:     0.01
+  queue_size:                8
+  result_queue_size:         64
+  enqueue_cooldown_frames:   8
+  workers:                   6
+  compensate_fit_latency:    true
+  # Score-to-sigma mapping: low score → high noise, high score → low noise
+  score_sigma_low:           0.6
+  score_sigma_high:          1.7
+  # Sequential-frame registration noise bounds
+  seq_sigma_t_min:           0.02
+  seq_sigma_t_max:           0.20
+  seq_sigma_r_min:           0.01
+  seq_sigma_r_max:           0.15
+  # Loop-closure registration noise bounds
+  loop_sigma_t_min:          0.03
+  loop_sigma_t_max:          0.40
+  loop_sigma_r_min:          0.02
+  loop_sigma_r_max:          0.25
 
-  # dlib trust-region stopping criterion (objective delta)
-  optimizer_stop_delta:   1.0e-7
-  # Initial trust-region radius
-  optimizer_trust_radius: 5.0
+# ---------------------------------------------------------------------------
+# Loop-closure detection
+# ---------------------------------------------------------------------------
+loop_closure:
+  enable:                     true
+  search_radius_m:            2.5    # [m] spatial search radius
+  min_keyframe_gap:           10     # skip recent keyframes
+  max_candidates:             5
+  request_every_n_keyframes:  2
+  search_cooldown_keyframes:  2
+  min_separation_m:           0.8    # [m] min distance between candidates
+  min_separation_deg:         20.0   # [deg]
+  max_age_s:                  720.0  # [s] ignore keyframes older than this
+  gmm_keep_keyframes:         15000  # GMMs kept for loop-closure matching
+  detect_score_threshold:     1.1    # accept loop if score > this
+  super_sigma_t:              0.02   # noise for very confident loops
+  super_sigma_r:              0.02
 
-  # If the registration score (negative log-likelihood) is worse than this
-  # value, the result is rejected as a failed match.
-  score_reject_threshold: -1.0e6   # set to a very negative number to never reject
+# ---------------------------------------------------------------------------
+# Keyframe triggers
+# ---------------------------------------------------------------------------
+keyframe:
+  translation_thresh_m: 0.3
+  rotation_thresh_deg:  7.0
+  use_time_trigger:     false
+  max_interval_s:       10.0   # [s] force keyframe after this long
 
-# -----------------------------------------------------------------------------
-# Odometry estimation  (odometry_estimation.cpp)
-# Frame-to-frame relative-pose estimation and iSAM Fixed-Lag Smoothing
-# -----------------------------------------------------------------------------
-odometry:
-  # Use a constant-velocity motion model to seed the initial guess when no
-  # external prior (e.g. IMU) is available.
-  use_constant_velocity_prior: true
+# ---------------------------------------------------------------------------
+# Global pose graph (submap level)
+# ---------------------------------------------------------------------------
+global_graph:
+  enable:                        true
+  submap_keyframes_per_submap:   10
+  between_sigma_t:               0.08
+  between_sigma_r:               0.08
+  prior_sigma_t:                 0.02
+  prior_sigma_r:                 0.02
+  overlap_radius_m:              3.0
+  reg_score_threshold:           0.5
+  traj_sigma_t:                  0.15
+  traj_sigma_r:                  0.15
+  # Auxiliary consistency gates
+  aux_gate_abs_trans_m:          2.5
+  aux_gate_abs_rot_deg:          50.0
+  aux_gate_consistency_trans_m:  2.0
+  aux_gate_consistency_rot_deg:  35.0
+  # Submap-level loop-closure noise bounds
+  submap_loop_sigma_t_min:       0.05
+  submap_loop_sigma_t_max:       0.50
+  submap_loop_sigma_r_min:       0.03
+  submap_loop_sigma_r_max:       0.30
 
-# Fixed-lag smoother iSAM2, in odometry_estimation.cpp
-fixed_lag_smoother:
-  lag:      5.0   # [s]  keep this many seconds of history in the smoother
+# ---------------------------------------------------------------------------
+# Noisy ground-truth publisher
+# ---------------------------------------------------------------------------
+gt_noise:
+  init_wait_s:     3.0     # [s] wait before publishing
+  sigma_t:         0.01    # [m] additive Gaussian noise on position
+  sigma_r:         0.01    # [rad] additive Gaussian noise on orientation
+  factor_sigma_t:  0.015   # [m] >= sqrt(2)*sigma_t for differenced poses
+  factor_sigma_r:  0.015   # [rad]
+  seed:            -1      # -1 = random seed
 
+# ---------------------------------------------------------------------------
+# IMU pre-integration
+# ---------------------------------------------------------------------------
+imu:
+  enable_preintegration: false
+  gravity_mps2:          9.81
+  buffer_keep_s:         30.0
+  acc_noise_sigma:       0.001
+  gyro_noise_sigma:      0.001
+  integration_sigma:     0.0001
+  bias_acc_rw_sigma:     0.001
+  bias_gyro_rw_sigma:    0.0001
+  velocity_prior_sigma:  1.0
+  bias_prior_sigma:      0.1
 
-# -----------------------------------------------------------------------------
-# Sub-mapping  (sub_mapping.cpp)
-# Builds a short local factor graph over a sliding window of keyframes,
-# optimizes it with LM, then exports a SubMap.
-# -----------------------------------------------------------------------------
-submap:
-  # A new keyframe is created when the odometry displacement exceeds either
-  # of these thresholds since the last keyframe.
-  keyframe_delta_trans:   0.5    # [m]    TODO: tune based on perf and map quality
-  keyframe_delta_rot:     0.15    # [rad] TODO: tune based on perf and map quality
+# ---------------------------------------------------------------------------
+# Visualization
+# ---------------------------------------------------------------------------
+visualization:
+  gmm_marker_sigma:           3.0    # ellipsoid scale factor
+  map_decimate:               5      # publish map cloud every N frames
+  global_map_publish_period_s: 5.0   # [s]
+  global_gmm_publish_period_s: 5.0   # [s]
 
-  # Number of keyframes accumulated before a SubMap is exported.
-  window_size:            10     # [frames]  #TODO: tune based on submap quality vs. runtime
-
-  # Levenberg-Marquardt optimizer settings for local submap optimization
-  lm_max_iterations:      20      #TODO: tune value based on runtime vs. convergence
-  lm_lambda_initial:      1.0e-5
-  lm_lambda_factor:       10.0
-
-# -----------------------------------------------------------------------------
-# Global mapping  (global_mapping.cpp)
-# Maintains a global factor graph of SubMaps, optimized incrementally with ISAM2.
-# -----------------------------------------------------------------------------
-global_mapping:
-  # ISAM2 incremental optimizer
-  isam2_relinearize_threshold: 0.1
-  isam2_relinearize_skip:      1
-  isam2_cache_linearized:      false
-
-  # Prior noise on the first pose  [rad, rad, rad, m, m, m]
-  prior_noise_rot:    [1.0e-3, 1.0e-3, 1.0e-3]   # [rad] TODO: tune values
-  prior_noise_trans:  [1.0e-2, 1.0e-2, 1.0e-2]   # [m] TODO: tune values
-
-  # Noise model applied to odometry BetweenFactors
-  odom_noise_rot:     [1.0e-2, 1.0e-2, 1.0e-2]   # [rad]
-  odom_noise_trans:   [0.08,   0.08,   0.08  ]    # [m]
-
-  # Loop closure
-  loop_closure_enabled:         true
-  # Minimum Euclidean distance between submap origins to be considered as a
-  # loop-closure candidate.
-  loop_candidate_max_dist:      2.0  # [m]
-  # Registration score must be better (higher) than this to accept a loop.
-  loop_accept_score_threshold:  0.5 #TODO: tune value
-
+# ---------------------------------------------------------------------------
+# Misc
+# ---------------------------------------------------------------------------
+gmm_dir: "/tmp/gmmslam_gmms"

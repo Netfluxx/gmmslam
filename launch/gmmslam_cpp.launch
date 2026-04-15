@@ -1,0 +1,65 @@
+<launch>
+  <!--
+    GMM-SLAM (C++): loads shared YAML into /gmmslam, then starts the three native
+    executables with CLI-overridable topics/frames. Tuning beyond these args lives
+    in config/params.yaml (or a custom file passed via config_file).
+  -->
+
+  <!-- ========== Config file path ========== -->
+  <arg name="config_file" default="$(find gmmslam)/config/params.yaml"/>
+
+  <!-- ========== Key command-line overrides (defaults match python/launch/gmmslam.launch) ========== -->
+  <arg name="lidar_topic" default="/m500_1/mpa/depth/points"/>
+  <arg name="sensor_frame" default="depth_camera_1"/>
+  <arg name="odom_frame" default="world"/>
+  <arg name="base_frame" default="m500_1_base_link"/>
+  <arg name="gt_topic" default="/m500_1/mavros/local_position/pose"/>
+  <arg name="registration_workers" default="6"/>
+  <arg name="noisy_gt_topic" default="/gmmslam_node/noisy_gt_pose"/>
+
+  <!-- ========== Load YAML onto the parameter server under /gmmslam ========== -->
+  <rosparam command="load" file="$(arg config_file)" ns="gmmslam"/>
+
+  <!-- ========== Static TF: body (base) → depth camera (sensor) ========== -->
+  <!-- Translation matches the RangeFinder position in voxl_m500.proto (same as Python launch). -->
+  <node pkg="tf2_ros" type="static_transform_publisher"
+        name="depth_camera_tf"
+        args="0.083 0 0.0315  0 0 0  $(arg base_frame)  $(arg sensor_frame)"/>
+
+  <!-- ========== Main GMM-SLAM node ========== -->
+  <node pkg="gmmslam" type="gmmslam_node"
+        name="gmmslam_node" output="screen" respawn="true">
+    <!-- Path passed to the node if it re-reads settings from disk -->
+    <param name="config_file" value="$(arg config_file)"/>
+    <!-- Topic / frame overrides from launch args (on top of /gmmslam YAML) -->
+    <param name="lidar_topic" value="$(arg lidar_topic)"/>
+    <param name="odom_frame" value="$(arg odom_frame)"/>
+    <param name="base_frame" value="$(arg base_frame)"/>
+    <param name="sensor_frame" value="$(arg sensor_frame)"/>
+    <param name="gt_topic" value="$(arg gt_topic)"/>
+    <param name="noisy_gt_topic" value="$(arg noisy_gt_topic)"/>
+  </node>
+
+  <!-- ========== D2D registration worker pool ========== -->
+  <!-- Topics must stay in sync with gmmslam_node registration I/O. -->
+  <node pkg="gmmslam" type="d2d_registration_node"
+        name="d2d_registration_node" output="screen" respawn="true">
+    <param name="request_topic" value="/gmmslam_node/registration/request"/>
+    <param name="result_topic" value="/gmmslam_node/registration/result"/>
+    <param name="num_workers" value="$(arg registration_workers)"/>
+  </node>
+
+  <!-- ========== Noisy ground-truth publisher (feeds optional GT factors) ========== -->
+  <node pkg="gmmslam" type="noisy_gt_publisher_node"
+        name="noisy_gt_publisher_node" output="screen" respawn="true">
+    <param name="gt_topic" value="$(arg gt_topic)"/>
+    <param name="odom_frame" value="$(arg odom_frame)"/>
+    <param name="pose_topic" value="$(arg noisy_gt_topic)"/>
+    <param name="path_topic" value="/gmmslam_node/noisy_gt_path"/>
+  </node>
+
+  <!-- ========== RViz ========== -->
+  <node pkg="rviz" type="rviz" name="rviz"
+        args="-d $(find gmmslam)/config/gmmslam.rviz" output="screen"/>
+
+</launch>

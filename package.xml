@@ -3,8 +3,19 @@
 <package format="3">
   <name>gmmslam</name>
   <version>1.0.0</version>
-  <description>3D SLAM with GMM</description>
+  <description>3D SLAM with Gaussian Mixture Models</description>
   <maintainer email="arno.laurie@epfl.ch">Arno Laurie</maintainer>
+  <license>MIT</license>
 
+  <buildtool_depend>catkin</buildtool_depend>
 
+  <depend>roscpp</depend>
+  <depend>tf2_ros</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>eigen</depend>
+  <depend>libyaml-cpp-dev</depend>
 </package>

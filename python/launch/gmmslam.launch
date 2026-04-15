@@ -25,8 +25,8 @@
   <arg name="loop_closure_gmm_keep_keyframes" default="15000"/>
   <arg name="pose_history_keep_keyframes" default="5000"/>
   <arg name="loop_closure_detect_score_threshold" default="1.1"/>
-  <arg name="loop_closure_super_sigma_t" default="0.01"/>
-  <arg name="loop_closure_super_sigma_r" default="0.01"/>
+  <arg name="loop_closure_super_sigma_t" default="0.02"/>
+  <arg name="loop_closure_super_sigma_r" default="0.02"/>
   <!-- score sigma low => D2D reg. score value corresponding to high noise -->
   <arg name="score_sigma_low" default="0.6"/>
   <!-- score sigma high => D2D reg. score value corresponding to low noise -->
@@ -63,19 +63,19 @@
   <arg name="submap_reg_score_threshold" default="0.5"/>
   <arg name="gt_topic" default="/m500_1/mavros/local_position/pose"/>
   <arg name="gt_init_wait_s" default="3.0"/>
-  <arg name="gt_noise_sigma_t" default="0.03"/>
-  <arg name="gt_noise_sigma_r" default="0.03"/>
+  <arg name="gt_noise_sigma_t" default="0.01"/>
+  <arg name="gt_noise_sigma_r" default="0.01"/>
   <!-- GT factor noise: should be >= sqrt(2)*gt_noise_sigma to match
        the actual measurement noise from differencing noisy absolute poses.
        Auto-derived from gt_noise_sigma if omitted in the node code. -->
-  <arg name="gt_factor_sigma_t" default="0.045"/>
-  <arg name="gt_factor_sigma_r" default="0.045"/>
+  <arg name="gt_factor_sigma_t" default="0.015"/>
+  <arg name="gt_factor_sigma_r" default="0.015"/>
   <arg name="gt_noise_seed" default="-1"/>
   <arg name="noisy_gt_topic" default="/gmmslam_node/noisy_gt_pose"/>
 
   <!-- Preprocessing -->
   <arg name="min_range"        default="0.1"/>
-  <arg name="max_range"        default="10.0"/>
+  <arg name="max_range"        default="25.0"/>
   <arg name="voxel_leaf_size"  default="0.05"/>
 
   <!-- GMM -->
@@ -92,8 +92,8 @@
   <arg name="enable_imu_preintegration" default="false"/>
   <arg name="imu_gravity_mps2" default="9.81"/>
   <arg name="imu_buffer_keep_s" default="30.0"/>
-  <arg name="imu_acc_noise_sigma" default="0.2"/>
-  <arg name="imu_gyro_noise_sigma" default="0.05"/>
+  <arg name="imu_acc_noise_sigma" default="0.001"/>
+  <arg name="imu_gyro_noise_sigma" default="0.001"/>
   <arg name="imu_integration_sigma" default="0.0001"/>
   <arg name="imu_bias_acc_rw_sigma" default="0.001"/>
   <arg name="imu_bias_gyro_rw_sigma" default="0.0001"/>

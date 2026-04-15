@@ -1,0 +1,574 @@
+#include "gmmslam/fixed_lag_backend.hpp"
+
+#include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/slam/PriorFactor.h>
+#include <gtsam/navigation/CombinedImuFactor.h>
+#include <gtsam/navigation/ImuFactor.h>
+#include <gtsam/navigation/ImuBias.h>
+#include <gtsam/inference/Symbol.h>
+
+#include <ros/ros.h>
+
+#include <algorithm>
+#include <chrono>
+
+namespace gmmslam {
+
+using gtsam::symbol_shorthand::X;
+using gtsam::Symbol;
+using gtsam::Pose3;
+using gtsam::Rot3;
+using gtsam::Point3;
+using gtsam::noiseModel::Diagonal;
+using gtsam::noiseModel::Isotropic;
+using gtsam::imuBias::ConstantBias;
+
+// -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
+
+static gtsam::Key keyV(int idx) { return Symbol('v', idx); }
+static gtsam::Key keyB(int idx) { return Symbol('b', idx); }
+
+static double stampToSec(const ros::Time& t) { return t.toSec(); }
+
+static ConstantBias zeroBias() {
+    return ConstantBias(Vector3d::Zero(), Vector3d::Zero());
+}
+
+// -----------------------------------------------------------------------
+// Construction
+// -----------------------------------------------------------------------
+
+FixedLagBackend::FixedLagBackend(const SmootherConfig& smoother_cfg,
+                                 const GtNoiseConfig& gt_cfg,
+                                 const LoopClosureConfig& loop_cfg,
+                                 const ImuConfig& imu_cfg)
+    : fixed_lag_s(smoother_cfg.fixed_lag_s),
+      pose_history_keep_(smoother_cfg.pose_history_keep),
+      enable_imu_(imu_cfg.enable_preintegration)
+{
+    // Odometry noise (GTSAM ordering: 3 rotation, 3 translation)
+    const double sr = smoother_cfg.odom_noise_sigma_r;
+    const double st = smoother_cfg.odom_noise_sigma_t;
+    Eigen::Matrix<double,6,1> odom_sigmas;
+    odom_sigmas << sr, sr, sr, st, st, st;
+
+    odom_noise_      = Diagonal::Sigmas(odom_sigmas);
+    odom_noise_lost_ = Diagonal::Sigmas(odom_sigmas * smoother_cfg.lost_scale);
+    prior_noise_     = Diagonal::Sigmas(odom_sigmas * smoother_cfg.prior_scale);
+
+    // GT factor noise
+    Eigen::Matrix<double,6,1> gt_sigmas;
+    gt_sigmas << gt_cfg.factor_sigma_r, gt_cfg.factor_sigma_r, gt_cfg.factor_sigma_r,
+                 gt_cfg.factor_sigma_t, gt_cfg.factor_sigma_t, gt_cfg.factor_sigma_t;
+    gt_factor_noise_ = Diagonal::Sigmas(gt_sigmas);
+
+    // Loop-closure noise
+    Eigen::Matrix<double,6,1> lc_sigmas;
+    lc_sigmas << loop_cfg.super_sigma_r, loop_cfg.super_sigma_r, loop_cfg.super_sigma_r,
+                 loop_cfg.super_sigma_t, loop_cfg.super_sigma_t, loop_cfg.super_sigma_t;
+
+    // "strong" loop-closure noise reuses the same super_sigma_{t,r} fields
+    // (the Python caller passes strong_factor_sigma_{t,r} as loop_sigma_{t,r}).
+    // In the C++ config these live as super_sigma_{t,r} on LoopClosureConfig;
+    // the registration-level adaptive sigmas are resolved externally.
+    loop_closure_noise_ = Diagonal::Sigmas(lc_sigmas);
+
+    Eigen::Matrix<double,6,1> lc_super_sigmas;
+    lc_super_sigmas << loop_cfg.super_sigma_r, loop_cfg.super_sigma_r, loop_cfg.super_sigma_r,
+                       loop_cfg.super_sigma_t, loop_cfg.super_sigma_t, loop_cfg.super_sigma_t;
+    loop_closure_super_noise_ = Diagonal::Sigmas(lc_super_sigmas);
+
+    // IMU noise models
+    vel_prior_noise_  = Isotropic::Sigma(3, imu_cfg.velocity_prior_sigma);
+    bias_prior_noise_ = Isotropic::Sigma(6, imu_cfg.bias_prior_sigma);
+    bias_rw_noise_    = Isotropic::Sigma(6, std::max(1e-9, imu_cfg.bias_prior_sigma));
+
+    // Fixed-lag smoother
+    fixed_lag_ = std::make_unique<gtsam::IncrementalFixedLagSmoother>(fixed_lag_s);
+
+    // Build IMU preintegration params once (reused per frame)
+    if (enable_imu_) {
+        imu_preint_params_ = gtsam::PreintegrationCombinedParams::MakeSharedU(imu_cfg.gravity_mps2);
+        imu_preint_params_->setAccelerometerCovariance(
+            imu_cfg.acc_noise_sigma * imu_cfg.acc_noise_sigma * Eigen::Matrix3d::Identity());
+        imu_preint_params_->setGyroscopeCovariance(
+            imu_cfg.gyro_noise_sigma * imu_cfg.gyro_noise_sigma * Eigen::Matrix3d::Identity());
+        imu_preint_params_->setIntegrationCovariance(
+            imu_cfg.integration_sigma * imu_cfg.integration_sigma * Eigen::Matrix3d::Identity());
+        imu_preint_params_->setBiasAccCovariance(
+            imu_cfg.bias_acc_rw_sigma * imu_cfg.bias_acc_rw_sigma * Eigen::Matrix3d::Identity());
+        imu_preint_params_->setBiasOmegaCovariance(
+            imu_cfg.bias_gyro_rw_sigma * imu_cfg.bias_gyro_rw_sigma * Eigen::Matrix3d::Identity());
+        imu_preint_params_->setBiasAccOmegaInit(
+            1e-10 * Eigen::Matrix<double, 6, 6>::Identity());
+    }
+
+    pose_by_idx[0] = Matrix4d::Identity();
+
+    ROS_INFO("[smoother] initialized: IncrementalFixedLagSmoother (lag=%.2f s, imu=%s)",
+             fixed_lag_s, enable_imu_ ? "on" : "off");
+}
+
+// -----------------------------------------------------------------------
+// Static conversion helpers
+// -----------------------------------------------------------------------
+
+gtsam::Pose3 FixedLagBackend::pose3FromMatrix(const Matrix4d& T) {
+    return Pose3(Rot3(T.block<3,3>(0,0)),
+                 Point3(T(0,3), T(1,3), T(2,3)));
+}
+
+Matrix4d FixedLagBackend::matrixFromPose3(const gtsam::Pose3& p) {
+    Matrix4d T = Matrix4d::Identity();
+    T.block<3,3>(0,0) = p.rotation().matrix();
+    T.block<3,1>(0,3) = p.translation();
+    return T;
+}
+
+// -----------------------------------------------------------------------
+// Private helpers
+// -----------------------------------------------------------------------
+
+void FixedLagBackend::resetNewData() {
+    new_factors_.resize(0);
+    new_values_.clear();
+    new_timestamps_.clear();
+}
+
+gtsam::NonlinearFactorGraph FixedLagBackend::filterStaleFactors(
+        const gtsam::NonlinearFactorGraph& factors,
+        const gtsam::Values& new_vals,
+        double t_latest) const {
+
+    const double t_cutoff = t_latest - fixed_lag_s * 0.85;
+    gtsam::NonlinearFactorGraph clean;
+    int n_dropped = 0;
+
+    for (std::size_t i = 0; i < factors.size(); ++i) {
+        const auto& f = factors.at(i);
+        if (!f) { continue; }
+        bool stale = false;
+        for (const gtsam::Key key : f->keys()) {
+            if (new_vals.exists(key)) { continue; }
+            const auto idx = static_cast<int>(Symbol(key).index());
+            auto it = key_t_sec.find(idx);
+            if (it != key_t_sec.end() && it->second < t_cutoff) {
+                stale = true;
+                break;
+            }
+        }
+        if (stale) {
+            ++n_dropped;
+        } else {
+            clean.push_back(f);
+        }
+    }
+
+    if (n_dropped > 0) {
+        ROS_WARN("[smoother] dropped %d stale factor(s) referencing keys outside the lag window",
+                 n_dropped);
+    }
+    return clean;
+}
+
+void FixedLagBackend::rebuildSmoother(int anchor_idx) {
+    Matrix4d anchor_pose = Matrix4d::Identity();
+    {
+        auto it = pose_by_idx.find(anchor_idx);
+        if (it != pose_by_idx.end()) {
+            anchor_pose = it->second;
+        } else {
+            anchor_pose = pose;
+        }
+    }
+    const double t_sec = [&]{
+        auto it = key_t_sec.find(anchor_idx);
+        return (it != key_t_sec.end()) ? it->second : 0.0;
+    }();
+
+    fixed_lag_ = std::make_unique<gtsam::IncrementalFixedLagSmoother>(fixed_lag_s);
+
+    gtsam::NonlinearFactorGraph factors;
+    gtsam::Values values;
+    gtsam::FixedLagSmootherKeyTimestampMap timestamps;
+
+    const gtsam::Key key0 = X(anchor_idx);
+    const Pose3 p3 = pose3FromMatrix(anchor_pose);
+    factors.addPrior(key0, p3, prior_noise_);
+    values.insert(key0, p3);
+    timestamps[key0] = t_sec;
+
+    if (enable_imu_) {
+        const gtsam::Key kv = keyV(anchor_idx);
+        const gtsam::Key kb = keyB(anchor_idx);
+
+        Vector3d v = Vector3d::Zero();
+        {
+            auto it = velocity_by_idx.find(anchor_idx);
+            if (it != velocity_by_idx.end()) v = it->second;
+        }
+        Eigen::Matrix<double,6,1> bvec = Eigen::Matrix<double,6,1>::Zero();
+        {
+            auto it = bias_by_idx.find(anchor_idx);
+            if (it != bias_by_idx.end()) bvec = it->second;
+        }
+        const ConstantBias bias(bvec.head<3>(), bvec.tail<3>());
+
+        values.insert(kv, v);
+        values.insert(kb, bias);
+        timestamps[kv] = t_sec;
+        timestamps[kb] = t_sec;
+
+        factors.addPrior(kv, v, vel_prior_noise_);
+        factors.addPrior(kb, bias, bias_prior_noise_);
+    }
+
+    fixed_lag_->update(factors, values, timestamps);
+    inserted_pose_keys_ = {anchor_idx};
+
+    solve_queue_.clear();
+    resetNewData();
+
+    ROS_WARN("[smoother] RESET smoother after %d consecutive failures; re-anchored at X(%d)",
+             kMaxConsecutiveFailures, anchor_idx);
+}
+
+// -----------------------------------------------------------------------
+// Public API
+// -----------------------------------------------------------------------
+
+bool FixedLagBackend::initialize(const Matrix4d& init_pose, const ros::Time& stamp) {
+    if (initialized_) return true;
+
+    try {
+        std::lock_guard<std::mutex> lk(graph_lock);
+        pose = init_pose;
+
+        const gtsam::Key key0 = X(0);
+        const double t0 = stampToSec(stamp);
+        const Pose3 p0 = pose3FromMatrix(init_pose);
+
+        new_factors_.addPrior(key0, p0, prior_noise_);
+        new_values_.insert(key0, p0);
+        new_timestamps_[key0] = t0;
+
+        if (enable_imu_) {
+            const gtsam::Key kv0 = keyV(0);
+            const gtsam::Key kb0 = keyB(0);
+            const Vector3d v0 = Vector3d::Zero();
+            const ConstantBias b0 = zeroBias();
+
+            new_values_.insert(kv0, v0);
+            new_values_.insert(kb0, b0);
+            new_timestamps_[kv0] = t0;
+            new_timestamps_[kb0] = t0;
+
+            new_factors_.addPrior(kv0, v0, vel_prior_noise_);
+            new_factors_.addPrior(kb0, b0, bias_prior_noise_);
+        }
+
+        fixed_lag_->update(new_factors_, new_values_, new_timestamps_);
+        resetNewData();
+
+        pose_by_idx[0] = init_pose;
+        key_t_sec[0] = t0;
+        inserted_pose_keys_ = {0};
+
+        if (enable_imu_) {
+            velocity_by_idx[0] = Vector3d::Zero();
+            bias_by_idx[0] = Eigen::Matrix<double,6,1>::Zero();
+        }
+
+        initialized_ = true;
+        ROS_INFO("[smoother] fixed-lag smoother initialized with prior X(0)");
+        return true;
+    } catch (const std::exception& e) {
+        ROS_WARN("[smoother] init failed: %s", e.what());
+        return false;
+    }
+}
+
+bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
+                               const ros::Time& stamp,
+                               const Matrix4d& predicted_pose,
+                               const Matrix4d* gt_rel_mat,
+                               const std::vector<std::tuple<double, Vector3d, Vector3d>>* imu_measurements) {
+    if (!initialize(predicted_pose, stamp)) return false;
+
+    if (prev_idx < 0) {
+        key_t_sec[curr_idx] = stampToSec(stamp);
+        return true;
+    }
+
+    const double t_sec = stampToSec(stamp);
+    const gtsam::Key key_prev = X(prev_idx);
+    const gtsam::Key key_curr = X(curr_idx);
+    const bool prev_exists = inserted_pose_keys_.count(prev_idx) > 0;
+
+    // ---- Pose factor ----
+    if (prev_exists && gt_rel_mat != nullptr) {
+        new_factors_.push_back(
+            gtsam::BetweenFactor<Pose3>(key_prev, key_curr,
+                                        pose3FromMatrix(*gt_rel_mat),
+                                        gt_factor_noise_));
+    } else if (prev_exists) {
+        new_factors_.push_back(
+            gtsam::BetweenFactor<Pose3>(key_prev, key_curr,
+                                        Pose3::Identity(),
+                                        odom_noise_lost_));
+    } else {
+        new_factors_.addPrior(key_curr, pose3FromMatrix(predicted_pose), prior_noise_);
+        ROS_WARN_THROTTLE(2.0,
+            "[smoother] missing predecessor X(%d); re-anchoring X(%d) with prior",
+            prev_idx, curr_idx);
+    }
+
+    new_values_.insert(key_curr, pose3FromMatrix(predicted_pose));
+    new_timestamps_[key_curr] = t_sec;
+    key_t_sec[curr_idx] = t_sec;
+
+    // ---- Optional IMU preintegration ----
+    if (enable_imu_) {
+        const gtsam::Key kv_prev = keyV(prev_idx);
+        const gtsam::Key kv_curr = keyV(curr_idx);
+        const gtsam::Key kb_prev = keyB(prev_idx);
+        const gtsam::Key kb_curr = keyB(curr_idx);
+
+        Eigen::Matrix<double,6,1> prev_bias_vec = Eigen::Matrix<double,6,1>::Zero();
+        {
+            auto it = bias_by_idx.find(prev_idx);
+            if (it != bias_by_idx.end()) prev_bias_vec = it->second;
+        }
+        const ConstantBias prev_bias(prev_bias_vec.head<3>(), prev_bias_vec.tail<3>());
+
+        auto preint = boost::make_shared<gtsam::PreintegratedCombinedMeasurements>(
+            imu_preint_params_, prev_bias);
+        int n_imu = 0;
+        if (prev_exists && imu_measurements != nullptr) {
+            for (const auto& [dt, acc, gyro] : *imu_measurements) {
+                if (dt <= 0.0) continue;
+                preint->integrateMeasurement(acc, gyro, dt);
+                ++n_imu;
+            }
+        }
+
+        const bool has_imu_link = prev_exists && (n_imu > 0);
+        if (has_imu_link) {
+            new_factors_.push_back(
+                gtsam::CombinedImuFactor(key_prev, kv_prev,
+                                         key_curr, kv_curr,
+                                         kb_prev, kb_curr,
+                                         *preint));
+        }
+
+        // Velocity initial guess
+        const double t_prev = [&]{
+            auto it = key_t_sec.find(prev_idx);
+            return (it != key_t_sec.end()) ? it->second : (t_sec - 1e-3);
+        }();
+        const double dt_pose = std::max(1e-3, t_sec - t_prev);
+
+        Vector3d vel_guess = Vector3d::Zero();
+        {
+            auto it = pose_by_idx.find(prev_idx);
+            if (it != pose_by_idx.end()) {
+                vel_guess = (predicted_pose.block<3,1>(0,3) - it->second.block<3,1>(0,3)) / dt_pose;
+            } else {
+                auto vit = velocity_by_idx.find(prev_idx);
+                if (vit != velocity_by_idx.end()) vel_guess = vit->second;
+            }
+        }
+
+        new_values_.insert(kv_curr, vel_guess);
+        new_values_.insert(kb_curr, prev_bias);
+        new_timestamps_[kv_curr] = t_sec;
+        new_timestamps_[kb_curr] = t_sec;
+
+        velocity_by_idx[curr_idx] = vel_guess;
+        bias_by_idx[curr_idx] = prev_bias_vec;
+
+        if (!has_imu_link) {
+            new_factors_.addPrior(kv_curr, vel_guess, vel_prior_noise_);
+            new_factors_.addPrior(kb_curr, prev_bias, bias_prior_noise_);
+            ROS_WARN_THROTTLE(2.0,
+                "[smoother] weakly-anchored V/B at X(%d) (imu_link=%s, samples=%d)",
+                curr_idx, has_imu_link ? "yes" : "no", n_imu);
+        }
+
+        ROS_DEBUG("[smoother] IMU preintegration at X(%d): samples=%d", curr_idx, n_imu);
+    }
+
+    // Drop stale factors
+    new_factors_ = filterStaleFactors(new_factors_, new_values_, t_sec);
+
+    // Snapshot and enqueue
+    SolveBatch batch;
+    batch.curr_idx  = curr_idx;
+    batch.factors    = std::move(new_factors_);
+    batch.values     = std::move(new_values_);
+    batch.timestamps = std::move(new_timestamps_);
+
+    new_factors_ = gtsam::NonlinearFactorGraph();
+    new_values_  = gtsam::Values();
+    new_timestamps_.clear();
+
+    if (!solve_queue_.tryPush(std::move(batch))) {
+        // Queue full: keep staged so it batches with the next frame
+        new_factors_    = std::move(batch.factors);
+        new_values_     = std::move(batch.values);
+        new_timestamps_ = std::move(batch.timestamps);
+        deferred_batches.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    {
+        std::lock_guard<std::mutex> lk(graph_lock);
+        pose = predicted_pose;
+        latest_key_idx = curr_idx;
+        pose_by_idx[curr_idx] = predicted_pose;
+    }
+    return true;
+}
+
+void FixedLagBackend::stageFactor(const gtsam::NonlinearFactor::shared_ptr& factor) {
+    new_factors_.push_back(factor);
+}
+
+bool FixedLagBackend::flushStagedFactors() {
+    if (new_factors_.empty()) return false;
+
+    SolveBatch batch;
+    batch.curr_idx  = latest_key_idx;
+    batch.factors   = std::move(new_factors_);
+    batch.values    = std::move(new_values_);
+    batch.timestamps = std::move(new_timestamps_);
+
+    new_factors_ = gtsam::NonlinearFactorGraph();
+    new_values_  = gtsam::Values();
+    new_timestamps_.clear();
+
+    if (!solve_queue_.tryPush(std::move(batch))) {
+        new_factors_    = std::move(batch.factors);
+        new_values_     = std::move(batch.values);
+        new_timestamps_ = std::move(batch.timestamps);
+        return false;
+    }
+    return true;
+}
+
+bool FixedLagBackend::isInLagWindow(int idx) const {
+    auto it = key_t_sec.find(idx);
+    if (it == key_t_sec.end()) return false;
+    auto lit = key_t_sec.find(latest_key_idx);
+    const double t_latest = (lit != key_t_sec.end()) ? lit->second : 0.0;
+    return (t_latest - it->second) <= fixed_lag_s * 1.1;
+}
+
+// -----------------------------------------------------------------------
+// Backend solve loop (runs on dedicated thread)
+// -----------------------------------------------------------------------
+
+void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
+    while (!shutdown.load(std::memory_order_acquire)) {
+        auto maybe_batch = solve_queue_.popWithTimeout(std::chrono::milliseconds(100));
+        if (!maybe_batch.has_value()) continue;
+
+        SolveBatch& batch = maybe_batch.value();
+        const int curr_idx = batch.curr_idx;
+
+        try {
+            fixed_lag_->update(batch.factors, batch.values, batch.timestamps);
+            const gtsam::Values estimate = fixed_lag_->calculateEstimate();
+
+            const gtsam::Key key_curr = X(curr_idx);
+            bool has_curr = estimate.exists(key_curr);
+
+            Matrix4d new_pose;
+            if (has_curr) {
+                new_pose = matrixFromPose3(estimate.at<Pose3>(key_curr));
+            } else {
+                std::lock_guard<std::mutex> lk(graph_lock);
+                auto it = pose_by_idx.find(curr_idx);
+                new_pose = (it != pose_by_idx.end()) ? it->second : pose;
+                ROS_WARN_THROTTLE(2.0,
+                    "[smoother] estimate missing X(%d) after update; keeping previous pose",
+                    curr_idx);
+            }
+
+            {
+                std::lock_guard<std::mutex> lk(graph_lock);
+                const double latest_t = [&]{
+                    auto it = key_t_sec.find(curr_idx);
+                    return (it != key_t_sec.end()) ? it->second : -1.0;
+                }();
+
+                inserted_pose_keys_.insert(curr_idx);
+
+                for (const auto& [k_idx, k_t] : key_t_sec) {
+                    if (latest_t >= 0.0 && (latest_t - k_t) > fixed_lag_s * 1.2) continue;
+
+                    const gtsam::Key kx = X(k_idx);
+                    if (estimate.exists(kx)) {
+                        try {
+                            pose_by_idx[k_idx] = matrixFromPose3(estimate.at<Pose3>(kx));
+                        } catch (...) {}
+                    }
+
+                    if (enable_imu_) {
+                        const gtsam::Key kv = keyV(k_idx);
+                        if (estimate.exists(kv)) {
+                            try {
+                                velocity_by_idx[k_idx] = estimate.at<Vector3d>(kv);
+                            } catch (...) {}
+                        }
+                        const gtsam::Key kb = keyB(k_idx);
+                        if (estimate.exists(kb)) {
+                            try {
+                                const auto b = estimate.at<ConstantBias>(kb);
+                                Eigen::Matrix<double,6,1> bvec;
+                                bvec.head<3>() = b.accelerometer();
+                                bvec.tail<3>() = b.gyroscope();
+                                bias_by_idx[k_idx] = bvec;
+                            } catch (...) {}
+                        }
+                    }
+                }
+
+                pose = new_pose;
+                latest_key_idx = curr_idx;
+                pose_by_idx[curr_idx] = new_pose;
+
+                // Trim old entries
+                const int cutoff = curr_idx - pose_history_keep_;
+                for (auto it = pose_by_idx.begin(); it != pose_by_idx.end(); ) {
+                    if (it->first < cutoff) {
+                        velocity_by_idx.erase(it->first);
+                        bias_by_idx.erase(it->first);
+                        it = pose_by_idx.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+
+            consecutive_failures_ = 0;
+            ROS_DEBUG("[smoother] GTSAM backend solved at X(%d)", curr_idx);
+
+        } catch (const std::exception& e) {
+            ++consecutive_failures_;
+            ROS_WARN("[smoother] GTSAM backend failed at X(%d): %s", curr_idx, e.what());
+
+            if (consecutive_failures_ >= kMaxConsecutiveFailures) {
+                try {
+                    rebuildSmoother(curr_idx);
+                    consecutive_failures_ = 0;
+                } catch (const std::exception& reset_err) {
+                    ROS_ERROR("[smoother] reset also failed: %s", reset_err.what());
+                }
+            }
+        }
+    }
+}
+
+} // namespace gmmslam
