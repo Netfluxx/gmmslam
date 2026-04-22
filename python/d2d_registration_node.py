@@ -130,6 +130,15 @@ class D2DRegistrationNode:
             result["success"] = True
             result["score"] = score_final
             result["transform"] = T_final.reshape(-1).tolist()
+            # Echo SOLiD / loop metadata from the request for downstream viz & logging.
+            for key in (
+                "solid_cos_sim",
+                "solid_rescue",
+                "solid_yaw_deg",
+                "solid_yaw_overlap",
+            ):
+                if key in req:
+                    result[key] = req[key]
 
             tag = "submap" if is_submap_registration else "keyframe"
             if is_submap_registration:

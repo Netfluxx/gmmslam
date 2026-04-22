@@ -20,11 +20,23 @@ public:
                                "/gmmslam_node/noisy_gt_pose");
         pnh.param<std::string>("path_topic", path_topic,
                                "/gmmslam_node/noisy_gt_path");
-        pnh.param<double>("gt_init_wait_s", gt_init_wait_s_, 3.0);
-        pnh.param<double>("gt_noise_sigma_t", gt_noise_sigma_t_, 0.0);
-        pnh.param<double>("gt_noise_sigma_r", gt_noise_sigma_r_, 0.0);
+
+        // Private ~params (Python launch / manual override), else same keys as
+        // config/params.yaml loaded under /gmmslam via rosparam (gt_noise: …).
+        ros::NodeHandle nh_gmmslam("/gmmslam");
+        if (!pnh.getParam("gt_init_wait_s", gt_init_wait_s_)) {
+            nh_gmmslam.param("gt_noise/init_wait_s", gt_init_wait_s_, 3.0);
+        }
+        if (!pnh.getParam("gt_noise_sigma_t", gt_noise_sigma_t_)) {
+            nh_gmmslam.param("gt_noise/sigma_t", gt_noise_sigma_t_, 0.01);
+        }
+        if (!pnh.getParam("gt_noise_sigma_r", gt_noise_sigma_r_)) {
+            nh_gmmslam.param("gt_noise/sigma_r", gt_noise_sigma_r_, 0.01);
+        }
         int seed = -1;
-        pnh.param<int>("gt_noise_seed", seed, -1);
+        if (!pnh.getParam("gt_noise_seed", seed)) {
+            nh_gmmslam.param("gt_noise/seed", seed, -1);
+        }
 
         if (seed >= 0) {
             rng_.seed(static_cast<uint64_t>(seed));
@@ -37,8 +49,10 @@ public:
         gt_sub_ = nh.subscribe(gt_topic, 1,
                                &NoisyGTPublisherNode::gtCallback, this);
 
-        ROS_INFO("[noisy_gt_pub] ready | gt=%s | pose=%s | path=%s",
-                 gt_topic.c_str(), pose_topic.c_str(), path_topic.c_str());
+        ROS_INFO("[noisy_gt_pub] ready | gt=%s | pose=%s | path=%s | "
+                 "sigma_t=%.4f m sigma_r=%.4f rad init_wait=%.2f s seed=%d",
+                 gt_topic.c_str(), pose_topic.c_str(), path_topic.c_str(),
+                 gt_noise_sigma_t_, gt_noise_sigma_r_, gt_init_wait_s_, seed);
     }
 
 private:
@@ -143,8 +157,8 @@ private:
     ros::Publisher path_pub_;
     std::string odom_frame_;
     double gt_init_wait_s_ = 3.0;
-    double gt_noise_sigma_t_ = 0.0;
-    double gt_noise_sigma_r_ = 0.0;
+    double gt_noise_sigma_t_ = 0.01;
+    double gt_noise_sigma_r_ = 0.01;
     std::mt19937_64 rng_{std::random_device{}()};
     std::normal_distribution<double> normal_dist_{0.0, 1.0};
 

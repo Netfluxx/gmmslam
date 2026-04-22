@@ -99,12 +99,15 @@ private:
                 Eigen::Matrix4d::Identity());
             const std::vector<double> flat_identity(I_row.data(), I_row.data() + 16);
 
+            // NOTE: finite sentinel — nlohmann::json serializes non-finite
+            // doubles (NaN, ±Inf) as JSON null, which then throws
+            // type_error.302 on the receiver when read as a number.
             result = {
                 {"prev_idx", prev_idx},
                 {"curr_idx", curr_idx},
                 {"stamp", stamp},
                 {"success", false},
-                {"score", -std::numeric_limits<double>::infinity()},
+                {"score", -1.0e30},
                 {"transform", flat_identity},
                 {"is_loop_closure", is_loop},
                 {"is_submap_registration", is_submap}
@@ -116,8 +119,25 @@ private:
                 return;
             }
 
-            // Step 1: isoplanar registration
-            const Eigen::Matrix4f T_init = Eigen::Matrix4f::Identity();
+            // Step 1: isoplanar registration. Default T_init is identity;
+            // loop-closure requests may attach an `initial_transform` (e.g.
+            // a SOLiD-derived yaw prior) to improve the convergence basin.
+            Eigen::Matrix4f T_init = Eigen::Matrix4f::Identity();
+            if (req.contains("initial_transform")) {
+                const auto& arr = req.at("initial_transform");
+                if (arr.is_array() && arr.size() == 16) {
+                    Eigen::Matrix<float, 4, 4, Eigen::RowMajor> T_row;
+                    bool ok = true;
+                    for (int k = 0; k < 16 && ok; ++k) {
+                        if (!arr[k].is_number()) { ok = false; break; }
+                        T_row.data()[k] = arr[k].get<float>();
+                    }
+                    if (ok && T_row.allFinite()) {
+                        T_init = Eigen::Matrix4f(T_row);
+                    }
+                }
+            }
+
             auto iso_result =
                 gmmslam::isoplanarRegistration(T_init, source_path, target_path);
             Eigen::Matrix4f T_iso = iso_result.transform;

@@ -23,15 +23,15 @@ ros:
 preprocess:
   min_range:       0.1       # [m] discard points closer than this
   max_range:       25.0      # [m] discard points farther than this
-  voxel_leaf_size: 0.05      # [m] voxel-grid downsampling (0 = off)
+  voxel_leaf_size: 0.0      # [m] voxel-grid downsampling (0 = off)
   min_points:      50        # frames with fewer points are skipped
 
 # ---------------------------------------------------------------------------
 # SOGMM fitting
 # ---------------------------------------------------------------------------
 sogmm:
-  bandwidth:    0.02         # [m] mean-shift bandwidth
-  max_points:   2000         # downsample to at most this many points
+  bandwidth:    0.1         # [m] mean-shift bandwidth
+  max_points:   2200         # downsample to at most this many points
   n_components: 0            # 0 = auto via mean-shift
   compute:      "GPU"        # "GPU" or "CPU"
 
@@ -41,8 +41,8 @@ sogmm:
 smoother:
   fixed_lag_s:       4.0     # [s] smoothing horizon
   smoother_stride:   3       # optimise every N frames
-  odom_noise_sigma_t: 0.03   # [m] translation odometry noise
-  odom_noise_sigma_r: 0.03   # [rad] rotation odometry noise
+  odom_noise_sigma_t: 0.02   # [m] translation odometry noise
+  odom_noise_sigma_r: 0.02   # [rad] rotation odometry noise
   lost_scale:        10.0    # multiplier on odom noise when tracking is lost
   prior_scale:       0.1     # multiplier on odom noise for the origin prior
   pose_history_keep: 5000    # max keyframes kept in pose history
@@ -56,8 +56,8 @@ registration:
   factor_every_n_frames:     3
   score_threshold:           0.3
   strong_factor_score_threshold: 2.0
-  strong_factor_sigma_t:     0.01
-  strong_factor_sigma_r:     0.01
+  strong_factor_sigma_t:     0.03
+  strong_factor_sigma_r:     0.03
   queue_size:                8
   result_queue_size:         64
   enqueue_cooldown_frames:   8
@@ -67,33 +67,62 @@ registration:
   score_sigma_low:           0.6
   score_sigma_high:          1.7
   # Sequential-frame registration noise bounds
-  seq_sigma_t_min:           0.02
+  seq_sigma_t_min:           0.03
   seq_sigma_t_max:           0.20
   seq_sigma_r_min:           0.01
   seq_sigma_r_max:           0.15
-  # Loop-closure registration noise bounds
-  loop_sigma_t_min:          0.03
-  loop_sigma_t_max:          0.40
+  # Loop-closure registration noise bounds (wider max → more tolerant D2D)
+  loop_sigma_t_min:          0.02
+  loop_sigma_t_max:          0.48
   loop_sigma_r_min:          0.02
-  loop_sigma_r_max:          0.25
+  loop_sigma_r_max:          0.30
 
 # ---------------------------------------------------------------------------
 # Loop-closure detection
 # ---------------------------------------------------------------------------
 loop_closure:
   enable:                     true
-  search_radius_m:            2.5    # [m] spatial search radius
-  min_keyframe_gap:           10     # skip recent keyframes
-  max_candidates:             5
-  request_every_n_keyframes:  2
-  search_cooldown_keyframes:  2
-  min_separation_m:           0.8    # [m] min distance between candidates
-  min_separation_deg:         20.0   # [deg]
-  max_age_s:                  720.0  # [s] ignore keyframes older than this
+  search_radius_m:            3.2    # [m] spatial search radius
+  min_keyframe_gap:           7      # skip recent keyframes
+  max_candidates:             6
+  request_every_n_keyframes:  1
+  search_cooldown_keyframes:  1
+  min_separation_m:           0.3    # [m] translation gate (paired with deg in C++)
+  min_separation_deg:         15.0   # [deg] paired with min_separation_m for diversity
+  max_age_s:                  9999.0  # [s] ignore keyframes older than this
   gmm_keep_keyframes:         15000  # GMMs kept for loop-closure matching
-  detect_score_threshold:     1.1    # accept loop if score > this
+  detect_score_threshold:     0.85   # accept loop if D2D score > this
   super_sigma_t:              0.02   # noise for very confident loops
   super_sigma_r:              0.02
+
+# ---------------------------------------------------------------------------
+# SOLiD — spatially organized, lightweight global descriptor (Kim et al. 2024)
+# Used as appearance-based gate on the radius loop search
+# index + yaw prior for D2D. Tuned for a 120° horizontal FOV depth camera.
+# ---------------------------------------------------------------------------
+solid:
+  enable:                     true
+  fov_up_deg:                 30.0    # match the depth camera's vertical FOV
+  fov_down_deg:              -30.0
+  min_distance_m:             0.5
+  max_distance_m:             35.0    # match preprocess.max_range
+  num_angle:                  36      # 10° bins over 360° azimuth
+  num_range:                  32      # radial bins
+  num_height:                 16      # vertical bins across FOV
+  voxel_size_m:               0.0     # extra coarse voxel (<=0 disables)
+  cos_similarity_threshold:   0.78    # minimum range-cosine to pass the gate
+  radius_weight:              0.55    # fused-score weight on radius term
+  appearance_weight:          0.45    # fused-score weight on cosine term
+  provide_yaw_prior:          true    # attach SOLiD yaw as T_init for D2D
+  overlap_min:                0.22    # min non-zero-bin overlap for yaw search
+  max_abs_yaw_deg:            180.0   # restrict shift search to |Δyaw| <= this
+  yaw_sign:                   1       # flip to -1 if empirical convention wrong
+  rescue_enable:              true
+  rescue_every_n_kf:          10      # throttle full-index rescue search
+  rescue_trigger_silence_kf:  30      # trigger rescue after this many silent kf
+  rescue_top_k:               3
+  rescue_cos_threshold:       0.82
+  keep_descriptors:           0       # 0 = follow gmm_keep_keyframes
 
 # ---------------------------------------------------------------------------
 # Keyframe triggers
@@ -130,12 +159,14 @@ global_graph:
   submap_loop_sigma_r_max:       0.30
 
 # ---------------------------------------------------------------------------
-# Noisy ground-truth publisher
+# Noisy ground-truth publisher (also used by gmmslam_node when loading this file)
+# C++ noisy_gt_publisher_node: reads /gmmslam/gt_noise/* after rosparam load, or
+# private ~gt_noise_sigma_t / ~gt_init_wait_s overrides from launch.
 # ---------------------------------------------------------------------------
 gt_noise:
   init_wait_s:     3.0     # [s] wait before publishing
-  sigma_t:         0.01    # [m] additive Gaussian noise on position
-  sigma_r:         0.01    # [rad] additive Gaussian noise on orientation
+  sigma_t:         0.02    # [m] additive Gaussian noise on position
+  sigma_r:         0.02    # [rad] additive Gaussian noise on orientation
   factor_sigma_t:  0.015   # [m] >= sqrt(2)*sigma_t for differenced poses
   factor_sigma_r:  0.015   # [rad]
   seed:            -1      # -1 = random seed
@@ -144,7 +175,7 @@ gt_noise:
 # IMU pre-integration
 # ---------------------------------------------------------------------------
 imu:
-  enable_preintegration: false
+  enable_preintegration: true
   gravity_mps2:          9.81
   buffer_keep_s:         30.0
   acc_noise_sigma:       0.001

@@ -120,6 +120,7 @@ target_include_directories(sogmm_obj PRIVATE
   ${EIGEN3_INCLUDE_DIR}        # System Eigen 3.4 — MUST come first here
   ${SOGMM_INCLUDE_DIR}
   ${NANOFLANN_INCLUDE_DIR}
+  ${catkin_INCLUDE_DIRS}       # ros/ros.h for DBG logs in sogmm_fitting.cpp
 )
 
 add_library(gmmslam_lib SHARED
@@ -130,6 +131,8 @@ add_library(gmmslam_lib SHARED
   src/fixed_lag_backend.cpp
   src/global_pose_graph.cpp
   src/registration_manager.cpp
+  src/solid.cpp
+  src/place_recognition.cpp
   src/visualizer.cpp
   $<TARGET_OBJECTS:sogmm_obj>
 )

@@ -80,6 +80,49 @@ struct LoopClosureConfig {
     double super_sigma_r = 0.02;
 };
 
+// SOLiD (Kim et al. 2024) — spatially organized, lightweight global descriptor
+// used as an appearance-based gate for the radius-based loop search and as a
+// rescue index when the smoother's pose is not trustworthy. Tuned here for a
+// 120° horizontal FOV depth camera, not for 360° rotating LiDAR.
+struct SolidConfig {
+    bool enable = true;
+
+    // Geometry / binning. Must match the physical sensor when the descriptor
+    // is produced in the sensor frame.
+    double fov_up_deg    = 30.0;   // upper vertical FOV boundary
+    double fov_down_deg  = -30.0;  // lower vertical FOV boundary
+    double min_distance_m = 0.5;
+    double max_distance_m = 25.0;
+    int num_angle  = 36;           // azimuth bins over 360° (10°/bin)
+    int num_range  = 32;           // radial bins up to max_distance_m
+    int num_height = 16;           // vertical bins across [fov_down, fov_up]
+    // Extra voxel leaf applied to the already-preprocessed cloud. <=0 disables.
+    double voxel_size_m = 0.0;
+
+    // Matching gate.
+    double cos_similarity_threshold = 0.85;  // range-vec cosine accept cutoff
+    double radius_weight     = 0.5;          // α in fused score
+    double appearance_weight = 0.5;          // β in fused score
+
+    // Yaw estimation for T_init seeding.
+    bool   provide_yaw_prior   = true;
+    double overlap_min         = 0.3;   // min non-zero overlap fraction accepted
+    double max_abs_yaw_deg     = 180.0; // restrict shift search to |yaw| <= this
+    int    yaw_sign            = +1;    // empirical sign flip: +1 or -1
+
+    // Rescue path: run a full-index top-K search when no loop has been added
+    // in the last `rescue_trigger_silence_kf` keyframes, throttled by
+    // `rescue_every_n_kf`.
+    bool   rescue_enable          = true;
+    int    rescue_every_n_kf      = 10;
+    int    rescue_trigger_silence_kf = 30;
+    int    rescue_top_k           = 3;
+    double rescue_cos_threshold   = 0.9;
+
+    // In-memory cache sizing. 0 => unlimited (trimmed by gmm_keep_keyframes).
+    int keep_descriptors = 0;
+};
+
 struct KeyframeConfig {
     double translation_thresh_m = 0.3;
     double rotation_thresh_deg = 7.0;
@@ -144,6 +187,7 @@ struct Config {
     SmootherConfig smoother;
     RegistrationConfig registration;
     LoopClosureConfig loop_closure;
+    SolidConfig solid;
     KeyframeConfig keyframe;
     GlobalGraphConfig global_graph;
     GtNoiseConfig gt_noise;

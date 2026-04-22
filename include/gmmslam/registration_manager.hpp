@@ -2,6 +2,7 @@
 
 #include "gmmslam/types.hpp"
 #include "gmmslam/config.hpp"
+#include "gmmslam/place_recognition.hpp"
 #include "gmmslam/thread_safe_queue.hpp"
 
 #include <Eigen/Core>
@@ -34,13 +35,22 @@ public:
                         ros::Publisher reg_request_pub,
                         const RegistrationConfig& reg_cfg,
                         const LoopClosureConfig& lc_cfg,
+                        const SolidConfig& solid_cfg,
                         const SogmmConfig& sogmm_cfg,
-                        const std::string& gmm_dir);
+                        const std::string& gmm_dir,
+                        ros::Publisher loop_closure_markers_pub = {},
+                        std::string map_frame = {});
 
     // Enqueue a GMM fit. Returns true if enqueued, false if dropped.
     bool enqueueFit(int frame_idx, const ros::Time& stamp,
                     const Eigen::MatrixXf& pts,
                     double capture_t_sec, const Matrix4d& capture_pose);
+
+    // Synchronous: compute SOLiD descriptor from a preprocessed sensor-frame
+    // cloud and insert it into the place-recognition index. Must be called
+    // at keyframe creation time, before any loop search referencing that
+    // keyframe is dispatched.
+    void submitKeyframeDescriptor(int frame_idx, const Eigen::MatrixXf& pts);
 
     // Background fit worker thread entry point
     void fitWorkerLoop(const std::atomic<bool>& shutdown);
@@ -59,6 +69,7 @@ public:
     GmmModel latest_gmm_model;
     bool has_latest_gmm = false;
     std::set<std::pair<int,int>> loop_edges_added;
+    std::atomic<int> loop_viz_uid_{0};
 
     // Backpressure counters
     std::atomic<int> dropped_fit_frames{0};
@@ -82,6 +93,9 @@ private:
         bool is_loop;
         double score;
         double stamp_sec;
+        bool has_solid_cos_sim = false;
+        double solid_cos_sim = 0.0;
+        bool solid_rescue = false;
     };
 
     struct NoiseResult {
@@ -106,17 +120,27 @@ private:
                                   double score,
                                   bool force_loop, bool use_super,
                                   bool is_loop_candidate,
-                                  const ros::Time& stamp);
+                                  const ros::Time& stamp,
+                                  bool has_solid_cos_sim = false,
+                                  double solid_cos_sim = 0.0,
+                                  bool solid_rescue = false);
 
     void handleSubmapResult(const nlohmann::json& data, double result_stamp_sec);
+
+    void publishLoopClosureMarkers(int prev_idx, int curr_idx, double score,
+                                   const ros::Time& stamp, bool has_solid_cos,
+                                   double solid_cos_sim, bool solid_rescue);
 
     // References to other subsystems
     FixedLagBackend& smoother_;
     GlobalPoseGraph* global_graph_;
     ros::Publisher reg_pub_;
+    ros::Publisher loop_closure_markers_pub_;
+    std::string map_frame_;
 
     // Config
     SogmmConfig sogmm_cfg_;
+    SolidConfig solid_cfg_;
     std::string gmm_dir_;
     double registration_score_threshold_;
     int registration_factor_every_n_frames_;
@@ -143,6 +167,11 @@ private:
     // State
     std::set<std::pair<int,int>> pending_loop_requests_;
     int last_loop_search_idx_ = -1000000;
+    int last_rescue_idx_ = -1000000;
+    int last_loop_accepted_idx_ = -1000000;
+
+    // Place-recognition index (SOLiD descriptors). Thread-safe.
+    PlaceRecognitionIndex place_index_;
 
     // Queues
     ThreadSafeQueue<FitJob> fit_queue_;

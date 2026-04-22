@@ -205,6 +205,32 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("loop_closure_super_sigma_t",  cfg_.loop_closure.super_sigma_t, 0.01);
         pnh.param("loop_closure_super_sigma_r",  cfg_.loop_closure.super_sigma_r, 0.01);
 
+        pnh.param("solid_enable",             cfg_.solid.enable, true);
+        pnh.param("solid_fov_up_deg",         cfg_.solid.fov_up_deg, 30.0);
+        pnh.param("solid_fov_down_deg",       cfg_.solid.fov_down_deg, -30.0);
+        pnh.param("solid_min_distance_m",     cfg_.solid.min_distance_m, 0.5);
+        pnh.param("solid_max_distance_m",     cfg_.solid.max_distance_m, 25.0);
+        pnh.param("solid_num_angle",          cfg_.solid.num_angle, 36);
+        pnh.param("solid_num_range",          cfg_.solid.num_range, 32);
+        pnh.param("solid_num_height",         cfg_.solid.num_height, 16);
+        pnh.param("solid_voxel_size_m",       cfg_.solid.voxel_size_m, 0.0);
+        pnh.param("solid_cos_similarity_threshold",
+                  cfg_.solid.cos_similarity_threshold, 0.85);
+        pnh.param("solid_radius_weight",      cfg_.solid.radius_weight, 0.5);
+        pnh.param("solid_appearance_weight",  cfg_.solid.appearance_weight, 0.5);
+        pnh.param("solid_provide_yaw_prior",  cfg_.solid.provide_yaw_prior, true);
+        pnh.param("solid_overlap_min",        cfg_.solid.overlap_min, 0.3);
+        pnh.param("solid_max_abs_yaw_deg",    cfg_.solid.max_abs_yaw_deg, 180.0);
+        pnh.param("solid_yaw_sign",           cfg_.solid.yaw_sign, 1);
+        pnh.param("solid_rescue_enable",      cfg_.solid.rescue_enable, true);
+        pnh.param("solid_rescue_every_n_kf",  cfg_.solid.rescue_every_n_kf, 10);
+        pnh.param("solid_rescue_trigger_silence_kf",
+                  cfg_.solid.rescue_trigger_silence_kf, 30);
+        pnh.param("solid_rescue_top_k",       cfg_.solid.rescue_top_k, 3);
+        pnh.param("solid_rescue_cos_threshold",
+                  cfg_.solid.rescue_cos_threshold, 0.9);
+        pnh.param("solid_keep_descriptors",   cfg_.solid.keep_descriptors, 0);
+
         pnh.param("keyframe_translation_thresh_m",
                   cfg_.keyframe.translation_thresh_m, 0.3);
         pnh.param("keyframe_rotation_thresh_deg",
@@ -294,6 +320,8 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
     const auto gmm_global_pub   = pnh.advertise<visualization_msgs::MarkerArray>("gmm_global_markers", 1, true);
     const auto gg_markers_pub   = pnh.advertise<visualization_msgs::MarkerArray>("global_graph_markers", 1, true);
     const auto graph_nodes_pub  = pnh.advertise<visualization_msgs::MarkerArray>("graph_nodes", 1, true);
+    const auto loop_closure_markers_pub =
+        pnh.advertise<visualization_msgs::MarkerArray>("loop_closure_markers", 10, true);
     const auto reg_request_pub  = nh.advertise<std_msgs::String>(
         cfg_.ros.registration_request_topic, 10);
 
@@ -327,8 +355,15 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         reg_request_pub,
         cfg_.registration,
         cfg_.loop_closure,
+        cfg_.solid,
         cfg_.sogmm,
-        cfg_.gmm_dir);
+        cfg_.gmm_dir,
+        loop_closure_markers_pub,
+        cfg_.ros.odom_frame);
+    ROS_INFO("[gmmslam] loop_closure_markers -> %s (MarkerArray, latched; "
+             "frame_id=%s)",
+             (pnh.getNamespace() + "/loop_closure_markers").c_str(),
+             cfg_.ros.odom_frame.c_str());
 
     Visualizer::Publishers vis_pubs;
     vis_pubs.path              = path_pub;
@@ -906,19 +941,46 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
                 keyframe_odom_indices_.push_back(curr_odom);
                 ++keyframe_count_;
 
+                ROS_INFO("[gmmslam][DBG] NEW KEYFRAME X(%d) "
+                         "keyframe_count=%d pts=%ld",
+                         curr_odom, keyframe_count_,
+                         static_cast<long>(pts.rows()));
+
                 global_graph_->updateWithKeyframe(
                     curr_odom, stamp, T_curr, stampToSec(stamp));
 
-                if (cfg_.registration.enable_async &&
-                    (keyframe_count_ % cfg_.registration.request_every_n_frames == 0) &&
-                    (curr_odom >= reg_enqueue_resume_frame_))
+                // SOLiD descriptor first — cheap and synchronous — so that
+                // the subsequent async GMM fit's loop search (triggered
+                // from finishFit) can already query by appearance.
+                registration_->submitKeyframeDescriptor(curr_odom, pts);
+
+                const bool gate_async  = cfg_.registration.enable_async;
+                const bool gate_modulo =
+                    (keyframe_count_ % cfg_.registration.request_every_n_frames == 0);
+                const bool gate_resume =
+                    (curr_odom >= reg_enqueue_resume_frame_);
+                ROS_INFO("[gmmslam][DBG] enqueue gate X(%d) async=%d "
+                         "kf_count%%%d==0: %d (kf_count=%d) "
+                         "resume_frame=%d (curr=%d, pass=%d)",
+                         curr_odom, gate_async ? 1 : 0,
+                         cfg_.registration.request_every_n_frames,
+                         gate_modulo ? 1 : 0, keyframe_count_,
+                         reg_enqueue_resume_frame_, curr_odom,
+                         gate_resume ? 1 : 0);
+
+                if (gate_async && gate_modulo && gate_resume)
                 {
                     const double capture_t = stampToSec(stamp);
                     const bool ok = registration_->enqueueFit(
                         curr_odom, stamp, pts, capture_t, T_curr);
+                    ROS_INFO("[gmmslam][DBG] enqueueFit result X(%d) ok=%d",
+                             curr_odom, ok ? 1 : 0);
                     if (!ok && cfg_.registration.enqueue_cooldown_frames > 0) {
                         reg_enqueue_resume_frame_ =
                             curr_odom + cfg_.registration.enqueue_cooldown_frames;
+                        ROS_WARN("[gmmslam][DBG] enqueue cooldown: "
+                                 "resume_frame set to %d",
+                                 reg_enqueue_resume_frame_);
                     }
                 }
             }

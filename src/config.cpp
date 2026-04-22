@@ -100,6 +100,36 @@ void loadLoopClosure(const YAML::Node& root, LoopClosureConfig& c) {
     c.super_sigma_r = readOr(n, "super_sigma_r", c.super_sigma_r);
 }
 
+void loadSolid(const YAML::Node& root, SolidConfig& c) {
+    if (!root["solid"]) return;
+    const auto& n = root["solid"];
+    c.enable = readOr(n, "enable", c.enable);
+    c.fov_up_deg = readOr(n, "fov_up_deg", c.fov_up_deg);
+    c.fov_down_deg = readOr(n, "fov_down_deg", c.fov_down_deg);
+    c.min_distance_m = readOr(n, "min_distance_m", c.min_distance_m);
+    c.max_distance_m = readOr(n, "max_distance_m", c.max_distance_m);
+    c.num_angle = readOr(n, "num_angle", c.num_angle);
+    c.num_range = readOr(n, "num_range", c.num_range);
+    c.num_height = readOr(n, "num_height", c.num_height);
+    c.voxel_size_m = readOr(n, "voxel_size_m", c.voxel_size_m);
+    c.cos_similarity_threshold =
+        readOr(n, "cos_similarity_threshold", c.cos_similarity_threshold);
+    c.radius_weight = readOr(n, "radius_weight", c.radius_weight);
+    c.appearance_weight = readOr(n, "appearance_weight", c.appearance_weight);
+    c.provide_yaw_prior = readOr(n, "provide_yaw_prior", c.provide_yaw_prior);
+    c.overlap_min = readOr(n, "overlap_min", c.overlap_min);
+    c.max_abs_yaw_deg = readOr(n, "max_abs_yaw_deg", c.max_abs_yaw_deg);
+    c.yaw_sign = readOr(n, "yaw_sign", c.yaw_sign);
+    c.rescue_enable = readOr(n, "rescue_enable", c.rescue_enable);
+    c.rescue_every_n_kf = readOr(n, "rescue_every_n_kf", c.rescue_every_n_kf);
+    c.rescue_trigger_silence_kf =
+        readOr(n, "rescue_trigger_silence_kf", c.rescue_trigger_silence_kf);
+    c.rescue_top_k = readOr(n, "rescue_top_k", c.rescue_top_k);
+    c.rescue_cos_threshold =
+        readOr(n, "rescue_cos_threshold", c.rescue_cos_threshold);
+    c.keep_descriptors = readOr(n, "keep_descriptors", c.keep_descriptors);
+}
+
 void loadKeyframe(const YAML::Node& root, KeyframeConfig& c) {
     if (!root["keyframe"]) return;
     const auto& n = root["keyframe"];
@@ -179,6 +209,7 @@ Config loadConfig(const std::string& yaml_path) {
     loadSmoother(root, cfg.smoother);
     loadRegistration(root, cfg.registration);
     loadLoopClosure(root, cfg.loop_closure);
+    loadSolid(root, cfg.solid);
     loadKeyframe(root, cfg.keyframe);
     loadGlobalGraph(root, cfg.global_graph);
     loadGtNoise(root, cfg.gt_noise);
