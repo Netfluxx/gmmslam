@@ -28,7 +28,6 @@ public:
     struct Publishers {
         ros::Publisher path;
         ros::Publisher odom;
-        ros::Publisher cloud;
         ros::Publisher latest_frame_cloud;
         ros::Publisher gmm_markers;
         ros::Publisher gmm_global_markers;
@@ -82,18 +81,13 @@ private:
     std::string odom_frame_;
     std::string base_frame_;
     double gmm_marker_sigma_;
-    int map_decimate_;
-    double global_map_publish_period_s_;
     double global_gmm_publish_period_s_;
 
     Publishers pubs_;
 
-    static constexpr std::size_t kMaxMapFrames = 500;
     static constexpr std::size_t kMaxGraphNodeMarkers = 2000;
 
     nav_msgs::Path path_;
-    std::vector<Eigen::MatrixXf> map_pts_;
-    double map_cloud_last_pub_t_ = 0.0;
     double global_gmm_markers_last_pub_t_ = 0.0;
     int last_global_gmm_processed_idx_ = -1;
     std::vector<std::pair<int, std::vector<GmmLocalData>>> global_gmm_cache_;

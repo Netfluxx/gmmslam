@@ -45,10 +45,15 @@ public:
 
     void backendLoop(const std::atomic<bool>& shutdown);
 
+    /// Request rebuilding the fixed-lag smoother around `anchor_idx` with pose
+    /// `T_odom` (odom frame). Applied on the backend thread before the next solve.
+    void scheduleReanchorToGt(int anchor_idx, const Matrix4d& T_odom, double t_sec);
+
     // --- Thread-safe shared state ---
     mutable std::mutex graph_lock;
     Matrix4d pose = Matrix4d::Identity();
     std::map<int, Matrix4d> pose_by_idx;
+    std::map<int, double> pose_uncertainty_by_idx;
     std::map<int, Vector3d> velocity_by_idx;
     std::map<int, Eigen::Matrix<double,6,1>> bias_by_idx;
     std::map<int, double> key_t_sec;
@@ -70,6 +75,10 @@ private:
 
     void resetNewData();
     void rebuildSmoother(int anchor_idx);
+    void rebuildSmootherCore(int anchor_idx, const Matrix4d& anchor_pose,
+                             double t_sec, const char* reason,
+                             bool zero_imu_at_anchor);
+    void applyScheduledReanchorIfNeeded();
     gtsam::NonlinearFactorGraph filterStaleFactors(
         const gtsam::NonlinearFactorGraph& factors,
         const gtsam::Values& new_values,
@@ -106,6 +115,12 @@ private:
     // Failure tracking
     int consecutive_failures_ = 0;
     static constexpr int kMaxConsecutiveFailures = 5;
+
+    std::mutex reanchor_scheduled_mu_;
+    bool reanchor_scheduled_ = false;
+    int reanchor_anchor_idx_ = 0;
+    Matrix4d reanchor_pose_ = Matrix4d::Identity();
+    double reanchor_t_sec_ = 0.0;
 };
 
 } // namespace gmmslam

@@ -31,7 +31,7 @@ preprocess:
 # ---------------------------------------------------------------------------
 sogmm:
   bandwidth:    0.1         # [m] mean-shift bandwidth
-  max_points:   2200         # downsample to at most this many points
+  max_points:   2600         # downsample to at most this many points
   n_components: 0            # 0 = auto via mean-shift
   compute:      "GPU"        # "GPU" or "CPU"
 
@@ -39,10 +39,10 @@ sogmm:
 # Fixed-lag iSAM2 smoother
 # ---------------------------------------------------------------------------
 smoother:
-  fixed_lag_s:       4.0     # [s] smoothing horizon
+  fixed_lag_s:       7.0     # [s] smoothing horizon
   smoother_stride:   3       # optimise every N frames
-  odom_noise_sigma_t: 0.02   # [m] translation odometry noise
-  odom_noise_sigma_r: 0.02   # [rad] rotation odometry noise
+  odom_noise_sigma_t: 0.01   # [m] translation odometry noise
+  odom_noise_sigma_r: 0.01  # [rad] rotation odometry noise
   lost_scale:        10.0    # multiplier on odom noise when tracking is lost
   prior_scale:       0.1     # multiplier on odom noise for the origin prior
   pose_history_keep: 5000    # max keyframes kept in pose history
@@ -90,7 +90,7 @@ loop_closure:
   min_separation_m:           0.3    # [m] translation gate (paired with deg in C++)
   min_separation_deg:         15.0   # [deg] paired with min_separation_m for diversity
   max_age_s:                  9999.0  # [s] ignore keyframes older than this
-  gmm_keep_keyframes:         15000  # GMMs kept for loop-closure matching
+  gmm_keep_keyframes:         105000  # GMMs kept for loop-closure matching
   detect_score_threshold:     0.85   # accept loop if D2D score > this
   super_sigma_t:              0.02   # noise for very confident loops
   super_sigma_r:              0.02
@@ -147,11 +147,14 @@ global_graph:
   reg_score_threshold:           0.5
   traj_sigma_t:                  0.15
   traj_sigma_r:                  0.15
-  # Auxiliary consistency gates
-  aux_gate_abs_trans_m:          2.5
+  # Auxiliary consistency gates (abs trans: ~keyframes_per_submap * keyframe_spacing;
+  # default 10 * 0.3 m ≈ 3 m, so 2.5 m rejected normal motion — use ≥6 m)
+  aux_gate_abs_trans_m:          6.0
   aux_gate_abs_rot_deg:          50.0
   aux_gate_consistency_trans_m:  2.0
   aux_gate_consistency_rot_deg:  35.0
+  # When traj aux factor fails absurd-motion gates, rebuild fixed-lag smoother on GT
+  reanchor_smoother_on_traj_gate_fail: true
   # Submap-level loop-closure noise bounds
   submap_loop_sigma_t_min:       0.05
   submap_loop_sigma_t_max:       0.50
@@ -165,11 +168,13 @@ global_graph:
 # ---------------------------------------------------------------------------
 gt_noise:
   init_wait_s:     3.0     # [s] wait before publishing
-  sigma_t:         0.02    # [m] additive Gaussian noise on position
-  sigma_r:         0.02    # [rad] additive Gaussian noise on orientation
+  sigma_t:         0.01    # [m] additive Gaussian noise on position
+  sigma_r:         0.01    # [rad] additive Gaussian noise on orientation
   factor_sigma_t:  0.015   # [m] >= sqrt(2)*sigma_t for differenced poses
   factor_sigma_r:  0.015   # [rad]
   seed:            -1      # -1 = random seed
+  jump_reject_trans_m: 0.0  # [m] 0 = off (reserved for GT outlier rejection)
+  jump_reject_rot_deg: 0.0  # [deg] 0 = off
 
 # ---------------------------------------------------------------------------
 # IMU pre-integration
@@ -191,9 +196,24 @@ imu:
 # ---------------------------------------------------------------------------
 visualization:
   gmm_marker_sigma:           3.0    # ellipsoid scale factor
-  map_decimate:               5      # publish map cloud every N frames
-  global_map_publish_period_s: 5.0   # [s]
   global_gmm_publish_period_s: 5.0   # [s]
+
+# ---------------------------------------------------------------------------
+# Map representation
+# The persistent map is the per-submap GMM produced by GlobalPoseGraph at
+# submap finalization. Pruning collapses near-duplicate components produced
+# by overlapping observations of the same physical surface using optional
+# R-tree candidate search, a Bhattacharyya-distance gate, and a
+# keep-lower-pose-uncertainty rule.
+# ---------------------------------------------------------------------------
+map:
+  prune_enable:           true
+  prune_bhatt_threshold:  2.0    # merge if D_B < this (lower = more conservative)
+  prune_search_radius_m:  1.0    # legacy: mean-distance gate; R-tree: AABB margin (m) on each axis
+  prune_use_rtree:        true   # index components by 3D AABB; else mean-radius prefilter only
+  prune_rtree_chi_sq:     9.21   # 3-DOF chi-squared for ellipsoid -> AABB (larger = looser boxes)
+  prune_max_passes:       2      # greedy passes over the component list
+  prune_cov_reg:          1.0e-6 # regularization added before any covariance inversion for stability
 
 # ---------------------------------------------------------------------------
 # Misc

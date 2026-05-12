@@ -20,6 +20,9 @@
   <!-- ========== Load YAML onto the parameter server under /gmmslam ========== -->
   <rosparam command="load" file="$(arg config_file)" ns="gmmslam"/>
 
+  <!-- Webots autopilot_ctrl_ros: do not publish world->base (gmmslam owns it) or duplicate depth static -->
+  <param name="/webots_publish_gt_base_tf" value="false"/>
+
   <!-- ========== Static TF: body (base) → depth camera (sensor) ========== -->
   <!-- Translation matches the RangeFinder position in voxl_m500.proto (same as Python launch). -->
   <node pkg="tf2_ros" type="static_transform_publisher"

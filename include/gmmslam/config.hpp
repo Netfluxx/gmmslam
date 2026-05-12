@@ -141,7 +141,7 @@ struct GlobalGraphConfig {
     double reg_score_threshold = 0.5;
     double traj_sigma_t = 0.15;
     double traj_sigma_r = 0.15;
-    double aux_gate_abs_trans_m = 2.5;
+    double aux_gate_abs_trans_m = 6.0;
     double aux_gate_abs_rot_deg = 50.0;
     double aux_gate_consistency_trans_m = 2.0;
     double aux_gate_consistency_rot_deg = 35.0;
@@ -149,6 +149,11 @@ struct GlobalGraphConfig {
     double submap_loop_sigma_t_max = 0.50;
     double submap_loop_sigma_r_min = 0.03;
     double submap_loop_sigma_r_max = 0.30;
+    /// When the submap trajectory auxiliary factor is rejected because the fixed-lag
+    /// estimate implies an absurd motion (|t|/|r| above aux gates), schedule re-
+    /// anchoring the smoother on the current GT pose so published SLAM pose stops
+    /// drifting from simulation truth.
+    bool reanchor_smoother_on_traj_gate_fail = true;
 };
 
 struct GtNoiseConfig {
@@ -158,6 +163,9 @@ struct GtNoiseConfig {
     double factor_sigma_t = 0.015;
     double factor_sigma_r = 0.015;
     int seed = -1;
+    /// If > 0, optional cap on accepted GT step size (m); 0 = unused until wired in node.
+    double jump_reject_trans_m = 0.0;
+    double jump_reject_rot_deg = 0.0;
 };
 
 struct ImuConfig {
@@ -175,9 +183,33 @@ struct ImuConfig {
 
 struct VisualizationConfig {
     double gmm_marker_sigma = 3.0;
-    int map_decimate = 5;
-    double global_map_publish_period_s = 1.0;
     double global_gmm_publish_period_s = 1.0;
+};
+
+// Map-representation knobs. The "map" is the per-submap GMM produced at
+// submap finalization; pruning collapses near-duplicate components produced
+// by overlapping observations of the same physical structure.
+struct MapConfig {
+    bool prune_enable = true;
+    // Bhattacharyya distance threshold under which two components are merged.
+    // For two equal isotropic gaussians 3 sigma apart D_B ~= 1.125, so a
+    // value around 1.5 merges aggressively only on near-duplicates.
+    double prune_bhatt_threshold = 1.5;
+    // Legacy mean-distance prefilter (meters) when prune_use_rtree is false.
+    // When prune_use_rtree is true, this value is added as a uniform margin
+    // (meters) on each axis of every component AABB before indexing.
+    double prune_search_radius_m = 0.5;
+    // If true, use an R-tree on 3D AABBs (from covariance + chi-squared
+    // ellipsoid bounds) to find merge candidates; otherwise use mean distance.
+    bool prune_use_rtree = true;
+    // Chi-squared threshold (3 dof) for the ellipsoid axis lengths used to
+    // build each component's axis-aligned bounding box (larger = looser box).
+    double prune_rtree_chi_sq = 9.21; // ~99% mass in 3D if Gaussian
+    // Number of greedy passes over the component list. 1-2 is normally enough.
+    int prune_max_passes = 2;
+    // Tikhonov regularization added to covariances before any inversion to
+    // keep Cholesky stable on near-singular components.
+    double prune_cov_reg = 1e-6;
 };
 
 struct Config {
@@ -193,6 +225,7 @@ struct Config {
     GtNoiseConfig gt_noise;
     ImuConfig imu;
     VisualizationConfig visualization;
+    MapConfig map;
     std::string gmm_dir = "/tmp/gmmslam_gmms";
 };
 

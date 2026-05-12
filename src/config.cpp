@@ -160,6 +160,8 @@ void loadGlobalGraph(const YAML::Node& root, GlobalGraphConfig& c) {
     c.submap_loop_sigma_t_max = readOr(n, "submap_loop_sigma_t_max", c.submap_loop_sigma_t_max);
     c.submap_loop_sigma_r_min = readOr(n, "submap_loop_sigma_r_min", c.submap_loop_sigma_r_min);
     c.submap_loop_sigma_r_max = readOr(n, "submap_loop_sigma_r_max", c.submap_loop_sigma_r_max);
+    c.reanchor_smoother_on_traj_gate_fail =
+        readOr(n, "reanchor_smoother_on_traj_gate_fail", c.reanchor_smoother_on_traj_gate_fail);
 }
 
 void loadGtNoise(const YAML::Node& root, GtNoiseConfig& c) {
@@ -171,6 +173,8 @@ void loadGtNoise(const YAML::Node& root, GtNoiseConfig& c) {
     c.factor_sigma_t = readOr(n, "factor_sigma_t", c.factor_sigma_t);
     c.factor_sigma_r = readOr(n, "factor_sigma_r", c.factor_sigma_r);
     c.seed = readOr(n, "seed", c.seed);
+    c.jump_reject_trans_m = readOr(n, "jump_reject_trans_m", c.jump_reject_trans_m);
+    c.jump_reject_rot_deg = readOr(n, "jump_reject_rot_deg", c.jump_reject_rot_deg);
 }
 
 void loadImu(const YAML::Node& root, ImuConfig& c) {
@@ -192,9 +196,19 @@ void loadVisualization(const YAML::Node& root, VisualizationConfig& c) {
     if (!root["visualization"]) return;
     const auto& n = root["visualization"];
     c.gmm_marker_sigma = readOr(n, "gmm_marker_sigma", c.gmm_marker_sigma);
-    c.map_decimate = readOr(n, "map_decimate", c.map_decimate);
-    c.global_map_publish_period_s = readOr(n, "global_map_publish_period_s", c.global_map_publish_period_s);
     c.global_gmm_publish_period_s = readOr(n, "global_gmm_publish_period_s", c.global_gmm_publish_period_s);
+}
+
+void loadMap(const YAML::Node& root, MapConfig& c) {
+    if (!root["map"]) return;
+    const auto& n = root["map"];
+    c.prune_enable = readOr(n, "prune_enable", c.prune_enable);
+    c.prune_bhatt_threshold = readOr(n, "prune_bhatt_threshold", c.prune_bhatt_threshold);
+    c.prune_search_radius_m = readOr(n, "prune_search_radius_m", c.prune_search_radius_m);
+    c.prune_use_rtree = readOr(n, "prune_use_rtree", c.prune_use_rtree);
+    c.prune_rtree_chi_sq = readOr(n, "prune_rtree_chi_sq", c.prune_rtree_chi_sq);
+    c.prune_max_passes = readOr(n, "prune_max_passes", c.prune_max_passes);
+    c.prune_cov_reg = readOr(n, "prune_cov_reg", c.prune_cov_reg);
 }
 
 } // anonymous namespace
@@ -215,6 +229,7 @@ Config loadConfig(const std::string& yaml_path) {
     loadGtNoise(root, cfg.gt_noise);
     loadImu(root, cfg.imu);
     loadVisualization(root, cfg.visualization);
+    loadMap(root, cfg.map);
 
     cfg.gmm_dir = readOr<std::string>(root, "gmm_dir", cfg.gmm_dir);
 

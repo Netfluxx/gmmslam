@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 
 namespace gmmslam {
 
@@ -106,6 +107,7 @@ FixedLagBackend::FixedLagBackend(const SmootherConfig& smoother_cfg,
     }
 
     pose_by_idx[0] = Matrix4d::Identity();
+    pose_uncertainty_by_idx[0] = 0.0;
 
     ROS_INFO("[smoother] initialized: IncrementalFixedLagSmoother (lag=%.2f s, imu=%s)",
              fixed_lag_s, enable_imu_ ? "on" : "off");
@@ -173,20 +175,21 @@ gtsam::NonlinearFactorGraph FixedLagBackend::filterStaleFactors(
     return clean;
 }
 
-void FixedLagBackend::rebuildSmoother(int anchor_idx) {
-    Matrix4d anchor_pose = Matrix4d::Identity();
-    {
-        auto it = pose_by_idx.find(anchor_idx);
-        if (it != pose_by_idx.end()) {
-            anchor_pose = it->second;
-        } else {
-            anchor_pose = pose;
+void FixedLagBackend::rebuildSmootherCore(int anchor_idx, const Matrix4d& anchor_pose,
+                                          double t_sec, const char* reason,
+                                          bool zero_imu_at_anchor) {
+    Vector3d v_anchor = Vector3d::Zero();
+    Eigen::Matrix<double,6,1> bvec_anchor = Eigen::Matrix<double,6,1>::Zero();
+    if (enable_imu_ && !zero_imu_at_anchor) {
+        {
+            auto it = velocity_by_idx.find(anchor_idx);
+            if (it != velocity_by_idx.end()) v_anchor = it->second;
+        }
+        {
+            auto it = bias_by_idx.find(anchor_idx);
+            if (it != bias_by_idx.end()) bvec_anchor = it->second;
         }
     }
-    const double t_sec = [&]{
-        auto it = key_t_sec.find(anchor_idx);
-        return (it != key_t_sec.end()) ? it->second : 0.0;
-    }();
 
     fixed_lag_ = std::make_unique<gtsam::IncrementalFixedLagSmoother>(fixed_lag_s);
 
@@ -203,36 +206,87 @@ void FixedLagBackend::rebuildSmoother(int anchor_idx) {
     if (enable_imu_) {
         const gtsam::Key kv = keyV(anchor_idx);
         const gtsam::Key kb = keyB(anchor_idx);
+        const ConstantBias bias(bvec_anchor.head<3>(), bvec_anchor.tail<3>());
 
-        Vector3d v = Vector3d::Zero();
-        {
-            auto it = velocity_by_idx.find(anchor_idx);
-            if (it != velocity_by_idx.end()) v = it->second;
-        }
-        Eigen::Matrix<double,6,1> bvec = Eigen::Matrix<double,6,1>::Zero();
-        {
-            auto it = bias_by_idx.find(anchor_idx);
-            if (it != bias_by_idx.end()) bvec = it->second;
-        }
-        const ConstantBias bias(bvec.head<3>(), bvec.tail<3>());
-
-        values.insert(kv, v);
+        values.insert(kv, v_anchor);
         values.insert(kb, bias);
         timestamps[kv] = t_sec;
         timestamps[kb] = t_sec;
 
-        factors.addPrior(kv, v, vel_prior_noise_);
+        factors.addPrior(kv, v_anchor, vel_prior_noise_);
         factors.addPrior(kb, bias, bias_prior_noise_);
     }
 
     fixed_lag_->update(factors, values, timestamps);
+
+    key_t_sec.clear();
+    key_t_sec[anchor_idx] = t_sec;
+    pose_by_idx.clear();
+    pose_by_idx[anchor_idx] = anchor_pose;
+    pose_uncertainty_by_idx.clear();
+    pose_uncertainty_by_idx[anchor_idx] = 0.0;
+    velocity_by_idx.clear();
+    bias_by_idx.clear();
+    if (enable_imu_) {
+        velocity_by_idx[anchor_idx] = v_anchor;
+        bias_by_idx[anchor_idx] = bvec_anchor;
+    }
+
+    pose = anchor_pose;
+    latest_key_idx = anchor_idx;
     inserted_pose_keys_ = {anchor_idx};
 
     solve_queue_.clear();
     resetNewData();
+    consecutive_failures_ = 0;
 
-    ROS_WARN("[smoother] RESET smoother after %d consecutive failures; re-anchored at X(%d)",
-             kMaxConsecutiveFailures, anchor_idx);
+    ROS_WARN("[smoother] RESET fixed-lag smoother (%s); re-anchored at X(%d)",
+             reason, anchor_idx);
+}
+
+void FixedLagBackend::rebuildSmoother(int anchor_idx) {
+    Matrix4d anchor_pose = Matrix4d::Identity();
+    {
+        auto it = pose_by_idx.find(anchor_idx);
+        if (it != pose_by_idx.end()) {
+            anchor_pose = it->second;
+        } else {
+            anchor_pose = pose;
+        }
+    }
+    const double t_sec = [&]{
+        auto it = key_t_sec.find(anchor_idx);
+        return (it != key_t_sec.end()) ? it->second : 0.0;
+    }();
+
+    std::lock_guard<std::mutex> lk(graph_lock);
+    rebuildSmootherCore(anchor_idx, anchor_pose, t_sec,
+                        "consecutive GTSAM failures", false);
+}
+
+void FixedLagBackend::scheduleReanchorToGt(int anchor_idx, const Matrix4d& T_odom,
+                                           double t_sec) {
+    std::lock_guard<std::mutex> lk(reanchor_scheduled_mu_);
+    reanchor_scheduled_ = true;
+    reanchor_anchor_idx_ = anchor_idx;
+    reanchor_pose_ = T_odom;
+    reanchor_t_sec_ = t_sec;
+}
+
+void FixedLagBackend::applyScheduledReanchorIfNeeded() {
+    std::unique_lock<std::mutex> rk(reanchor_scheduled_mu_);
+    if (!reanchor_scheduled_) {
+        return;
+    }
+    reanchor_scheduled_ = false;
+    const int aid = reanchor_anchor_idx_;
+    const Matrix4d T = reanchor_pose_;
+    const double ts = reanchor_t_sec_;
+    rk.unlock();
+
+    std::lock_guard<std::mutex> gk(graph_lock);
+    rebuildSmootherCore(aid, T, ts, "GT re-anchor after submap traj divergence",
+                        true);
 }
 
 // -----------------------------------------------------------------------
@@ -471,6 +525,8 @@ bool FixedLagBackend::isInLagWindow(int idx) const {
 
 void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
     while (!shutdown.load(std::memory_order_acquire)) {
+        applyScheduledReanchorIfNeeded();
+
         auto maybe_batch = solve_queue_.popWithTimeout(std::chrono::milliseconds(100));
         if (!maybe_batch.has_value()) continue;
 
@@ -513,6 +569,18 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
                         try {
                             pose_by_idx[k_idx] = matrixFromPose3(estimate.at<Pose3>(kx));
                         } catch (...) {}
+                        try {
+                            const auto cov = fixed_lag_->marginalCovariance(kx);
+                            if (cov.rows() >= 6 && cov.cols() >= 6 && cov.allFinite()) {
+                                pose_uncertainty_by_idx[k_idx] = cov.diagonal().sum();
+                            } else {
+                                pose_uncertainty_by_idx[k_idx] =
+                                    std::numeric_limits<double>::infinity();
+                            }
+                        } catch (...) {
+                            pose_uncertainty_by_idx[k_idx] =
+                                std::numeric_limits<double>::infinity();
+                        }
                     }
 
                     if (enable_imu_) {
@@ -538,11 +606,26 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
                 pose = new_pose;
                 latest_key_idx = curr_idx;
                 pose_by_idx[curr_idx] = new_pose;
+                if (!pose_uncertainty_by_idx.count(curr_idx)) {
+                    try {
+                        const auto cov = fixed_lag_->marginalCovariance(key_curr);
+                        if (cov.rows() >= 6 && cov.cols() >= 6 && cov.allFinite()) {
+                            pose_uncertainty_by_idx[curr_idx] = cov.diagonal().sum();
+                        } else {
+                            pose_uncertainty_by_idx[curr_idx] =
+                                std::numeric_limits<double>::infinity();
+                        }
+                    } catch (...) {
+                        pose_uncertainty_by_idx[curr_idx] =
+                            std::numeric_limits<double>::infinity();
+                    }
+                }
 
                 // Trim old entries
                 const int cutoff = curr_idx - pose_history_keep_;
                 for (auto it = pose_by_idx.begin(); it != pose_by_idx.end(); ) {
                     if (it->first < cutoff) {
+                        pose_uncertainty_by_idx.erase(it->first);
                         velocity_by_idx.erase(it->first);
                         bias_by_idx.erase(it->first);
                         it = pose_by_idx.erase(it);

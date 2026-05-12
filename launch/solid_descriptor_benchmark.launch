@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- SOLiD-only benchmark: subscribe to lidar + pose, publish ~metrics and optional CSV. -->
+  <arg name="config_path" default="$(find gmmslam)/config/params.yaml"/>
+  <arg name="lidar_topic" default="/m500_1/mpa/lidar_pc"/>
+  <arg name="pose_topic" default="/m500_1/mavros/local_position/pose"/>
+  <arg name="csv_path" default=""/>
+  <arg name="log_hz" default="10"/>
+
+  <node pkg="gmmslam" type="solid_descriptor_benchmark" name="solid_descriptor_benchmark"
+        output="screen">
+    <param name="config_path" value="$(arg config_path)"/>
+    <param name="lidar_topic" value="$(arg lidar_topic)"/>
+    <param name="pose_topic" value="$(arg pose_topic)"/>
+    <param name="log_hz" value="$(arg log_hz)"/>
+    <param name="csv_path" value="$(arg csv_path)"/>
+  </node>
+</launch>

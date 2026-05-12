@@ -126,7 +126,7 @@ target_include_directories(sogmm_obj PRIVATE
 add_library(gmmslam_lib SHARED
   src/config.cpp
   src/ros_helpers.cpp
-  src/gmm_utils.cpp
+  src/util/gmm_utils.cpp
   src/d2d_registration.cpp
   src/fixed_lag_backend.cpp
   src/global_pose_graph.cpp
@@ -145,6 +145,10 @@ target_include_directories(gmmslam_lib PUBLIC
   ${GMM_D2D_INCLUDE_DIR}
   ${NANOFLANN_INCLUDE_DIR}
 )
+# util/rtree.h (header-only), included from gmm_utils.cpp only
+target_include_directories(gmmslam_lib PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
 
 target_link_libraries(gmmslam_lib
   ${catkin_LIBRARIES}
@@ -162,8 +166,10 @@ target_link_libraries(gmmslam_lib
 add_executable(gmmslam_node             src/gmmslam_node.cpp)
 add_executable(d2d_registration_node    src/d2d_registration_node.cpp)
 add_executable(noisy_gt_publisher_node  src/noisy_gt_publisher_node.cpp)
+add_executable(solid_descriptor_benchmark src/testing/solid_descriptor_benchmark.cpp)
 
-foreach(_target gmmslam_node d2d_registration_node noisy_gt_publisher_node)
+foreach(_target gmmslam_node d2d_registration_node noisy_gt_publisher_node
+                solid_descriptor_benchmark)
   target_link_libraries(${_target} gmmslam_lib)
 endforeach()
 
@@ -172,6 +178,7 @@ endforeach()
 # ===========================================================================
 
 install(TARGETS gmmslam_lib gmmslam_node d2d_registration_node noisy_gt_publisher_node
+                      solid_descriptor_benchmark
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
@@ -179,4 +186,8 @@ install(TARGETS gmmslam_lib gmmslam_node d2d_registration_node noisy_gt_publishe
 
 install(DIRECTORY include/${PROJECT_NAME}/
   DESTINATION ${CATKIN_PACKAGE_INCLUDE_DESTINATION}
+)
+
+install(DIRECTORY launch config
+  DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )

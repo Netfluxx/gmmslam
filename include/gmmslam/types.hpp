@@ -1,6 +1,7 @@
 #pragma once
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -15,6 +16,8 @@ struct GmmComponent {
     Vector3d mean;
     Matrix3d covariance;
     double weight;
+    int source_key_idx = -1;
+    double pose_uncertainty = std::numeric_limits<double>::infinity();
 };
 
 struct GmmLocalData {

@@ -3,7 +3,7 @@
 #include "gmmslam/registration_manager.hpp"
 #include "gmmslam/global_pose_graph.hpp"
 #include "gmmslam/ros_helpers.hpp"
-#include "gmmslam/gmm_utils.hpp"
+#include "gmmslam/util/gmm_utils.hpp"
 
 #include <Eigen/Geometry>
 #include <algorithm>
@@ -30,8 +30,6 @@ Visualizer::Visualizer(FixedLagBackend& smoother,
     , odom_frame_(odom_frame)
     , base_frame_(base_frame)
     , gmm_marker_sigma_(vis_cfg.gmm_marker_sigma)
-    , map_decimate_(vis_cfg.map_decimate)
-    , global_map_publish_period_s_(vis_cfg.global_map_publish_period_s)
     , global_gmm_publish_period_s_(vis_cfg.global_gmm_publish_period_s)
     , pubs_(std::move(publishers))
 {
@@ -115,35 +113,11 @@ void Visualizer::publishScanProducts(const ros::Time& stamp,
     pubs_.latest_frame_cloud.publish(
         eigenToPc2Rgb(pts_w, stamp, odom_frame_, 255, 0, 0));
 
-    // --- Accumulated global map cloud (gray, slow refresh) ---
-    if (map_decimate_ > 0 && (frame_count % map_decimate_) == 0) {
-        if (map_pts_.size() >= kMaxMapFrames) {
-            map_pts_.erase(map_pts_.begin(),
-                           map_pts_.begin() + static_cast<long>(map_pts_.size() / 4));
-        }
-        map_pts_.push_back(pts_w);
-    }
-
     const double now_t = stampToSec(stamp);
 
-    if (!map_pts_.empty() &&
-        (now_t - map_cloud_last_pub_t_) >= global_map_publish_period_s_) {
-
-        int total_rows = 0;
-        for (const auto& mp : map_pts_) {
-            total_rows += static_cast<int>(mp.rows());
-        }
-        Eigen::MatrixXf all_pts(total_rows, 3);
-        int row = 0;
-        for (const auto& mp : map_pts_) {
-            const int nr = static_cast<int>(mp.rows());
-            all_pts.middleRows(row, nr) = mp;
-            row += nr;
-        }
-        pubs_.cloud.publish(
-            eigenToPc2Rgb(all_pts, stamp, odom_frame_, 140, 140, 140));
-        map_cloud_last_pub_t_ = now_t;
-    }
+    // The map representation is the per-submap GMM published below; the
+    // accumulated raw point cloud previously emitted on /map_cloud was not
+    // loop-closure aware and has been removed.
 
     // --- Graph node marker (red sphere at keyframe position) ---
     {

@@ -9,10 +9,12 @@
 #include <gtsam/nonlinear/Values.h>
 #include <gtsam/nonlinear/ISAM2.h>
 
+#include <atomic>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -27,23 +29,34 @@ public:
     // Callback types for cross-module access
     using GetPoseFn = std::function<std::optional<Matrix4d>(int)>;
     using GetGmmFn = std::function<std::optional<std::pair<GmmModel, Matrix4d>>(int)>;
+    using GetPoseUncertaintyFn = std::function<std::optional<double>(int)>;
     using GetSubmapTrajDeltaFn = std::function<std::optional<Matrix4d>(int, int, double, double)>;
 
     GlobalPoseGraph(const GlobalGraphConfig& gg_cfg,
                     const RegistrationConfig& reg_cfg,
                     const LoopClosureConfig& lc_cfg,
+                    const MapConfig& map_cfg,
                     const std::string& odom_frame,
                     const std::string& gmm_dir,
                     ros::Publisher path_pub,
                     ros::Publisher reg_request_pub,
                     GetPoseFn get_pose_fn,
                     GetGmmFn get_gmm_fn = nullptr,
+                    GetPoseUncertaintyFn get_pose_uncertainty_fn = nullptr,
                     GetSubmapTrajDeltaFn get_traj_delta_fn = nullptr);
 
     bool shouldCreateSubmap(int key_idx) const;
 
     void updateWithKeyframe(int key_idx, const ros::Time& stamp,
                             const Matrix4d& T_curr, double t_sec);
+
+    /// Retry merging GMMs for submaps whose rollover happened before async SOGMM
+    /// fits finished (typically invoked from RegistrationManager after each fit).
+    void processPendingSubmapFinalizations(const ros::Time& stamp);
+
+    /// Set when submap traj auxiliary factor fails absurd-motion gates; node
+    /// consumes to re-anchor the fixed-lag smoother on GT.
+    bool consumeSmootherReanchorRequest();
 
     void handleSubmapRegistrationResult(int sid_prev, int sid_curr,
                                         const Matrix4d& T_rel, double score,
@@ -90,7 +103,10 @@ private:
     bool passesAuxGate(const std::string& name, const Matrix4d& T_aux,
                        const Matrix4d* T_ref) const;
 
-    void finalizeSubmap(int sid, const ros::Time& stamp);
+    void enqueueSubmapFinalization(int sid, const ros::Time& stamp);
+    /// Returns true if submap is finalized (or already had a merged GMM), false if
+    /// still waiting for keyframe GMMs from the async fit worker.
+    bool tryFinalizeSubmap(int sid, const ros::Time& stamp);
     void requestOverlapRegistrations(int sid_new, const ros::Time& stamp);
     void addTransitionAuxFactors(int prev_sid, int curr_sid,
                                   const Matrix4d& T_ref_rel,
@@ -100,6 +116,7 @@ private:
     // Config
     std::string odom_frame_;
     std::string gmm_dir_;
+    MapConfig map_cfg_;
     int submap_keyframes_per_submap_;
     double overlap_radius_m_;
     double submap_reg_score_threshold_;
@@ -134,9 +151,15 @@ private:
     // Pending registrations
     std::set<std::pair<int,int>> pending_submap_registrations_;
 
+    std::vector<std::pair<int, ros::Time>> pending_submap_finalize_;
+
+    bool reanchor_on_traj_fail_ = true;
+    std::atomic<bool> smoother_reanchor_requested_{false};
+
     // Callbacks
     GetPoseFn get_pose_;
     GetGmmFn get_gmm_;
+    GetPoseUncertaintyFn get_pose_uncertainty_;
     GetSubmapTrajDeltaFn get_traj_delta_;
 
     // Publishers

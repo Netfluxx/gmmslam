@@ -61,6 +61,12 @@ public:
     // Drain result queue and stage factors in the smoother
     void drainResults(const ros::Time& stamp);
 
+    using FitCompleteCallback =
+        std::function<void(int frame_idx, const ros::Time& stamp)>;
+    void setOnFitComplete(FitCompleteCallback cb) {
+        on_fit_complete_ = std::move(cb);
+    }
+
     // --- Thread-safe shared state ---
     mutable std::mutex lock;
     std::map<int, std::string> gmm_paths_by_idx;
@@ -176,6 +182,8 @@ private:
     // Queues
     ThreadSafeQueue<FitJob> fit_queue_;
     ThreadSafeQueue<ResultItem> result_queue_;
+
+    FitCompleteCallback on_fit_complete_;
 };
 
 } // namespace gmmslam

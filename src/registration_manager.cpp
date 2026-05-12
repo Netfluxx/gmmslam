@@ -2,7 +2,7 @@
 #include "gmmslam/fixed_lag_backend.hpp"
 #include "gmmslam/global_pose_graph.hpp"
 #include "gmmslam/sogmm_fitting.hpp"
-#include "gmmslam/gmm_utils.hpp"
+#include "gmmslam/util/gmm_utils.hpp"
 
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/inference/Symbol.h>
@@ -382,6 +382,10 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
     // Keep the SOLiD index aligned with the GMM cache so we never rank a
     // candidate whose GMM has already been evicted.
     place_index_.eraseOlderThan(min_keep);
+
+    if (on_fit_complete_) {
+        on_fit_complete_(frame_idx, stamp);
+    }
 }
 
 // ---------------------------------------------------------------------------

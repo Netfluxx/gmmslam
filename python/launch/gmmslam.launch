@@ -43,6 +43,7 @@
   <arg name="submap_loop_sigma_t_max" default="0.50"/>
   <arg name="submap_loop_sigma_r_min" default="0.03"/>
   <arg name="submap_loop_sigma_r_max" default="0.30"/>
+  <arg name="submap_reanchor_smoother_on_traj_gate_fail" default="true"/>
   <arg name="solve_after_registration_factor" default="false"/>
   <arg name="registration_workers" default="6"/>
   <!-- Keyframe parameters -->
@@ -101,13 +102,16 @@
   <arg name="imu_bias_prior_sigma" default="0.1"/>
   <arg name="submap_traj_sigma_t" default="0.15"/>
   <arg name="submap_traj_sigma_r" default="0.15"/>
-  <arg name="submap_aux_gate_abs_trans_m" default="2.5"/>
+  <arg name="submap_aux_gate_abs_trans_m" default="6.0"/>
   <arg name="submap_aux_gate_abs_rot_deg" default="50.0"/>
   <arg name="submap_aux_gate_consistency_trans_m" default="2.0"/>
   <arg name="submap_aux_gate_consistency_rot_deg" default="35.0"/>
 
   <!-- Minimum valid points per cloud (below this the frame is skipped) -->
   <arg name="min_points"       default="50"/>
+
+  <!-- Webots autopilot: let gmmslam publish world->base; avoid duplicate TF + RViz origin bug -->
+  <param name="/webots_publish_gt_base_tf" value="false"/>
 
   <!-- ===== static TF: drone body → depth camera ===== -->
   <!-- Translation matches the RangeFinder position in voxl_m500.proto -->
@@ -159,6 +163,8 @@
     <param name="submap_loop_sigma_t_max" value="$(arg submap_loop_sigma_t_max)"/>
     <param name="submap_loop_sigma_r_min" value="$(arg submap_loop_sigma_r_min)"/>
     <param name="submap_loop_sigma_r_max" value="$(arg submap_loop_sigma_r_max)"/>
+    <param name="submap_reanchor_smoother_on_traj_gate_fail"
+           value="$(arg submap_reanchor_smoother_on_traj_gate_fail)"/>
     <param name="solve_after_registration_factor" value="$(arg solve_after_registration_factor)"/>
     <param name="registration_request_topic" value="/gmmslam_node/registration/request"/>
     <param name="registration_result_topic"  value="/gmmslam_node/registration/result"/>

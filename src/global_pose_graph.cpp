@@ -1,5 +1,5 @@
 #include "gmmslam/global_pose_graph.hpp"
-#include "gmmslam/gmm_utils.hpp"
+#include "gmmslam/util/gmm_utils.hpp"
 #include "gmmslam/ros_helpers.hpp"
 
 #include <gtsam/inference/Symbol.h>
@@ -113,16 +113,19 @@ GlobalPoseGraph::GlobalPoseGraph(
         const GlobalGraphConfig& gg_cfg,
         const RegistrationConfig& reg_cfg,
         const LoopClosureConfig& lc_cfg,
+        const MapConfig& map_cfg,
         const std::string& odom_frame,
         const std::string& gmm_dir,
         ros::Publisher path_pub,
         ros::Publisher reg_request_pub,
         GetPoseFn get_pose_fn,
         GetGmmFn get_gmm_fn,
+        GetPoseUncertaintyFn get_pose_uncertainty_fn,
         GetSubmapTrajDeltaFn get_traj_delta_fn)
     : enable(gg_cfg.enable)
     , odom_frame_(odom_frame)
     , gmm_dir_(gmm_dir)
+    , map_cfg_(map_cfg)
     , submap_keyframes_per_submap_(gg_cfg.submap_keyframes_per_submap)
     , overlap_radius_m_(gg_cfg.overlap_radius_m)
     , submap_reg_score_threshold_(gg_cfg.reg_score_threshold)
@@ -140,8 +143,10 @@ GlobalPoseGraph::GlobalPoseGraph(
     , aux_gate_abs_rot_deg_(gg_cfg.aux_gate_abs_rot_deg)
     , aux_gate_consistency_trans_m_(gg_cfg.aux_gate_consistency_trans_m)
     , aux_gate_consistency_rot_deg_(gg_cfg.aux_gate_consistency_rot_deg)
+    , reanchor_on_traj_fail_(gg_cfg.reanchor_smoother_on_traj_gate_fail)
     , get_pose_(std::move(get_pose_fn))
     , get_gmm_(std::move(get_gmm_fn))
+    , get_pose_uncertainty_(std::move(get_pose_uncertainty_fn))
     , get_traj_delta_(std::move(get_traj_delta_fn))
     , path_pub_(std::move(path_pub))
     , reg_request_pub_(std::move(reg_request_pub))
@@ -169,6 +174,10 @@ GlobalPoseGraph::GlobalPoseGraph(
     path_.header.frame_id = odom_frame_;
 }
 
+bool GlobalPoseGraph::consumeSmootherReanchorRequest() {
+    return smoother_reanchor_requested_.exchange(false, std::memory_order_acq_rel);
+}
+
 // ---------------------------------------------------------------
 // Keyframe / submap lifecycle
 // ---------------------------------------------------------------
@@ -190,7 +199,7 @@ void GlobalPoseGraph::updateWithKeyframe(int key_idx, const ros::Time& stamp,
     if (!shouldCreateSubmap(key_idx)) return;
 
     if (last_submap_idx_ >= 0) {
-        finalizeSubmap(last_submap_idx_, stamp);
+        enqueueSubmapFinalization(last_submap_idx_, stamp);
     }
 
     const int sid = static_cast<int>(submap_ids.size());
@@ -256,7 +265,15 @@ void GlobalPoseGraph::addTransitionAuxFactors(
         if (!opt_T_traj.has_value()) return;
 
         const Matrix4d& T_traj = opt_T_traj.value();
-        if (passesAuxGate("traj", T_traj, &T_ref_rel)) {
+        const bool gate_ok = passesAuxGate("traj", T_traj, &T_ref_rel);
+        if (!gate_ok && reanchor_on_traj_fail_) {
+            const double d_abs = T_traj.block<3,1>(0,3).norm();
+            const double r_abs = rotAngleDeg(T_traj.block<3,3>(0,0));
+            if (d_abs > aux_gate_abs_trans_m_ || r_abs > aux_gate_abs_rot_deg_) {
+                smoother_reanchor_requested_.store(true, std::memory_order_relaxed);
+            }
+        }
+        if (gate_ok) {
             new_factors_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
                 X(prev_sid), X(curr_sid),
                 toPose3(T_traj), submap_traj_noise_);
@@ -277,18 +294,49 @@ void GlobalPoseGraph::addTransitionAuxFactors(
 // Submap finalization
 // ---------------------------------------------------------------
 
-void GlobalPoseGraph::finalizeSubmap(int sid, const ros::Time& stamp) {
-    if (!get_gmm_) return;
+void GlobalPoseGraph::enqueueSubmapFinalization(int sid, const ros::Time& stamp) {
+    if (!enable || !get_gmm_) return;
+    if (submap_gmm.count(sid)) return;
+    const auto dup = std::find_if(
+        pending_submap_finalize_.begin(), pending_submap_finalize_.end(),
+        [sid](const std::pair<int, ros::Time>& p) { return p.first == sid; });
+    if (dup == pending_submap_finalize_.end()) {
+        pending_submap_finalize_.emplace_back(sid, stamp);
+    }
+    processPendingSubmapFinalizations(stamp);
+}
+
+void GlobalPoseGraph::processPendingSubmapFinalizations(const ros::Time& stamp) {
+    if (!enable || !get_gmm_) return;
+    for (auto it = pending_submap_finalize_.begin();
+         it != pending_submap_finalize_.end();) {
+        const int sid = it->first;
+        if (submap_gmm.count(sid)) {
+            it = pending_submap_finalize_.erase(it);
+            continue;
+        }
+        if (tryFinalizeSubmap(sid, stamp)) {
+            it = pending_submap_finalize_.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool GlobalPoseGraph::tryFinalizeSubmap(int sid, const ros::Time& stamp) {
+    if (!get_gmm_) return true;
+
+    if (submap_gmm.count(sid)) return true;
 
     const auto it_keys = submap_keyframes.find(sid);
-    if (it_keys == submap_keyframes.end() || it_keys->second.empty()) return;
+    if (it_keys == submap_keyframes.end() || it_keys->second.empty()) return true;
     const auto& key_indices = it_keys->second;
 
     const auto it_pose = submap_pose_by_idx.find(sid);
-    if (it_pose == submap_pose_by_idx.end()) return;
+    if (it_pose == submap_pose_by_idx.end()) return true;
     const Matrix4d& T_ref = it_pose->second;
 
-    std::vector<std::pair<GmmModel, Matrix4d>> gmms_with_poses;
+    std::vector<PosedGmmInput> gmms_with_poses;
     for (int ki : key_indices) {
         auto result = get_gmm_(ki);
         if (!result.has_value()) continue;
@@ -301,26 +349,45 @@ void GlobalPoseGraph::finalizeSubmap(int sid, const ros::Time& stamp) {
             T_kf = opt_pose.value();
         }
         if (gmm.components.empty() || !T_kf.allFinite()) continue;
-        gmms_with_poses.emplace_back(std::move(gmm), T_kf);
+
+        PosedGmmInput input;
+        input.model = std::move(gmm);
+        input.pose = T_kf;
+        input.key_idx = ki;
+        if (get_pose_uncertainty_) {
+            auto opt_uncertainty = get_pose_uncertainty_(ki);
+            if (opt_uncertainty.has_value() && std::isfinite(opt_uncertainty.value())) {
+                input.pose_uncertainty = opt_uncertainty.value();
+            }
+        }
+        gmms_with_poses.push_back(std::move(input));
     }
 
     if (gmms_with_poses.empty()) {
-        ROS_WARN("[global_graph] S(%d): no keyframe GMMs available "
-                 "(%zu keyframes, 0 GMMs)",
-                 sid, key_indices.size());
-        return;
+        ROS_DEBUG_THROTTLE(
+            5.0,
+            "[global_graph] S(%d): submap finalize waiting for async GMM fits "
+            "(%zu keyframes, none ready yet)",
+            sid, key_indices.size());
+        return false;
     }
 
-    GmmModel merged = mergeGmmsConcatenate(gmms_with_poses, T_ref);
-    if (merged.components.empty()) return;
+    GmmModel raw     = mergeGmmsConcatenate(gmms_with_poses, T_ref);
+    GmmModel merged  = map_cfg_.prune_enable
+                         ? pruneSimilarComponents(raw, map_cfg_)
+                         : raw;
+    if (merged.components.empty()) return true;
 
     submap_gmm[sid] = merged;
     submap_gmm_components[sid] = precomputeGmmLocalData(merged);
     submap_frozen_pose_by_idx[sid] = T_ref;
 
-    ROS_INFO("[global_graph] S(%d) finalized: %d components "
-             "from %zu/%zu keyframes",
+    ROS_INFO("[global_graph] S(%d) finalized: %d components (raw %d, "
+             "pruned %d, gate D_B<%.2f) from %zu/%zu keyframes",
              sid, merged.numComponents(),
+             raw.numComponents(),
+             raw.numComponents() - merged.numComponents(),
+             map_cfg_.prune_bhatt_threshold,
              gmms_with_poses.size(), key_indices.size());
 
     const std::string gmm_path =
@@ -336,10 +403,11 @@ void GlobalPoseGraph::finalizeSubmap(int sid, const ros::Time& stamp) {
     } catch (const std::exception& e) {
         ROS_WARN("[global_graph] failed to save S(%d) GMM: %s",
                  sid, e.what());
-        return;
+        return true;
     }
 
     requestOverlapRegistrations(sid, stamp);
+    return true;
 }
 
 // ---------------------------------------------------------------
@@ -536,6 +604,14 @@ void GlobalPoseGraph::commit(const ros::Time& stamp) {
         try {
             const Matrix4d T_sid = toMatrix(est.at<gtsam::Pose3>(X(sid)));
             submap_pose_by_idx[sid] = T_sid;
+            // Keep the finalized (render-time) pose tracking iSAM2.
+            // Non-finalized submaps never had an entry here and the
+            // visualiser falls back to submap_pose_by_idx for them,
+            // so we only refresh sids that are already frozen.
+            auto fz_it = submap_frozen_pose_by_idx.find(sid);
+            if (fz_it != submap_frozen_pose_by_idx.end()) {
+                fz_it->second = T_sid;
+            }
             path.poses.push_back(poseToPoseStamped(T_sid, stamp, odom_frame_));
         } catch (const gtsam::ValuesKeyDoesNotExist&) {
             continue;
