@@ -1,12 +1,84 @@
 #include "gmmslam/ros_helpers.hpp"
 
+#include <cmath>
+#include <cstdint>
 #include <cstring>
+#include <numeric>
+#include <random>
 #include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 #include <sensor_msgs/point_cloud2_iterator.h>
 
 namespace gmmslam {
+
+namespace {
+
+// Centroid per voxel; leaf_size <= 0 returns pts unchanged (same idea as SOLiD).
+Eigen::MatrixXf voxelDownsample(const Eigen::MatrixXf& pts, double leaf_size) {
+    if (leaf_size <= 0.0 || pts.rows() == 0) {
+        return pts;
+    }
+
+    const float inv = 1.0f / static_cast<float>(leaf_size);
+    struct Acc {
+        double sx = 0.0, sy = 0.0, sz = 0.0;
+        int n = 0;
+    };
+    std::unordered_map<std::int64_t, Acc> bins;
+    bins.reserve(static_cast<std::size_t>(pts.rows()));
+
+    auto pack = [](std::int32_t a, std::int32_t b, std::int32_t c) {
+        std::int64_t h = static_cast<std::int64_t>(a) * 73856093LL;
+        h ^= static_cast<std::int64_t>(b) * 19349663LL;
+        h ^= static_cast<std::int64_t>(c) * 83492791LL;
+        return h;
+    };
+
+    for (int i = 0; i < pts.rows(); ++i) {
+        const auto ix = static_cast<std::int32_t>(std::floor(pts(i, 0) * inv));
+        const auto iy = static_cast<std::int32_t>(std::floor(pts(i, 1) * inv));
+        const auto iz = static_cast<std::int32_t>(std::floor(pts(i, 2) * inv));
+        const auto key = pack(ix, iy, iz);
+        auto& acc = bins[key];
+        acc.sx += pts(i, 0);
+        acc.sy += pts(i, 1);
+        acc.sz += pts(i, 2);
+        acc.n += 1;
+    }
+
+    Eigen::MatrixXf out(static_cast<int>(bins.size()), 3);
+    int r = 0;
+    for (const auto& kv : bins) {
+        const auto& a = kv.second;
+        out(r, 0) = static_cast<float>(a.sx / static_cast<double>(a.n));
+        out(r, 1) = static_cast<float>(a.sy / static_cast<double>(a.n));
+        out(r, 2) = static_cast<float>(a.sz / static_cast<double>(a.n));
+        ++r;
+    }
+    return out;
+}
+
+Eigen::MatrixXf subsampleToMax(const Eigen::MatrixXf& pts, int target) {
+    const int n = static_cast<int>(pts.rows());
+    if (target <= 0 || n <= target) {
+        return pts;
+    }
+    std::vector<int> pop(static_cast<std::size_t>(n));
+    std::iota(pop.begin(), pop.end(), 0);
+    std::vector<int> pick(static_cast<std::size_t>(target));
+    thread_local std::mt19937 rng{std::random_device{}()};
+    std::sample(pop.begin(), pop.end(), pick.begin(),
+                static_cast<std::ptrdiff_t>(target), rng);
+    Eigen::MatrixXf out(target, 3);
+    for (int i = 0; i < target; ++i) {
+        out.row(i) = pts.row(pick[static_cast<std::size_t>(i)]);
+    }
+    return out;
+}
+
+} // namespace
 
 double stampToSec(const ros::Time& stamp) {
     return static_cast<double>(stamp.sec) + 1e-9 * static_cast<double>(stamp.nsec);
@@ -137,7 +209,8 @@ Eigen::MatrixXf preprocess(
     const Eigen::MatrixXf& pts,
     double min_range,
     double max_range,
-    double /*voxel_size*/) {
+    double voxel_size,
+    int target_points) {
 
     if (pts.rows() == 0) return pts;
 
@@ -157,7 +230,8 @@ Eigen::MatrixXf preprocess(
     for (int i = 0; i < static_cast<int>(keep.size()); ++i) {
         result.row(i) = pts.row(keep[i]);
     }
-    return result;
+    result = voxelDownsample(result, voxel_size);
+    return subsampleToMax(result, target_points);
 }
 
 Matrix4d poseMsgToMatrix(const geometry_msgs::Pose& pose_msg) {

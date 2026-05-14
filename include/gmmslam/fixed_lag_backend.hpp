@@ -32,6 +32,7 @@ public:
                     const ImuConfig& imu_cfg);
 
     bool initialize(const Matrix4d& pose, const ros::Time& stamp);
+    bool initialized() const { return initialized_; }
 
     bool addFrame(int prev_idx, int curr_idx, const ros::Time& stamp,
                   const Matrix4d& predicted_pose,

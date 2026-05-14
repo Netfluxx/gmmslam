@@ -10,7 +10,11 @@ struct RosConfig {
     std::string sensor_frame = "depth_camera_1";
     std::string odom_frame = "world";
     std::string base_frame = "m500_1_base_link";
-    std::string noisy_gt_topic = "/gmmslam_node/noisy_gt_pose";
+    /// geometry_msgs/PoseStamped odometry-style input (e.g. noisy GT publisher).
+    std::string odometry_input = "/gmmslam_node/noisy_gt_pose";
+    /// Persist latest odom-frame pose here; on respawn, seed the smoother from it.
+    /// Empty string disables restart pose persistence.
+    std::string restart_state_path = "/tmp/gmmslam_restart_pose.txt";
     std::string registration_request_topic = "/gmmslam_node/registration/request";
     std::string registration_result_topic = "/gmmslam_node/registration/result";
 };
@@ -19,6 +23,9 @@ struct PreprocessConfig {
     double min_range = 0.1;
     double max_range = 25.0;
     double voxel_leaf_size = 0.05;
+    /// If > 0, randomly subsample to at most this many points after range filter
+    /// and optional voxel (uniform subset without replacement).
+    int target_points = 0;
     int min_points = 50;
 };
 
@@ -145,6 +152,13 @@ struct GlobalGraphConfig {
     double aux_gate_abs_rot_deg = 50.0;
     double aux_gate_consistency_trans_m = 2.0;
     double aux_gate_consistency_rot_deg = 35.0;
+    /// Separate limits for the sequential submap *trajectory* aux factor (spanning
+    /// ~submap_keyframes_per_submap keyframes). If unset in YAML, loadGlobalGraph
+    /// copies from aux_gate_* after those are read.
+    double traj_aux_gate_abs_trans_m = 6.0;
+    double traj_aux_gate_abs_rot_deg = 55.0;
+    double traj_aux_gate_consistency_trans_m = 2.0;
+    double traj_aux_gate_consistency_rot_deg = 40.0;
     double submap_loop_sigma_t_min = 0.05;
     double submap_loop_sigma_t_max = 0.50;
     double submap_loop_sigma_r_min = 0.03;
@@ -154,6 +168,18 @@ struct GlobalGraphConfig {
     /// anchoring the smoother on the current GT pose so published SLAM pose stops
     /// drifting from simulation truth.
     bool reanchor_smoother_on_traj_gate_fail = true;
+    /// Before merging keyframe GMMs into a closed submap, require at least this many
+    /// keyframes to have finished SOGMM fits (clamped to the submap's keyframe count).
+    /// 1 preserves legacy behavior (finalize as soon as any GMM is ready). 0 lets
+    /// the fraction rule alone set the threshold (minimum remains 1 ready keyframe).
+    int submap_finalize_min_ready_keyframes = 1;
+    /// If in (0,1], also require ceil(fraction * N) ready keyframes where N is the number
+    /// of keyframes in the submap. Combined with min_ready_keyframes via max(...).
+    /// 0 disables the fraction rule.
+    double submap_finalize_min_ready_fraction = 0.0;
+    /// If >0, after this many seconds waiting on the readiness gate, finalize using
+    /// whatever keyframe GMMs are available (>=1). 0 disables the fallback.
+    double submap_finalize_max_wait_s = 0.0;
 };
 
 struct GtNoiseConfig {
@@ -184,6 +210,10 @@ struct ImuConfig {
 struct VisualizationConfig {
     double gmm_marker_sigma = 3.0;
     double global_gmm_publish_period_s = 1.0;
+    /// Accumulated map PointCloud2 publish rate (Hz); period = 1/rate.
+    double map_cloud_publish_hz = 0.5;
+    /// Max smoother-frame scans retained (oldest dropped when exceeded).
+    int map_cloud_max_chunks = 3000;
 };
 
 // Map-representation knobs. The "map" is the per-submap GMM produced at

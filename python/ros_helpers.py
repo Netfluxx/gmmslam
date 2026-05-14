@@ -99,16 +99,48 @@ def make_pcld_4d(pts: np.ndarray) -> np.ndarray:
     return np.hstack([pts, ranges]).astype(np.float64)
 
 
+def _voxel_downsample(pts: np.ndarray, leaf: float) -> np.ndarray:
+    """One point per voxel (centroid); leaf <= 0 leaves pts unchanged."""
+    if leaf <= 0.0 or pts.shape[0] == 0:
+        return pts
+    inv = 1.0 / float(leaf)
+    pts_f = pts.astype(np.float64, copy=False)
+    q = np.floor(pts_f * inv).astype(np.int64, copy=False)
+    ax = q[:, 0] * np.int64(73856093)
+    bx = q[:, 1] * np.int64(19349663)
+    cx = q[:, 2] * np.int64(83492791)
+    k = np.bitwise_xor(np.bitwise_xor(ax, bx), cx)
+    _, inv_idx, counts = np.unique(k, return_inverse=True, return_counts=True)
+    n_u = counts.shape[0]
+    sums = np.zeros((n_u, 3), dtype=np.float64)
+    for d in range(3):
+        np.add.at(sums[:, d], inv_idx, pts_f[:, d])
+    return (sums / counts[:, np.newaxis]).astype(np.float32)
+
+
+def _subsample_to_max(pts: np.ndarray, target: int) -> np.ndarray:
+    """Uniform random subset without replacement; target <= 0 leaves pts unchanged."""
+    if target <= 0 or pts.shape[0] <= target:
+        return pts
+    idx = np.random.choice(pts.shape[0], size=target, replace=False)
+    return pts[idx]
+
+
 def preprocess(
-    pts: np.ndarray, min_range: float, max_range: float, voxel_size: float
+    pts: np.ndarray,
+    min_range: float,
+    max_range: float,
+    voxel_size: float,
+    target_points: int = 0,
 ) -> np.ndarray:
-    """Range filter + voxel-grid downsampling."""
+    """Range filter, optional voxel centroids, then optional random cap to target_points."""
     ranges = np.linalg.norm(pts, axis=1)
     mask = (ranges >= min_range) & (ranges <= max_range)
     pts = pts[mask]
     if pts.shape[0] == 0:
         return pts
-    return pts
+    pts = _voxel_downsample(pts, voxel_size)
+    return _subsample_to_max(pts, target_points)
 
 
 def pose_msg_to_matrix(pose_msg) -> np.ndarray:

@@ -15,7 +15,7 @@
   <arg name="base_frame" default="m500_1_base_link"/>
   <arg name="gt_topic" default="/m500_1/mavros/local_position/pose"/>
   <arg name="registration_workers" default="6"/>
-  <arg name="noisy_gt_topic" default="/gmmslam_node/noisy_gt_pose"/>
+  <arg name="odometry_input" default="/gmmslam_node/noisy_gt_pose"/>
 
   <!-- ========== Load YAML onto the parameter server under /gmmslam ========== -->
   <rosparam command="load" file="$(arg config_file)" ns="gmmslam"/>
@@ -40,7 +40,7 @@
     <param name="base_frame" value="$(arg base_frame)"/>
     <param name="sensor_frame" value="$(arg sensor_frame)"/>
     <param name="gt_topic" value="$(arg gt_topic)"/>
-    <param name="noisy_gt_topic" value="$(arg noisy_gt_topic)"/>
+    <param name="odometry_input" value="$(arg odometry_input)"/>
   </node>
 
   <!-- ========== D2D registration worker pool ========== -->
@@ -57,7 +57,7 @@
         name="noisy_gt_publisher_node" output="screen" respawn="true">
     <param name="gt_topic" value="$(arg gt_topic)"/>
     <param name="odom_frame" value="$(arg odom_frame)"/>
-    <param name="pose_topic" value="$(arg noisy_gt_topic)"/>
+    <param name="pose_topic" value="$(arg odometry_input)"/>
     <param name="path_topic" value="/gmmslam_node/noisy_gt_path"/>
   </node>
 

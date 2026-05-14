@@ -8,6 +8,7 @@ results are added as BetweenFactors between submap nodes.
 import json
 import os
 import threading
+from typing import Optional
 
 import numpy as np
 import rospy
@@ -61,6 +62,10 @@ class GlobalPoseGraph:
         submap_aux_gate_abs_rot_deg: float = 90.0,
         submap_aux_gate_consistency_trans_m: float = 2.0,
         submap_aux_gate_consistency_rot_deg: float = 35.0,
+        submap_traj_aux_gate_abs_trans_m: float = 6.0,
+        submap_traj_aux_gate_abs_rot_deg: float = 55.0,
+        submap_traj_aux_gate_consistency_trans_m: float = 2.0,
+        submap_traj_aux_gate_consistency_rot_deg: float = 40.0,
     ):
         self.odom_frame = odom_frame
         self.enable = enable
@@ -90,6 +95,14 @@ class GlobalPoseGraph:
         )
         self.submap_aux_gate_consistency_rot_deg = float(
             submap_aux_gate_consistency_rot_deg
+        )
+        self.submap_traj_aux_gate_abs_trans_m = float(submap_traj_aux_gate_abs_trans_m)
+        self.submap_traj_aux_gate_abs_rot_deg = float(submap_traj_aux_gate_abs_rot_deg)
+        self.submap_traj_aux_gate_consistency_trans_m = float(
+            submap_traj_aux_gate_consistency_trans_m
+        )
+        self.submap_traj_aux_gate_consistency_rot_deg = float(
+            submap_traj_aux_gate_consistency_rot_deg
         )
 
         os.makedirs(self._gmm_dir, exist_ok=True)
@@ -190,38 +203,66 @@ class GlobalPoseGraph:
         c = float(np.clip(c, -1.0, 1.0))
         return float(np.degrees(np.arccos(c)))
 
-    def _passes_aux_gate(self, name: str, T_aux: np.ndarray, T_ref: np.ndarray):
+    def _passes_aux_gate(
+        self,
+        name: str,
+        T_aux: np.ndarray,
+        T_ref: Optional[np.ndarray],
+        *,
+        use_traj_limits: bool = False,
+    ):
         """Gate auxiliary submap delta with absolute and consistency limits."""
         if T_aux is None or not np.all(np.isfinite(T_aux)):
             return False
+        abs_t = (
+            self.submap_traj_aux_gate_abs_trans_m
+            if use_traj_limits
+            else self.submap_aux_gate_abs_trans_m
+        )
+        abs_r = (
+            self.submap_traj_aux_gate_abs_rot_deg
+            if use_traj_limits
+            else self.submap_aux_gate_abs_rot_deg
+        )
+        con_t = (
+            self.submap_traj_aux_gate_consistency_trans_m
+            if use_traj_limits
+            else self.submap_aux_gate_consistency_trans_m
+        )
+        con_r = (
+            self.submap_traj_aux_gate_consistency_rot_deg
+            if use_traj_limits
+            else self.submap_aux_gate_consistency_rot_deg
+        )
+
         d_abs = float(np.linalg.norm(T_aux[:3, 3]))
         r_abs = self._rot_angle_deg(T_aux[:3, :3])
-        if d_abs > self.submap_aux_gate_abs_trans_m:
+        if d_abs > abs_t:
             rospy.logwarn(
                 f"[global_graph] rejected {name} submap factor (abs trans {d_abs:.3f}m > "
-                f"{self.submap_aux_gate_abs_trans_m:.3f}m)"
+                f"{abs_t:.3f}m)"
             )
             return False
-        if r_abs > self.submap_aux_gate_abs_rot_deg:
+        if r_abs > abs_r:
             rospy.logwarn(
                 f"[global_graph] rejected {name} submap factor (abs rot {r_abs:.2f}deg > "
-                f"{self.submap_aux_gate_abs_rot_deg:.2f}deg)"
+                f"{abs_r:.2f}deg)"
             )
             return False
         if T_ref is not None and np.all(np.isfinite(T_ref)):
             T_err = np.linalg.inv(T_ref) @ T_aux
             d_err = float(np.linalg.norm(T_err[:3, 3]))
             r_err = self._rot_angle_deg(T_err[:3, :3])
-            if d_err > self.submap_aux_gate_consistency_trans_m:
+            if d_err > con_t:
                 rospy.logwarn(
                     f"[global_graph] rejected {name} submap factor (consistency trans "
-                    f"{d_err:.3f}m > {self.submap_aux_gate_consistency_trans_m:.3f}m)"
+                    f"{d_err:.3f}m > {con_t:.3f}m)"
                 )
                 return False
-            if r_err > self.submap_aux_gate_consistency_rot_deg:
+            if r_err > con_r:
                 rospy.logwarn(
                     f"[global_graph] rejected {name} submap factor (consistency rot "
-                    f"{r_err:.2f}deg > {self.submap_aux_gate_consistency_rot_deg:.2f}deg)"
+                    f"{r_err:.2f}deg > {con_r:.2f}deg)"
                 )
                 return False
         return True
@@ -324,7 +365,7 @@ class GlobalPoseGraph:
                 T_traj = self._get_submap_traj_delta(
                     prev_anchor_key, curr_anchor_key, prev_anchor_t, curr_anchor_t
                 )
-                if self._passes_aux_gate("traj", T_traj, T_ref_rel):
+                if self._passes_aux_gate("traj", T_traj, T_ref_rel, use_traj_limits=True):
                     self._new_factors.push_back(
                         gtsam.BetweenFactorPose3(
                             X(prev_sid),
@@ -473,6 +514,33 @@ class GlobalPoseGraph:
                 f"already exists, skipping"
             )
             return
+
+        if not np.all(np.isfinite(T_rel)):
+            rospy.logwarn(
+                f"[global_graph] submap reg S({sid_prev})->S({sid_curr}) "
+                "rejected (non-finite T)"
+            )
+            return
+
+        T_w_sp = self.submap_pose_by_idx.get(sid_prev)
+        T_w_sc = self.submap_pose_by_idx.get(sid_curr)
+        if T_w_sp is not None and T_w_sc is not None:
+            T_ref_rel = np.linalg.inv(T_w_sp) @ T_w_sc
+            if not self._passes_aux_gate(
+                "overlap_reg", T_rel, T_ref_rel, use_traj_limits=False
+            ):
+                rospy.loginfo(
+                    f"[global_graph] submap reg S({sid_prev})->S({sid_curr}) "
+                    "rejected (aux gate vs anchor poses)"
+                )
+                return
+        else:
+            if not self._passes_aux_gate("overlap_reg", T_rel, None, use_traj_limits=False):
+                rospy.loginfo(
+                    f"[global_graph] submap reg S({sid_prev})->S({sid_curr}) "
+                    "rejected (aux magnitude gate; missing anchor pose)"
+                )
+                return
 
         pos = T_rel[:3, 3]
         noise, sigma_t, sigma_r = self._noise_from_score(

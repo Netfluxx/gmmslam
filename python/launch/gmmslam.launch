@@ -72,12 +72,13 @@
   <arg name="gt_factor_sigma_t" default="0.015"/>
   <arg name="gt_factor_sigma_r" default="0.015"/>
   <arg name="gt_noise_seed" default="-1"/>
-  <arg name="noisy_gt_topic" default="/gmmslam_node/noisy_gt_pose"/>
+  <arg name="odometry_input" default="/gmmslam_node/noisy_gt_pose"/>
 
   <!-- Preprocessing -->
   <arg name="min_range"        default="0.1"/>
   <arg name="max_range"        default="25.0"/>
   <arg name="voxel_leaf_size"  default="0.05"/>
+  <arg name="target_points"    default="0"/>
 
   <!-- GMM -->
   <arg name="sogmm_bandwidth"    default="0.02"/>
@@ -106,6 +107,10 @@
   <arg name="submap_aux_gate_abs_rot_deg" default="50.0"/>
   <arg name="submap_aux_gate_consistency_trans_m" default="2.0"/>
   <arg name="submap_aux_gate_consistency_rot_deg" default="35.0"/>
+  <arg name="submap_traj_aux_gate_abs_trans_m" default="6.0"/>
+  <arg name="submap_traj_aux_gate_abs_rot_deg" default="55.0"/>
+  <arg name="submap_traj_aux_gate_consistency_trans_m" default="2.0"/>
+  <arg name="submap_traj_aux_gate_consistency_rot_deg" default="40.0"/>
 
   <!-- Minimum valid points per cloud (below this the frame is skipped) -->
   <arg name="min_points"       default="50"/>
@@ -193,12 +198,13 @@
     <param name="gt_factor_sigma_t" value="$(arg gt_factor_sigma_t)"/>
     <param name="gt_factor_sigma_r" value="$(arg gt_factor_sigma_r)"/>
     <param name="gt_noise_seed" value="$(arg gt_noise_seed)"/>
-    <param name="noisy_gt_topic" value="$(arg noisy_gt_topic)"/>
+    <param name="odometry_input" value="$(arg odometry_input)"/>
 
     <!-- GMM parameters -->
     <param name="min_range"        value="$(arg min_range)"/>
     <param name="max_range"        value="$(arg max_range)"/>
     <param name="voxel_leaf_size"  value="$(arg voxel_leaf_size)"/>
+    <param name="target_points"    value="$(arg target_points)"/>
     <param name="sogmm_bandwidth"    value="$(arg sogmm_bandwidth)"/>
     <param name="sogmm_max_points"   value="$(arg sogmm_max_points)"/>
     <param name="sogmm_n_components" value="$(arg sogmm_n_components)"/>
@@ -223,6 +229,10 @@
     <param name="submap_aux_gate_abs_rot_deg" value="$(arg submap_aux_gate_abs_rot_deg)"/>
     <param name="submap_aux_gate_consistency_trans_m" value="$(arg submap_aux_gate_consistency_trans_m)"/>
     <param name="submap_aux_gate_consistency_rot_deg" value="$(arg submap_aux_gate_consistency_rot_deg)"/>
+    <param name="submap_traj_aux_gate_abs_trans_m" value="$(arg submap_traj_aux_gate_abs_trans_m)"/>
+    <param name="submap_traj_aux_gate_abs_rot_deg" value="$(arg submap_traj_aux_gate_abs_rot_deg)"/>
+    <param name="submap_traj_aux_gate_consistency_trans_m" value="$(arg submap_traj_aux_gate_consistency_trans_m)"/>
+    <param name="submap_traj_aux_gate_consistency_rot_deg" value="$(arg submap_traj_aux_gate_consistency_rot_deg)"/>
 
     <param name="min_points"       value="$(arg min_points)"/>
   </node>
@@ -243,7 +253,7 @@
     <param name="gt_noise_sigma_t" value="$(arg gt_noise_sigma_t)"/>
     <param name="gt_noise_sigma_r" value="$(arg gt_noise_sigma_r)"/>
     <param name="gt_noise_seed" value="$(arg gt_noise_seed)"/>
-    <param name="pose_topic" value="$(arg noisy_gt_topic)"/>
+    <param name="pose_topic" value="$(arg odometry_input)"/>
     <param name="path_topic" value="/gmmslam_node/noisy_gt_path"/>
   </node>
 

@@ -77,6 +77,13 @@ public:
     std::set<std::pair<int,int>> loop_edges_added;
     std::atomic<int> loop_viz_uid_{0};
 
+    /// Odom indices whose SOGMM fit has started (worker popped job) but
+    /// `finishFit` has not yet committed `gmm_paths_by_idx`. Used to avoid
+    /// sequential D2D across temporal "holes" when parallel workers finish
+    /// out of order (otherwise prev can jump far back and the BetweenFactor
+    /// fights the GT chain).
+    std::set<int> awaiting_fits_;
+
     // Backpressure counters
     std::atomic<int> dropped_fit_frames{0};
     std::atomic<int> dropped_result_msgs{0};

@@ -22,11 +22,17 @@
 #include <atomic>
 #include <cmath>
 #include <deque>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <stdexcept>
 #include <thread>
 #include <vector>
+
+#include <unistd.h>
 
 namespace gmmslam {
 
@@ -53,6 +59,8 @@ private:
     void logBackpressure(const ros::Time& stamp);
     std::optional<Matrix4d> currentGtPoseOdomFrame(const ros::Time& stamp) const;
     void maybeReanchorSmootherFromGt(const ros::Time& stamp, double t_cloud);
+    std::optional<Matrix4d> loadRestartPose() const;
+    void saveRestartPose(const Matrix4d& pose, double t_sec, int key_idx);
 
     Config cfg_;
 
@@ -79,6 +87,8 @@ private:
     double last_backpressure_log_t_ = 0.0;
     double last_cloud_t_sec_processed_ = -1.0;
     bool has_last_keyframe_ = false;
+    std::optional<Matrix4d> restart_pose_;
+    double last_restart_state_write_t_ = -1.0;
 
     geometry_msgs::PoseStamped::ConstPtr latest_gt_pose_raw_;
     std::optional<Matrix4d> gt_origin_inv_;
@@ -128,8 +138,13 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param<std::string>("sensor_frame", cfg_.ros.sensor_frame, "depth_camera_1");
         pnh.param<std::string>("odom_frame",   cfg_.ros.odom_frame,   "world");
         pnh.param<std::string>("base_frame",   cfg_.ros.base_frame,   "m500_1_base_link");
-        pnh.param<std::string>("noisy_gt_topic", cfg_.ros.noisy_gt_topic,
-                               "/gmmslam_node/noisy_gt_pose");
+        if (!pnh.getParam("odometry_input", cfg_.ros.odometry_input)) {
+            if (!pnh.getParam("noisy_gt_topic", cfg_.ros.odometry_input)) {
+                cfg_.ros.odometry_input = "/gmmslam_node/noisy_gt_pose";
+            }
+        }
+        pnh.param<std::string>("restart_state_path", cfg_.ros.restart_state_path,
+                               cfg_.ros.restart_state_path);
         pnh.param<std::string>("registration_request_topic",
                                cfg_.ros.registration_request_topic,
                                "/gmmslam_node/registration/request");
@@ -140,6 +155,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("min_range",       cfg_.preprocess.min_range,       0.1);
         pnh.param("max_range",       cfg_.preprocess.max_range,       10.0);
         pnh.param("voxel_leaf_size", cfg_.preprocess.voxel_leaf_size, 0.05);
+        pnh.param("target_points",   cfg_.preprocess.target_points,   0);
         pnh.param("min_points",      cfg_.preprocess.min_points,      50);
 
         pnh.param("sogmm_bandwidth",     cfg_.sogmm.bandwidth,     0.02);
@@ -258,12 +274,26 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
                   cfg_.global_graph.aux_gate_consistency_trans_m, 2.0);
         pnh.param("submap_aux_gate_consistency_rot_deg",
                   cfg_.global_graph.aux_gate_consistency_rot_deg, 35.0);
+        pnh.param("submap_traj_aux_gate_abs_trans_m",
+                  cfg_.global_graph.traj_aux_gate_abs_trans_m, 6.0);
+        pnh.param("submap_traj_aux_gate_abs_rot_deg",
+                  cfg_.global_graph.traj_aux_gate_abs_rot_deg, 55.0);
+        pnh.param("submap_traj_aux_gate_consistency_trans_m",
+                  cfg_.global_graph.traj_aux_gate_consistency_trans_m, 2.0);
+        pnh.param("submap_traj_aux_gate_consistency_rot_deg",
+                  cfg_.global_graph.traj_aux_gate_consistency_rot_deg, 40.0);
         pnh.param("submap_loop_sigma_t_min", cfg_.global_graph.submap_loop_sigma_t_min, 0.05);
         pnh.param("submap_loop_sigma_t_max", cfg_.global_graph.submap_loop_sigma_t_max, 0.50);
         pnh.param("submap_loop_sigma_r_min", cfg_.global_graph.submap_loop_sigma_r_min, 0.03);
         pnh.param("submap_loop_sigma_r_max", cfg_.global_graph.submap_loop_sigma_r_max, 0.30);
         pnh.param("submap_reanchor_smoother_on_traj_gate_fail",
                   cfg_.global_graph.reanchor_smoother_on_traj_gate_fail, true);
+        pnh.param("submap_finalize_min_ready_keyframes",
+                  cfg_.global_graph.submap_finalize_min_ready_keyframes, 1);
+        pnh.param("submap_finalize_min_ready_fraction",
+                  cfg_.global_graph.submap_finalize_min_ready_fraction, 0.0);
+        pnh.param("submap_finalize_max_wait_s",
+                  cfg_.global_graph.submap_finalize_max_wait_s, 0.0);
 
         pnh.param("gt_init_wait_s",    cfg_.gt_noise.init_wait_s, 3.0);
         pnh.param("gt_noise_sigma_t",  cfg_.gt_noise.sigma_t, 0.03);
@@ -285,6 +315,8 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
 
         pnh.param("gmm_marker_sigma",            cfg_.visualization.gmm_marker_sigma, 3.0);
         pnh.param("global_gmm_publish_period_s",  cfg_.visualization.global_gmm_publish_period_s, 1.0);
+        pnh.param("map_cloud_publish_hz",        cfg_.visualization.map_cloud_publish_hz, 0.5);
+        pnh.param("map_cloud_max_chunks",        cfg_.visualization.map_cloud_max_chunks, 3000);
 
         pnh.param("map_prune_enable",            cfg_.map.prune_enable, cfg_.map.prune_enable);
         pnh.param("map_prune_bhatt_threshold",   cfg_.map.prune_bhatt_threshold, cfg_.map.prune_bhatt_threshold);
@@ -296,6 +328,19 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
 
         pnh.param<std::string>("gmm_dir", cfg_.gmm_dir, "/tmp/gmmslam_gmms");
     }
+
+    {
+        std::string oin;
+        if (pnh.getParam("odometry_input", oin)) {
+            cfg_.ros.odometry_input = oin;
+        } else if (pnh.getParam("noisy_gt_topic", oin)) {
+            cfg_.ros.odometry_input = oin;
+        }
+        pnh.param<std::string>("restart_state_path", cfg_.ros.restart_state_path,
+                               cfg_.ros.restart_state_path);
+    }
+
+    restart_pose_ = loadRestartPose();
 
     ROS_INFO("[gmmslam] lidar_topic   : %s", cfg_.ros.lidar_topic.c_str());
     ROS_INFO("[gmmslam] odom_frame    : %s", cfg_.ros.odom_frame.c_str());
@@ -323,6 +368,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
     const auto gg_path_pub      = pnh.advertise<nav_msgs::Path>("global_graph_path", 1);
     const auto odom_pub         = pnh.advertise<nav_msgs::Odometry>("odom", 1);
     const auto latest_frame_pub = pnh.advertise<sensor_msgs::PointCloud2>("latest_frame_cloud", 1);
+    const auto map_cloud_pub    = pnh.advertise<sensor_msgs::PointCloud2>("map_cloud", 1, true);
     gt_path_pub_                = pnh.advertise<nav_msgs::Path>("gt_path", 1);
     gt_pose_pub_                = pnh.advertise<geometry_msgs::PoseStamped>("gt_pose", 1);
     const auto gmm_markers_pub  = pnh.advertise<visualization_msgs::MarkerArray>("gmm_markers", 1);
@@ -391,6 +437,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
     vis_pubs.path              = path_pub;
     vis_pubs.odom              = odom_pub;
     vis_pubs.latest_frame_cloud = latest_frame_pub;
+    vis_pubs.map_cloud          = map_cloud_pub;
     vis_pubs.gmm_markers       = gmm_markers_pub;
     vis_pubs.gmm_global_markers = gmm_global_pub;
     vis_pubs.global_graph_markers = gg_markers_pub;
@@ -415,7 +462,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         &GMMSLAMNode::gtCallback, this);
 
     noisy_gt_sub_ = nh.subscribe(
-        cfg_.ros.noisy_gt_topic, 1,
+        cfg_.ros.odometry_input, 1,
         &GMMSLAMNode::noisyGtCallback, this);
 
     if (!cfg_.ros.imu_topic.empty()) {
@@ -655,6 +702,100 @@ std::optional<Matrix4d> GMMSLAMNode::currentGtPoseOdomFrame(
 // maybeReanchorSmootherFromGt
 // =====================================================================
 
+std::optional<Matrix4d> GMMSLAMNode::loadRestartPose() const {
+    if (cfg_.ros.restart_state_path.empty()) {
+        return std::nullopt;
+    }
+
+    std::ifstream in(cfg_.ros.restart_state_path);
+    if (!in.good()) {
+        return std::nullopt;
+    }
+
+    double t_sec = 0.0;
+    int key_idx = -1;
+    Matrix4d T = Matrix4d::Identity();
+    if (!(in >> t_sec >> key_idx)) {
+        ROS_WARN("[gmmslam] restart state %s is malformed; ignoring",
+                 cfg_.ros.restart_state_path.c_str());
+        return std::nullopt;
+    }
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            if (!(in >> T(r, c))) {
+                ROS_WARN("[gmmslam] restart state %s has incomplete pose; ignoring",
+                         cfg_.ros.restart_state_path.c_str());
+                return std::nullopt;
+            }
+        }
+    }
+    if (!T.allFinite()) {
+        ROS_WARN("[gmmslam] restart state %s has non-finite pose; ignoring",
+                 cfg_.ros.restart_state_path.c_str());
+        return std::nullopt;
+    }
+
+    const auto p = T.block<3,1>(0,3);
+    ROS_WARN("[gmmslam] loaded restart pose from %s (saved X(%d), t=%.3f): "
+             "pos=[%.3f, %.3f, %.3f]",
+             cfg_.ros.restart_state_path.c_str(), key_idx, t_sec,
+             p(0), p(1), p(2));
+    return T;
+}
+
+void GMMSLAMNode::saveRestartPose(const Matrix4d& T, double t_sec, int key_idx) {
+    if (cfg_.ros.restart_state_path.empty() || !T.allFinite()) {
+        return;
+    }
+    if (last_restart_state_write_t_ >= 0.0 &&
+        (t_sec - last_restart_state_write_t_) < 0.10) {
+        return;
+    }
+    last_restart_state_write_t_ = t_sec;
+
+    try {
+        const std::filesystem::path path(cfg_.ros.restart_state_path);
+        const auto parent = path.parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent);
+        }
+        const std::filesystem::path tmp =
+            path.string() + ".tmp." + std::to_string(::getpid());
+
+        {
+            std::ofstream out(tmp);
+            out << std::setprecision(17) << t_sec << ' ' << key_idx;
+            for (int r = 0; r < 4; ++r) {
+                for (int c = 0; c < 4; ++c) {
+                    out << ' ' << T(r, c);
+                }
+            }
+            out << '\n';
+            out.flush();
+            if (!out.good()) {
+                throw std::runtime_error("write failed");
+            }
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(tmp, path, ec);
+        if (ec) {
+            std::filesystem::remove(path, ec);
+            ec.clear();
+            std::filesystem::rename(tmp, path, ec);
+        }
+        if (ec) {
+            ROS_WARN_THROTTLE(5.0,
+                "[gmmslam] failed to update restart state %s: %s",
+                cfg_.ros.restart_state_path.c_str(), ec.message().c_str());
+        }
+    } catch (const std::exception& e) {
+        ROS_WARN_THROTTLE(5.0,
+            "[gmmslam] failed to save restart state %s: %s",
+            cfg_.ros.restart_state_path.c_str(), e.what());
+    }
+}
+
 void GMMSLAMNode::maybeReanchorSmootherFromGt(const ros::Time& stamp,
                                               double t_cloud) {
     if (!cfg_.global_graph.reanchor_smoother_on_traj_gate_fail || !global_graph_ ||
@@ -716,7 +857,7 @@ std::optional<Matrix4d> GMMSLAMNode::sampleNoisyGtRelativePose(const ros::Time& 
         return std::nullopt;
     }
     ROS_WARN_THROTTLE(5.0,
-        "[gmmslam] noisy_gt_topic unavailable; falling back to internal GT noise");
+        "[gmmslam] odometry_input unavailable; falling back to internal GT noise");
 
     const Matrix4d T_gt = poseMsgToMatrix(latest_gt_pose_raw_->pose);
     const Matrix4d T_curr_gt = gt_origin_inv_.value() * T_gt;
@@ -764,45 +905,42 @@ GMMSLAMNode::imuMeasurementsBetween(double t_prev, double t_curr) const
         return samples;
     }
 
-    // Gather entries in a slightly wider window for boundary context
     struct Entry { double t; Vector3d acc; Vector3d gyro; };
-    std::vector<Entry> entries;
-    entries.reserve(imu_buffer_.size());
+
+    // Latest IMU sample at or before t_prev (scan full buffer). The old logic
+    // only looked in [t_prev-50ms, t_curr]; if every sample there has t > t_prev
+    // (low-rate IMU, sim timing, or short stride dt), seed was null → samples=0.
+    bool have_seed = false;
+    Entry seed{};
     for (const auto& e : imu_buffer_) {
         const double ts = stampToSec(e.stamp);
-        if (ts >= (t_prev - 0.05) && ts <= t_curr) {
-            entries.push_back({ts, e.acc, e.gyro});
+        if (ts <= t_prev) {
+            if (!have_seed || ts >= seed.t) {
+                seed = Entry{ts, e.acc, e.gyro};
+                have_seed = true;
+            }
         }
     }
-    if (entries.empty()) {
+    if (!have_seed) {
         return samples;
     }
-    std::sort(entries.begin(), entries.end(),
+
+    std::vector<Entry> after_prev;
+    after_prev.reserve(imu_buffer_.size());
+    for (const auto& e : imu_buffer_) {
+        const double ts = stampToSec(e.stamp);
+        if (ts > t_prev && ts <= t_curr) {
+            after_prev.push_back({ts, e.acc, e.gyro});
+        }
+    }
+    std::sort(after_prev.begin(), after_prev.end(),
               [](const Entry& a, const Entry& b) { return a.t < b.t; });
 
-    // Seed with the latest sample at/before t_prev
-    const Entry* seed = nullptr;
-    for (const auto& e : entries) {
-        if (e.t <= t_prev) {
-            seed = &e;
-        } else {
-            break;
-        }
-    }
-    if (!seed) {
-        return samples;
-    }
-
     double t_last = t_prev;
-    Vector3d acc_last = seed->acc;
-    Vector3d gyro_last = seed->gyro;
+    Vector3d acc_last = seed.acc;
+    Vector3d gyro_last = seed.gyro;
 
-    for (const auto& e : entries) {
-        if (e.t <= t_prev) {
-            acc_last = e.acc;
-            gyro_last = e.gyro;
-            continue;
-        }
+    for (const auto& e : after_prev) {
         const double dt = e.t - t_last;
         if (dt > 1e-6) {
             samples.emplace_back(dt, acc_last, gyro_last);
@@ -922,7 +1060,8 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         }
         pts = preprocess(pts, cfg_.preprocess.min_range,
                          cfg_.preprocess.max_range,
-                         cfg_.preprocess.voxel_leaf_size);
+                         cfg_.preprocess.voxel_leaf_size,
+                         cfg_.preprocess.target_points);
         if (pts.rows() < cfg_.preprocess.min_points) {
             ROS_WARN_THROTTLE(5.0,
                 "[gmmslam] only %d points after filtering, skipping",
@@ -942,7 +1081,9 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         Matrix4d predicted;
         {
             std::lock_guard<std::mutex> lk(smoother_->graph_lock);
-            if (gt_rel_opt.has_value()) {
+            if (!smoother_->initialized() && restart_pose_.has_value()) {
+                predicted = restart_pose_.value();
+            } else if (gt_rel_opt.has_value()) {
                 predicted = smoother_->pose * gt_rel_opt.value();
             } else {
                 predicted = smoother_->pose;
@@ -964,6 +1105,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
             (smoother_frame_counter_ % cfg_.smoother.smoother_stride) == 0;
 
         Matrix4d T_pub;
+        int smoother_pose_key = -1;
         if (is_smoother_frame) {
             std::vector<std::tuple<double, Vector3d, Vector3d>> imu_measurements;
             if (has_last_smoother_stamp_) {
@@ -976,6 +1118,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
             }
 
             const int curr_odom = odom_idx_;
+            smoother_pose_key = curr_odom;
             const int prev_odom = curr_odom - 1;
 
             const Matrix4d* gt_rel_ptr = accumulated_gt_rel_.has_value()
@@ -1009,6 +1152,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
                 T_curr = (it != smoother_->pose_by_idx.end())
                          ? it->second : current_pose;
             }
+            saveRestartPose(T_curr, stampToSec(stamp), curr_odom);
 
             // 7. Keyframe check (global graph + registration only)
             if (shouldAddKeyframe(stamp, current_pose)) {
@@ -1074,7 +1218,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
 
         // 8. Publish
         visualizer_->publishPoseOnly(T_pub, stamp);
-        visualizer_->enqueueFrame(stamp, pts, frame_count_, T_pub);
+        visualizer_->enqueueFrame(stamp, pts, frame_count_, T_pub, smoother_pose_key);
 
         logBackpressure(stamp);
         ++frame_count_;

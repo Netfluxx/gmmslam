@@ -67,6 +67,7 @@ class GMMSLAMNode:
         self.min_range = rospy.get_param("~min_range", 0.1)
         self.max_range = rospy.get_param("~max_range", 10.0)
         self.voxel_size = rospy.get_param("~voxel_leaf_size", 0.05)
+        self.target_points = int(rospy.get_param("~target_points", 0))
         self.min_points = rospy.get_param("~min_points", 50)
         self.global_map_publish_period_s = max(
             0.1, float(rospy.get_param("~global_map_publish_period_s", 1.0))
@@ -160,6 +161,18 @@ class GMMSLAMNode:
         )
         self.submap_aux_gate_consistency_rot_deg = float(
             rospy.get_param("~submap_aux_gate_consistency_rot_deg", 35.0)
+        )
+        self.submap_traj_aux_gate_abs_trans_m = float(
+            rospy.get_param("~submap_traj_aux_gate_abs_trans_m", 6.0)
+        )
+        self.submap_traj_aux_gate_abs_rot_deg = float(
+            rospy.get_param("~submap_traj_aux_gate_abs_rot_deg", 55.0)
+        )
+        self.submap_traj_aux_gate_consistency_trans_m = float(
+            rospy.get_param("~submap_traj_aux_gate_consistency_trans_m", 2.0)
+        )
+        self.submap_traj_aux_gate_consistency_rot_deg = float(
+            rospy.get_param("~submap_traj_aux_gate_consistency_rot_deg", 40.0)
         )
 
         # Registration / loop closure
@@ -326,8 +339,8 @@ class GMMSLAMNode:
             rospy.get_param("~gt_factor_sigma_r", _default_gt_factor_sigma_r)
         )
         self.gt_noise_seed = rospy.get_param("~gt_noise_seed", -1)
-        self.noisy_gt_topic = rospy.get_param(
-            "~noisy_gt_topic", "/gmmslam_node/noisy_gt_pose"
+        self.odometry_input = _pa(
+            "~odometry_input", "~noisy_gt_topic", "/gmmslam_node/noisy_gt_pose"
         )
         self.map_decimate = 5
 
@@ -463,6 +476,10 @@ class GMMSLAMNode:
             submap_aux_gate_abs_rot_deg=self.submap_aux_gate_abs_rot_deg,
             submap_aux_gate_consistency_trans_m=self.submap_aux_gate_consistency_trans_m,
             submap_aux_gate_consistency_rot_deg=self.submap_aux_gate_consistency_rot_deg,
+            submap_traj_aux_gate_abs_trans_m=self.submap_traj_aux_gate_abs_trans_m,
+            submap_traj_aux_gate_abs_rot_deg=self.submap_traj_aux_gate_abs_rot_deg,
+            submap_traj_aux_gate_consistency_trans_m=self.submap_traj_aux_gate_consistency_trans_m,
+            submap_traj_aux_gate_consistency_rot_deg=self.submap_traj_aux_gate_consistency_rot_deg,
             score_sigma_low=self.score_sigma_low,
             score_sigma_high=self.score_sigma_high,
             loop_sigma_t_min=self.loop_sigma_t_min,
@@ -553,7 +570,7 @@ class GMMSLAMNode:
             queue_size=50,
         )
         rospy.Subscriber(
-            self.noisy_gt_topic,
+            self.odometry_input,
             PoseStamped,
             self._noisy_gt_input_callback,
             queue_size=1,
@@ -804,7 +821,13 @@ class GMMSLAMNode:
                 5.0, "[gmmslam] received empty point cloud, skipping"
             )
             return
-        pts = preprocess(pts, self.min_range, self.max_range, self.voxel_size)
+        pts = preprocess(
+            pts,
+            self.min_range,
+            self.max_range,
+            self.voxel_size,
+            self.target_points,
+        )
         if pts.shape[0] < self.min_points:
             rospy.logwarn_throttle(
                 5.0,
@@ -977,7 +1000,7 @@ class GMMSLAMNode:
             return None
         rospy.logwarn_throttle(
             5.0,
-            "[gmmslam] noisy_gt_topic unavailable; falling back to internal GT noise",
+            "[gmmslam] odometry_input unavailable; falling back to internal GT noise",
         )
         T_curr_gt = pose_msg_to_matrix(self._latest_gt_pose.pose)
         if self._last_gt_T_for_factor is None:

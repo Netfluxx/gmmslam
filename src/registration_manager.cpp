@@ -220,12 +220,18 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
         }
 
         FitJob& job = *maybe_job;
+        const int fid = job.frame_idx;
+        {
+            std::lock_guard<std::mutex> lk(lock);
+            awaiting_fits_.insert(fid);
+        }
         const std::size_t qsize_after_pop = fit_queue_.size();
         ROS_INFO("[registration][DBG] fit START X(%d) pts=%ld "
                  "queue_depth_after_pop=%zu",
-                 job.frame_idx, static_cast<long>(job.points.rows()),
+                 fid, static_cast<long>(job.points.rows()),
                  qsize_after_pop);
         const auto t0 = std::chrono::steady_clock::now();
+        bool finish_ok = false;
         try {
             GmmModel model = fitSogmm(job.points, sogmm_cfg_);
             const auto t1 = std::chrono::steady_clock::now();
@@ -233,16 +239,17 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
             ROS_INFO("[registration][DBG] fit DONE  X(%d) pts=%ld K=%d "
                      "elapsed_ms=%.1f",
-                     job.frame_idx, static_cast<long>(job.points.rows()),
+                     fid, static_cast<long>(job.points.rows()),
                      model.numComponents(), dt_ms);
             if (model.numComponents() > 0) {
                 finishFit(model, job.frame_idx, job.stamp,
                           job.capture_t_sec, job.capture_pose);
+                finish_ok = true;
             } else {
                 ROS_WARN(
                     "[registration][DBG] SOGMM fit returned EMPTY model "
                     "for frame %d pts=%ld elapsed_ms=%.1f",
-                    job.frame_idx, static_cast<long>(job.points.rows()),
+                    fid, static_cast<long>(job.points.rows()),
                     dt_ms);
             }
         } catch (const std::exception& e) {
@@ -252,8 +259,12 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
             ROS_ERROR(
                 "[registration][DBG] fit THROW X(%d) pts=%ld elapsed_ms=%.1f "
                 "what=%s",
-                job.frame_idx, static_cast<long>(job.points.rows()), dt_ms,
+                fid, static_cast<long>(job.points.rows()), dt_ms,
                 e.what());
+        }
+        if (!finish_ok) {
+            std::lock_guard<std::mutex> lk(lock);
+            awaiting_fits_.erase(fid);
         }
     }
     ROS_WARN("[registration][DBG] fitWorkerLoop EXITING (shutdown)");
@@ -306,6 +317,10 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
         saveGmmToFile(model, gmm_path);
     } catch (const std::exception& e) {
         ROS_ERROR("[registration] failed to save GMM: %s", e.what());
+        {
+            std::lock_guard<std::mutex> lk(lock);
+            awaiting_fits_.erase(frame_idx);
+        }
         return;
     }
 
@@ -329,8 +344,11 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
     // Update entry with map pose and fit time
     int prev_idx = -1;
     std::string prev_path;
+    bool skip_sequential_d2d = false;
     {
         std::lock_guard<std::mutex> lk(lock);
+        awaiting_fits_.erase(frame_idx);
+
         gmm_paths_by_idx[frame_idx] = gmm_path;
 
         auto entry_it = local_gmms_by_idx.find(frame_idx);
@@ -341,28 +359,80 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
             entry_it->second.capture_pose = effective_capture_pose;
         }
 
-        // Find the immediately preceding GMM
+        // Find the immediately preceding GMM in completion order (map keys).
         auto curr_it = gmm_paths_by_idx.find(frame_idx);
         if (curr_it != gmm_paths_by_idx.begin()) {
             --curr_it;
             prev_idx = curr_it->first;
             prev_path = curr_it->second;
         }
+
+        // Parallel SOGMM workers can finish out of order: `prev_idx` may jump
+        // backward over indices whose fits are still running. Sequential D2D
+        // would then add a long-hop BetweenFactor that disagrees with the GT
+        // chain. Skip until the gap has no in-flight fits.
+        if (prev_idx >= 0) {
+            for (int k = prev_idx + 1; k < frame_idx; ++k) {
+                if (awaiting_fits_.count(k) > 0) {
+                    skip_sequential_d2d = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (skip_sequential_d2d && prev_idx >= 0) {
+        ROS_WARN_THROTTLE(
+            2.0,
+            "[registration] skip sequential D2D X(%d)->X(%d): "
+            "intermediate odom indices still fitting (async ordering)",
+            prev_idx, frame_idx);
     }
 
     // Publish sequential D2D request
     if (prev_idx >= 0 && !prev_path.empty()) {
-        nlohmann::json payload;
-        payload["prev_idx"]         = prev_idx;
-        payload["curr_idx"]         = frame_idx;
-        payload["stamp"]            = stamp.toSec();
-        payload["source_path"]      = gmm_path;
-        payload["target_path"]      = prev_path;
-        payload["is_loop_closure"]  = false;
+        if (!skip_sequential_d2d) {
+            const int odom_gap = frame_idx - prev_idx;
+            if (odom_gap > 25) {
+                ROS_WARN_THROTTLE(
+                    5.0,
+                    "[registration] sequential D2D long hop X(%d)->X(%d) "
+                    "(odom_gap=%d): async backlog or sparse `request_every_n_frames`; "
+                    "attaching smoother relative pose as D2D init",
+                    prev_idx, frame_idx, odom_gap);
+            }
 
-        std_msgs::String msg;
-        msg.data = payload.dump();
-        reg_pub_.publish(msg);
+            nlohmann::json payload;
+            payload["prev_idx"]         = prev_idx;
+            payload["curr_idx"]         = frame_idx;
+            payload["stamp"]            = stamp.toSec();
+            payload["source_path"]      = gmm_path;
+            payload["target_path"]      = prev_path;
+            payload["is_loop_closure"]  = false;
+
+            // GMMs are in per-frame sensor coordinates; D2D matches source(curr)
+            // into target(prev). inv(T_prev)*T_curr is the same convention as the
+            // BetweenFactor relative staged from the D2D result (see stageRegistrationFactor).
+            {
+                std::lock_guard<std::mutex> lk(smoother_.graph_lock);
+                auto itp = smoother_.pose_by_idx.find(prev_idx);
+                auto itc = smoother_.pose_by_idx.find(frame_idx);
+                if (itp != smoother_.pose_by_idx.end() &&
+                    itc != smoother_.pose_by_idx.end()) {
+                    const Matrix4d T_init = itp->second.inverse() * itc->second;
+                    Eigen::Matrix<double, 4, 4, Eigen::RowMajor> T_row(T_init);
+                    std::vector<double> flat(16);
+                    for (int k = 0; k < 16; ++k) {
+                        flat[static_cast<std::size_t>(k)] = T_row.data()[k];
+                    }
+                    payload["initial_transform"] = std::move(flat);
+                }
+            }
+
+            std_msgs::String msg;
+            msg.data = payload.dump();
+            reg_pub_.publish(msg);
+        }
 
         enqueueLoopClosureRequests(frame_idx, stamp, gmm_path, prev_idx);
     }
@@ -712,13 +782,27 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
     ROS_INFO("[registration] submap result S(%d)<->S(%d) success=%s score=%.4f",
              sid_prev, sid_curr, success ? "true" : "false", score);
 
-    if (!success) return;
-    if (global_graph_ == nullptr) return;
+    const ros::Time stamp_msg = ros::Time(result_stamp_sec);
+    if (global_graph_ != nullptr) {
+        global_graph_->acknowledgeSubmapOverlapAttempt(sid_prev, sid_curr, stamp_msg);
+    }
+
+    if (!success) {
+        if (global_graph_ != nullptr) {
+            const int sid_new = std::max(sid_prev, sid_curr);
+            global_graph_->maybeApplyDeferredInternalSubmapPrune(sid_new, stamp_msg);
+        }
+        return;
+    }
 
     auto t_it = data.find("transform");
     if (t_it == data.end() || !t_it->is_array() || t_it->size() != 16) {
         ROS_WARN("[registration] submap result S(%d)<->S(%d) missing/invalid transform",
                  sid_prev, sid_curr);
+        if (global_graph_ != nullptr) {
+            const int sid_new = std::max(sid_prev, sid_curr);
+            global_graph_->maybeApplyDeferredInternalSubmapPrune(sid_new, stamp_msg);
+        }
         return;
     }
     Matrix4d T;
@@ -734,11 +818,16 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
     if (!T.allFinite()) {
         ROS_WARN("[registration] submap result S(%d)<->S(%d) has NaN/Inf transform, "
                  "discarding", sid_prev, sid_curr);
+        if (global_graph_ != nullptr) {
+            const int sid_new = std::max(sid_prev, sid_curr);
+            global_graph_->maybeApplyDeferredInternalSubmapPrune(sid_new, stamp_msg);
+        }
         return;
     }
 
-    const ros::Time stamp_msg = ros::Time(result_stamp_sec);
-    global_graph_->handleSubmapRegistrationResult(sid_prev, sid_curr, T, score, stamp_msg);
+    if (global_graph_ != nullptr) {
+        global_graph_->handleSubmapRegistrationResult(sid_prev, sid_curr, T, score, stamp_msg);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -785,18 +874,42 @@ void RegistrationManager::stageRegistrationFactor(
     bool is_loop_candidate, const ros::Time& stamp,
     bool has_solid_cos_sim, double solid_cos_sim, bool solid_rescue)
 {
-    if (prev_idx < 0 || curr_idx > smoother_.latest_key_idx) return;
+    int latest_key_snapshot = 0;
+    double t_curr_snapshot = 0.0;
+    double t_latest_snapshot = 0.0;
+    bool have_prev_t = false;
+    double t_prev_snapshot = 0.0;
+    bool prev_in_window = false;
+    {
+        std::lock_guard<std::mutex> gk(smoother_.graph_lock);
+        latest_key_snapshot = smoother_.latest_key_idx;
+        if (prev_idx < 0 || curr_idx > latest_key_snapshot) {
+            return;
+        }
+        const auto t_curr_it = smoother_.key_t_sec.find(curr_idx);
+        if (t_curr_it == smoother_.key_t_sec.end()) {
+            return;
+        }
+        t_curr_snapshot = t_curr_it->second;
+        const auto lit = smoother_.key_t_sec.find(latest_key_snapshot);
+        t_latest_snapshot =
+            (lit != smoother_.key_t_sec.end()) ? lit->second : 0.0;
 
-    auto t_curr_it = smoother_.key_t_sec.find(curr_idx);
-    if (t_curr_it == smoother_.key_t_sec.end()) return;
-    const double t_curr = t_curr_it->second;
+        const auto t_prev_it = smoother_.key_t_sec.find(prev_idx);
+        if (t_prev_it != smoother_.key_t_sec.end()) {
+            have_prev_t = true;
+            t_prev_snapshot = t_prev_it->second;
+        }
+        if (have_prev_t) {
+            prev_in_window =
+                (t_latest_snapshot - t_prev_snapshot) <=
+                smoother_.fixed_lag_s * 1.1;
+        }
+    }
 
-    const double t_latest = [&]() {
-        auto it = smoother_.key_t_sec.find(smoother_.latest_key_idx);
-        return (it != smoother_.key_t_sec.end()) ? it->second : 0.0;
-    }();
-
-    if ((t_latest - t_curr) > smoother_.fixed_lag_s * 1.1) return;
+    if ((t_latest_snapshot - t_curr_snapshot) > smoother_.fixed_lag_s * 1.1) {
+        return;
+    }
 
     const auto edge = std::make_pair(std::min(prev_idx, curr_idx),
                                      std::max(prev_idx, curr_idx));
@@ -812,8 +925,6 @@ void RegistrationManager::stageRegistrationFactor(
 
         const gtsam::Pose3 rel_pose =
             FixedLagBackend::pose3FromMatrix(T_prev_to_curr);
-
-        const bool prev_in_window = smoother_.isInLagWindow(prev_idx);
 
         if (prev_in_window) {
             // Both keys alive in the smoother → relative BetweenFactor
@@ -870,9 +981,12 @@ void RegistrationManager::stageRegistrationFactor(
         }
     } else {
         // Sequential → BetweenFactor
-        auto t_prev_it = smoother_.key_t_sec.find(prev_idx);
-        if (t_prev_it == smoother_.key_t_sec.end()) return;
-        if ((t_latest - t_prev_it->second) > smoother_.fixed_lag_s * 1.1) return;
+        if (!have_prev_t) {
+            return;
+        }
+        if ((t_latest_snapshot - t_prev_snapshot) > smoother_.fixed_lag_s * 1.1) {
+            return;
+        }
 
         const gtsam::Pose3 rel_pose =
             FixedLagBackend::pose3FromMatrix(T_prev_to_curr);

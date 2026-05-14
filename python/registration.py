@@ -144,6 +144,8 @@ class RegistrationManager:
         self.latest_gmm_model = None
         self._pending_loop_requests: set = set()
         self.loop_edges_added: set = set()
+        # Odom indices with SOGMM fit in flight (parallel pool / workers).
+        self._awaiting_fits: set = set()
         self._last_loop_search_idx = -1000000
         self._dropped_fit_frames = 0
         self._dropped_result_msgs = 0
@@ -270,6 +272,8 @@ class RegistrationManager:
             save_gmm_to_file(local_model, gmm_path)
         except Exception as e:
             rospy.logerr(f"[registration] failed to save GMM: {e}")
+            with self.lock:
+                self._awaiting_fits.discard(frame_idx)
             return
 
         fit_t_sec = stamp_to_sec(rospy.Time.now())
@@ -288,6 +292,7 @@ class RegistrationManager:
                 map_pose = capture_pose.copy()
 
         with self.lock:
+            self._awaiting_fits.discard(frame_idx)
             self.gmm_paths_by_idx[frame_idx] = gmm_path
             if frame_idx in self.local_gmms_by_idx:
                 entry = self.local_gmms_by_idx[frame_idx]
@@ -306,17 +311,46 @@ class RegistrationManager:
             prev_path = (
                 self.gmm_paths_by_idx.get(prev_idx) if prev_idx is not None else None
             )
+            skip_sequential = False
+            if prev_idx is not None:
+                for k in range(prev_idx + 1, frame_idx):
+                    if k in self._awaiting_fits:
+                        skip_sequential = True
+                        break
+
+        if skip_sequential and prev_idx is not None:
+            rospy.logwarn_throttle(
+                2.0,
+                f"[registration] skip sequential D2D X({prev_idx})->X({frame_idx}): "
+                "intermediate odom indices still fitting (async ordering)",
+            )
 
         if prev_path is not None:
-            payload = {
-                "prev_idx": int(prev_idx),
-                "curr_idx": int(frame_idx),
-                "stamp": float(stamp_to_sec(stamp)),
-                "source_path": gmm_path,
-                "target_path": prev_path,
-                "is_loop_closure": False,
-            }
-            self._pub.publish(String(data=json.dumps(payload)))
+            if not skip_sequential:
+                odom_gap = frame_idx - prev_idx
+                if odom_gap > 25:
+                    rospy.logwarn_throttle(
+                        5.0,
+                        f"[registration] sequential D2D long hop X({prev_idx})->X({frame_idx}) "
+                        f"(odom_gap={odom_gap}): attaching smoother init",
+                    )
+                payload = {
+                    "prev_idx": int(prev_idx),
+                    "curr_idx": int(frame_idx),
+                    "stamp": float(stamp_to_sec(stamp)),
+                    "source_path": gmm_path,
+                    "target_path": prev_path,
+                    "is_loop_closure": False,
+                }
+                with self.smoother.graph_lock:
+                    Tp = self.smoother.pose_by_idx.get(prev_idx)
+                    Tc = self.smoother.pose_by_idx.get(frame_idx)
+                if Tp is not None and Tc is not None:
+                    T_init = np.linalg.inv(Tp) @ Tc
+                    payload["initial_transform"] = T_init.reshape(
+                        -1, order="C"
+                    ).tolist()
+                self._pub.publish(String(data=json.dumps(payload)))
 
             self._enqueue_loop_closure_requests(
                 frame_idx, stamp, gmm_path, sequential_prev_idx=prev_idx
@@ -388,6 +422,8 @@ class RegistrationManager:
                                 ),
                             ),
                         )
+                        with self.lock:
+                            self._awaiting_fits.add(frame_idx)
                         pending.append(
                             (
                                 ar,
@@ -406,6 +442,8 @@ class RegistrationManager:
                         )
                         self._fit_pool_ok = False
 
+                with self.lock:
+                    self._awaiting_fits.add(frame_idx)
                 model = self._fit_sogmm_sync(pcld_4d, frame_idx)
                 if model is not None:
                     try:
@@ -416,6 +454,11 @@ class RegistrationManager:
                         rospy.logerr_throttle(
                             2.0, f"[registration] finish_fit error: {e}"
                         )
+                        with self.lock:
+                            self._awaiting_fits.discard(frame_idx)
+                else:
+                    with self.lock:
+                        self._awaiting_fits.discard(frame_idx)
 
             # --- 2. Harvest completed async results ---
             now_mono = time.monotonic()
@@ -437,13 +480,19 @@ class RegistrationManager:
                                 f"[registration] subprocess fit returned None "
                                 f"for frame {fi}",
                             )
+                            with self.lock:
+                                self._awaiting_fits.discard(fi)
                     except Exception as e:
                         rospy.logwarn_throttle(
                             2.0,
                             f"[registration] subprocess fit error for "
                             f"frame {fi}: {e}",
                         )
+                        with self.lock:
+                            self._awaiting_fits.discard(fi)
                 elif (now_mono - submit_t) > self._fit_pool_timeout_s:
+                    with self.lock:
+                        self._awaiting_fits.discard(fi)
                     self._fit_pool_consecutive_timeouts += 1
                     rospy.logwarn(
                         f"[registration] subprocess fit timed out for "
@@ -456,6 +505,9 @@ class RegistrationManager:
                             "switching to in-thread fitting"
                         )
                         self._fit_pool_ok = False
+                        with self.lock:
+                            for _, pf, *_ in pending:
+                                self._awaiting_fits.discard(pf)
                         try:
                             self._fit_pool.terminate()
                         except Exception:

@@ -144,6 +144,7 @@ gtsam::NonlinearFactorGraph FixedLagBackend::filterStaleFactors(
         const gtsam::Values& new_vals,
         double t_latest) const {
 
+    std::lock_guard<std::mutex> lk(graph_lock);
     const double t_cutoff = t_latest - fixed_lag_s * 0.85;
     gtsam::NonlinearFactorGraph clean;
     int n_dropped = 0;
@@ -352,6 +353,7 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
     if (!initialize(predicted_pose, stamp)) return false;
 
     if (prev_idx < 0) {
+        std::lock_guard<std::mutex> lk(graph_lock);
         key_t_sec[curr_idx] = stampToSec(stamp);
         return true;
     }
@@ -359,7 +361,15 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
     const double t_sec = stampToSec(stamp);
     const gtsam::Key key_prev = X(prev_idx);
     const gtsam::Key key_curr = X(curr_idx);
-    const bool prev_exists = inserted_pose_keys_.count(prev_idx) > 0;
+    // Use pose_by_idx (updated synchronously at the end of each addFrame), not
+    // inserted_pose_keys_ (updated only after the async backend solve). Otherwise
+    // a fast lidar thread can add X(k+1) before the backend has marked X(k) as
+    // inserted → spurious "missing predecessor", weak IMU links, and GTSAM errors.
+    bool prev_exists = false;
+    {
+        std::lock_guard<std::mutex> lk(graph_lock);
+        prev_exists = pose_by_idx.count(prev_idx) > 0;
+    }
 
     // ---- Pose factor ----
     if (prev_exists && gt_rel_mat != nullptr) {
@@ -381,7 +391,10 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
 
     new_values_.insert(key_curr, pose3FromMatrix(predicted_pose));
     new_timestamps_[key_curr] = t_sec;
-    key_t_sec[curr_idx] = t_sec;
+
+    Vector3d vel_wb = Vector3d::Zero();
+    Eigen::Matrix<double,6,1> bias_vec_wb =
+        Eigen::Matrix<double,6,1>::Zero();
 
     // ---- Optional IMU preintegration ----
     if (enable_imu_) {
@@ -390,12 +403,12 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
         const gtsam::Key kb_prev = keyB(prev_idx);
         const gtsam::Key kb_curr = keyB(curr_idx);
 
-        Eigen::Matrix<double,6,1> prev_bias_vec = Eigen::Matrix<double,6,1>::Zero();
         {
+            std::lock_guard<std::mutex> lk(graph_lock);
             auto it = bias_by_idx.find(prev_idx);
-            if (it != bias_by_idx.end()) prev_bias_vec = it->second;
+            if (it != bias_by_idx.end()) bias_vec_wb = it->second;
         }
-        const ConstantBias prev_bias(prev_bias_vec.head<3>(), prev_bias_vec.tail<3>());
+        const ConstantBias prev_bias(bias_vec_wb.head<3>(), bias_vec_wb.tail<3>());
 
         auto preint = boost::make_shared<gtsam::PreintegratedCombinedMeasurements>(
             imu_preint_params_, prev_bias);
@@ -419,32 +432,30 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
 
         // Velocity initial guess
         const double t_prev = [&]{
+            std::lock_guard<std::mutex> lk(graph_lock);
             auto it = key_t_sec.find(prev_idx);
             return (it != key_t_sec.end()) ? it->second : (t_sec - 1e-3);
         }();
         const double dt_pose = std::max(1e-3, t_sec - t_prev);
 
-        Vector3d vel_guess = Vector3d::Zero();
         {
+            std::lock_guard<std::mutex> lk(graph_lock);
             auto it = pose_by_idx.find(prev_idx);
             if (it != pose_by_idx.end()) {
-                vel_guess = (predicted_pose.block<3,1>(0,3) - it->second.block<3,1>(0,3)) / dt_pose;
+                vel_wb = (predicted_pose.block<3,1>(0,3) - it->second.block<3,1>(0,3)) / dt_pose;
             } else {
                 auto vit = velocity_by_idx.find(prev_idx);
-                if (vit != velocity_by_idx.end()) vel_guess = vit->second;
+                if (vit != velocity_by_idx.end()) vel_wb = vit->second;
             }
         }
 
-        new_values_.insert(kv_curr, vel_guess);
+        new_values_.insert(kv_curr, vel_wb);
         new_values_.insert(kb_curr, prev_bias);
         new_timestamps_[kv_curr] = t_sec;
         new_timestamps_[kb_curr] = t_sec;
 
-        velocity_by_idx[curr_idx] = vel_guess;
-        bias_by_idx[curr_idx] = prev_bias_vec;
-
         if (!has_imu_link) {
-            new_factors_.addPrior(kv_curr, vel_guess, vel_prior_noise_);
+            new_factors_.addPrior(kv_curr, vel_wb, vel_prior_noise_);
             new_factors_.addPrior(kb_curr, prev_bias, bias_prior_noise_);
             ROS_WARN_THROTTLE(2.0,
                 "[smoother] weakly-anchored V/B at X(%d) (imu_link=%s, samples=%d)",
@@ -481,6 +492,11 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
         pose = predicted_pose;
         latest_key_idx = curr_idx;
         pose_by_idx[curr_idx] = predicted_pose;
+        key_t_sec[curr_idx] = t_sec;
+        if (enable_imu_) {
+            velocity_by_idx[curr_idx] = vel_wb;
+            bias_by_idx[curr_idx] = bias_vec_wb;
+        }
     }
     return true;
 }
@@ -493,7 +509,10 @@ bool FixedLagBackend::flushStagedFactors() {
     if (new_factors_.empty()) return false;
 
     SolveBatch batch;
-    batch.curr_idx  = latest_key_idx;
+    {
+        std::lock_guard<std::mutex> lk(graph_lock);
+        batch.curr_idx = latest_key_idx;
+    }
     batch.factors   = std::move(new_factors_);
     batch.values    = std::move(new_values_);
     batch.timestamps = std::move(new_timestamps_);
@@ -512,6 +531,7 @@ bool FixedLagBackend::flushStagedFactors() {
 }
 
 bool FixedLagBackend::isInLagWindow(int idx) const {
+    std::lock_guard<std::mutex> lk(graph_lock);
     auto it = key_t_sec.find(idx);
     if (it == key_t_sec.end()) return false;
     auto lit = key_t_sec.find(latest_key_idx);
@@ -569,18 +589,6 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
                         try {
                             pose_by_idx[k_idx] = matrixFromPose3(estimate.at<Pose3>(kx));
                         } catch (...) {}
-                        try {
-                            const auto cov = fixed_lag_->marginalCovariance(kx);
-                            if (cov.rows() >= 6 && cov.cols() >= 6 && cov.allFinite()) {
-                                pose_uncertainty_by_idx[k_idx] = cov.diagonal().sum();
-                            } else {
-                                pose_uncertainty_by_idx[k_idx] =
-                                    std::numeric_limits<double>::infinity();
-                            }
-                        } catch (...) {
-                            pose_uncertainty_by_idx[k_idx] =
-                                std::numeric_limits<double>::infinity();
-                        }
                     }
 
                     if (enable_imu_) {
@@ -606,7 +614,9 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
                 pose = new_pose;
                 latest_key_idx = curr_idx;
                 pose_by_idx[curr_idx] = new_pose;
-                if (!pose_uncertainty_by_idx.count(curr_idx)) {
+                // Marginal only for X(curr_idx): full-window marginals spammed
+                // GTSAM on ill-conditioned keys.
+                if (has_curr) {
                     try {
                         const auto cov = fixed_lag_->marginalCovariance(key_curr);
                         if (cov.rows() >= 6 && cov.cols() >= 6 && cov.allFinite()) {

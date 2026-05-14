@@ -405,7 +405,11 @@ class FixedLagBackend:
         t_sec = stamp_to_sec(stamp)
         key_prev = X(prev_idx)
         key_curr = X(curr_idx)
-        prev_exists_in_graph = prev_idx in self._inserted_pose_keys
+        # Match C++: use pose_by_idx (updated synchronously in add_frame), not
+        # _inserted_pose_keys (updated only after async solve) — avoids spurious
+        # "missing predecessor" when the lidar thread outruns the GTSAM thread.
+        with self.graph_lock:
+            prev_exists_in_graph = prev_idx in self.pose_by_idx
 
         if prev_exists_in_graph and gt_rel_mat is not None:
             # Accurate between-factor from odometry / GT measurement

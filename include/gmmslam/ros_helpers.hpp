@@ -41,7 +41,8 @@ Eigen::MatrixXf preprocess(
     const Eigen::MatrixXf& pts,
     double min_range,
     double max_range,
-    double voxel_size);
+    double voxel_size,
+    int target_points);
 
 Matrix4d poseMsgToMatrix(const geometry_msgs::Pose& pose_msg);
 

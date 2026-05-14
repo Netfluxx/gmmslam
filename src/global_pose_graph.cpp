@@ -18,6 +18,57 @@ using gtsam::symbol_shorthand::X;
 
 namespace gmmslam {
 
+namespace {
+
+void normalizeGmmWeights(GmmModel& m) {
+    double s = 0.0;
+    for (const auto& c : m.components) {
+        s += c.weight;
+    }
+    if (s <= 0.0) {
+        return;
+    }
+    for (auto& c : m.components) {
+        c.weight /= s;
+    }
+}
+
+/// Apply rigid transform T_src_to_dst (maps points from src frame to dst).
+GmmModel transformGmmRigid(const GmmModel& in, const Matrix4d& T_src_to_dst) {
+    const Matrix3d R = T_src_to_dst.block<3, 3>(0, 0);
+    const Vector3d t = T_src_to_dst.block<3, 1>(0, 3);
+    GmmModel out;
+    out.components.reserve(in.components.size());
+    for (const auto& comp : in.components) {
+        GmmComponent c;
+        c.mean = R * comp.mean + t;
+        Matrix3d cov = R * comp.covariance * R.transpose();
+        c.covariance = 0.5 * (cov + cov.transpose());
+        c.weight = comp.weight;
+        c.source_key_idx = comp.source_key_idx;
+        c.pose_uncertainty = comp.pose_uncertainty;
+        out.components.push_back(std::move(c));
+    }
+    normalizeGmmWeights(out);
+    return out;
+}
+
+GmmComponent transformComponentRigid(const GmmComponent& comp,
+                                     const Matrix4d& T_src_to_dst) {
+    const Matrix3d R = T_src_to_dst.block<3, 3>(0, 0);
+    const Vector3d t = T_src_to_dst.block<3, 1>(0, 3);
+    GmmComponent c;
+    c.mean = R * comp.mean + t;
+    Matrix3d cov = R * comp.covariance * R.transpose();
+    c.covariance = 0.5 * (cov + cov.transpose());
+    c.weight = comp.weight;
+    c.source_key_idx = comp.source_key_idx;
+    c.pose_uncertainty = comp.pose_uncertainty;
+    return c;
+}
+
+} // namespace
+
 // ---------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------
@@ -67,20 +118,30 @@ GlobalPoseGraph::NoiseResult GlobalPoseGraph::noiseFromScore(
 
 bool GlobalPoseGraph::passesAuxGate(const std::string& name,
                                      const Matrix4d& T_aux,
-                                     const Matrix4d* T_ref) const {
+                                     const Matrix4d* T_ref,
+                                     bool use_traj_aux_limits) const {
     if (!T_aux.allFinite()) return false;
+
+    const double abs_t = use_traj_aux_limits ? traj_aux_gate_abs_trans_m_
+                                             : aux_gate_abs_trans_m_;
+    const double abs_r = use_traj_aux_limits ? traj_aux_gate_abs_rot_deg_
+                                             : aux_gate_abs_rot_deg_;
+    const double con_t = use_traj_aux_limits ? traj_aux_gate_consistency_trans_m_
+                                             : aux_gate_consistency_trans_m_;
+    const double con_r = use_traj_aux_limits ? traj_aux_gate_consistency_rot_deg_
+                                             : aux_gate_consistency_rot_deg_;
 
     const double d_abs = T_aux.block<3,1>(0,3).norm();
     const double r_abs = rotAngleDeg(T_aux.block<3,3>(0,0));
 
-    if (d_abs > aux_gate_abs_trans_m_) {
+    if (d_abs > abs_t) {
         ROS_WARN("[global_graph] rejected %s submap factor (abs trans %.3fm > %.3fm)",
-                 name.c_str(), d_abs, aux_gate_abs_trans_m_);
+                 name.c_str(), d_abs, abs_t);
         return false;
     }
-    if (r_abs > aux_gate_abs_rot_deg_) {
+    if (r_abs > abs_r) {
         ROS_WARN("[global_graph] rejected %s submap factor (abs rot %.2fdeg > %.2fdeg)",
-                 name.c_str(), r_abs, aux_gate_abs_rot_deg_);
+                 name.c_str(), r_abs, abs_r);
         return false;
     }
 
@@ -89,16 +150,16 @@ bool GlobalPoseGraph::passesAuxGate(const std::string& name,
         const double d_err = T_err.block<3,1>(0,3).norm();
         const double r_err = rotAngleDeg(T_err.block<3,3>(0,0));
 
-        if (d_err > aux_gate_consistency_trans_m_) {
+        if (d_err > con_t) {
             ROS_WARN("[global_graph] rejected %s submap factor "
                      "(consistency trans %.3fm > %.3fm)",
-                     name.c_str(), d_err, aux_gate_consistency_trans_m_);
+                     name.c_str(), d_err, con_t);
             return false;
         }
-        if (r_err > aux_gate_consistency_rot_deg_) {
+        if (r_err > con_r) {
             ROS_WARN("[global_graph] rejected %s submap factor "
                      "(consistency rot %.2fdeg > %.2fdeg)",
-                     name.c_str(), r_err, aux_gate_consistency_rot_deg_);
+                     name.c_str(), r_err, con_r);
             return false;
         }
     }
@@ -143,7 +204,14 @@ GlobalPoseGraph::GlobalPoseGraph(
     , aux_gate_abs_rot_deg_(gg_cfg.aux_gate_abs_rot_deg)
     , aux_gate_consistency_trans_m_(gg_cfg.aux_gate_consistency_trans_m)
     , aux_gate_consistency_rot_deg_(gg_cfg.aux_gate_consistency_rot_deg)
+    , traj_aux_gate_abs_trans_m_(gg_cfg.traj_aux_gate_abs_trans_m)
+    , traj_aux_gate_abs_rot_deg_(gg_cfg.traj_aux_gate_abs_rot_deg)
+    , traj_aux_gate_consistency_trans_m_(gg_cfg.traj_aux_gate_consistency_trans_m)
+    , traj_aux_gate_consistency_rot_deg_(gg_cfg.traj_aux_gate_consistency_rot_deg)
     , reanchor_on_traj_fail_(gg_cfg.reanchor_smoother_on_traj_gate_fail)
+    , submap_finalize_min_ready_keyframes_(std::max(0, gg_cfg.submap_finalize_min_ready_keyframes))
+    , submap_finalize_min_ready_fraction_(gg_cfg.submap_finalize_min_ready_fraction)
+    , submap_finalize_max_wait_s_(std::max(0.0, gg_cfg.submap_finalize_max_wait_s))
     , get_pose_(std::move(get_pose_fn))
     , get_gmm_(std::move(get_gmm_fn))
     , get_pose_uncertainty_(std::move(get_pose_uncertainty_fn))
@@ -191,41 +259,43 @@ void GlobalPoseGraph::updateWithKeyframe(int key_idx, const ros::Time& stamp,
                                           const Matrix4d& T_curr, double t_sec) {
     if (!enable) return;
 
-    if (last_submap_idx_ >= 0) {
-        submap_keyframes[last_submap_idx_].push_back(key_idx);
-        key_to_submap[key_idx] = last_submap_idx_;
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        if (last_submap_idx_ >= 0) {
+            submap_keyframes[last_submap_idx_].push_back(key_idx);
+            key_to_submap[key_idx] = last_submap_idx_;
+        }
+        if (!shouldCreateSubmap(key_idx)) {
+            return;
+        }
     }
-
-    if (!shouldCreateSubmap(key_idx)) return;
 
     if (last_submap_idx_ >= 0) {
         enqueueSubmapFinalization(last_submap_idx_, stamp);
     }
 
+    std::lock_guard<std::recursive_mutex> lk(lock);
     const int sid = static_cast<int>(submap_ids.size());
     const auto key_sid = X(sid);
 
-    {
-        std::lock_guard<std::mutex> lk(lock);
-        new_values_.insert(key_sid, toPose3(T_curr));
+    new_values_.insert(key_sid, toPose3(T_curr));
 
-        if (sid == 0) {
-            new_factors_.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
-                key_sid, toPose3(T_curr), prior_noise_);
-        } else {
-            const Matrix4d rel = last_submap_pose_.inverse() * T_curr;
-            new_factors_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
-                X(last_submap_idx_), key_sid, toPose3(rel), between_noise_);
+    if (sid == 0) {
+        new_factors_.emplace_shared<gtsam::PriorFactor<gtsam::Pose3>>(
+            key_sid, toPose3(T_curr), prior_noise_);
+    } else {
+        const Matrix4d rel = last_submap_pose_.inverse() * T_curr;
+        new_factors_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
+            X(last_submap_idx_), key_sid, toPose3(rel), between_noise_);
 
-            addTransitionAuxFactors(
-                last_submap_idx_, sid, rel,
-                submap_anchor_key.count(last_submap_idx_)
-                    ? submap_anchor_key.at(last_submap_idx_) : -1,
-                key_idx,
-                submap_anchor_time_sec.count(last_submap_idx_)
-                    ? submap_anchor_time_sec.at(last_submap_idx_) : 0.0,
-                t_sec);
-        }
+        addTransitionAuxFactors(
+            last_submap_idx_, sid, rel,
+            submap_anchor_key.count(last_submap_idx_)
+                ? submap_anchor_key.at(last_submap_idx_) : -1,
+            key_idx,
+            submap_anchor_time_sec.count(last_submap_idx_)
+                ? submap_anchor_time_sec.at(last_submap_idx_) : 0.0,
+            t_sec);
     }
 
     submap_ids.push_back(sid);
@@ -265,11 +335,12 @@ void GlobalPoseGraph::addTransitionAuxFactors(
         if (!opt_T_traj.has_value()) return;
 
         const Matrix4d& T_traj = opt_T_traj.value();
-        const bool gate_ok = passesAuxGate("traj", T_traj, &T_ref_rel);
+        const bool gate_ok = passesAuxGate("traj", T_traj, &T_ref_rel, true);
         if (!gate_ok && reanchor_on_traj_fail_) {
             const double d_abs = T_traj.block<3,1>(0,3).norm();
             const double r_abs = rotAngleDeg(T_traj.block<3,3>(0,0));
-            if (d_abs > aux_gate_abs_trans_m_ || r_abs > aux_gate_abs_rot_deg_) {
+            if (d_abs > traj_aux_gate_abs_trans_m_ ||
+                r_abs > traj_aux_gate_abs_rot_deg_) {
                 smoother_reanchor_requested_.store(true, std::memory_order_relaxed);
             }
         }
@@ -296,47 +367,94 @@ void GlobalPoseGraph::addTransitionAuxFactors(
 
 void GlobalPoseGraph::enqueueSubmapFinalization(int sid, const ros::Time& stamp) {
     if (!enable || !get_gmm_) return;
-    if (submap_gmm.count(sid)) return;
-    const auto dup = std::find_if(
-        pending_submap_finalize_.begin(), pending_submap_finalize_.end(),
-        [sid](const std::pair<int, ros::Time>& p) { return p.first == sid; });
-    if (dup == pending_submap_finalize_.end()) {
-        pending_submap_finalize_.emplace_back(sid, stamp);
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        if (submap_gmm.count(sid)) return;
+        const auto dup = std::find_if(
+            pending_submap_finalize_.begin(), pending_submap_finalize_.end(),
+            [sid](const std::pair<int, ros::Time>& p) { return p.first == sid; });
+        if (dup == pending_submap_finalize_.end()) {
+            pending_submap_finalize_.emplace_back(sid, stamp);
+        }
     }
     processPendingSubmapFinalizations(stamp);
 }
 
 void GlobalPoseGraph::processPendingSubmapFinalizations(const ros::Time& stamp) {
     if (!enable || !get_gmm_) return;
-    for (auto it = pending_submap_finalize_.begin();
-         it != pending_submap_finalize_.end();) {
-        const int sid = it->first;
-        if (submap_gmm.count(sid)) {
-            it = pending_submap_finalize_.erase(it);
+
+    std::lock_guard<std::mutex> fk(finalize_serialization_mu_);
+
+    // Snapshot pending work under lock, then finalize without holding the graph
+    // mutex across get_gmm_/get_pose_ (those take registration / smoother locks).
+    // Holding graph+registration in opposite order to publishGmmMarkers causes
+    // deadlock or hard-to-debug failure under load.
+    std::vector<std::pair<int, ros::Time>> snapshot;
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        snapshot = pending_submap_finalize_;
+    }
+
+    for (const auto& entry : snapshot) {
+        const int sid = entry.first;
+        const ros::Time since = entry.second;
+
+        bool already_done = false;
+        {
+            std::lock_guard<std::recursive_mutex> lk(lock);
+            if (submap_gmm.count(sid)) {
+                already_done = true;
+            }
+        }
+        if (already_done) {
+            std::lock_guard<std::recursive_mutex> lk(lock);
+            pending_submap_finalize_.erase(
+                std::remove_if(
+                    pending_submap_finalize_.begin(),
+                    pending_submap_finalize_.end(),
+                    [sid](const std::pair<int, ros::Time>& p) {
+                        return p.first == sid;
+                    }),
+                pending_submap_finalize_.end());
             continue;
         }
-        if (tryFinalizeSubmap(sid, stamp)) {
-            it = pending_submap_finalize_.erase(it);
-        } else {
-            ++it;
+
+        if (tryFinalizeSubmap(sid, stamp, since)) {
+            std::lock_guard<std::recursive_mutex> lk(lock);
+            pending_submap_finalize_.erase(
+                std::remove_if(
+                    pending_submap_finalize_.begin(),
+                    pending_submap_finalize_.end(),
+                    [sid](const std::pair<int, ros::Time>& p) {
+                        return p.first == sid;
+                    }),
+                pending_submap_finalize_.end());
         }
     }
 }
 
-bool GlobalPoseGraph::tryFinalizeSubmap(int sid, const ros::Time& stamp) {
+bool GlobalPoseGraph::tryFinalizeSubmap(int sid, const ros::Time& stamp,
+                                        const ros::Time& pending_since) {
     if (!get_gmm_) return true;
 
-    if (submap_gmm.count(sid)) return true;
+    std::vector<int> key_indices;
+    Matrix4d T_ref = Matrix4d::Identity();
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        if (submap_gmm.count(sid)) return true;
+        const auto it_keys = submap_keyframes.find(sid);
+        if (it_keys == submap_keyframes.end() || it_keys->second.empty()) {
+            return true;
+        }
+        key_indices = it_keys->second;
 
-    const auto it_keys = submap_keyframes.find(sid);
-    if (it_keys == submap_keyframes.end() || it_keys->second.empty()) return true;
-    const auto& key_indices = it_keys->second;
-
-    const auto it_pose = submap_pose_by_idx.find(sid);
-    if (it_pose == submap_pose_by_idx.end()) return true;
-    const Matrix4d& T_ref = it_pose->second;
+        const auto it_pose = submap_pose_by_idx.find(sid);
+        if (it_pose == submap_pose_by_idx.end()) return true;
+        T_ref = it_pose->second;
+    }
 
     std::vector<PosedGmmInput> gmms_with_poses;
+    gmms_with_poses.reserve(key_indices.size());
     for (int ki : key_indices) {
         auto result = get_gmm_(ki);
         if (!result.has_value()) continue;
@@ -363,7 +481,10 @@ bool GlobalPoseGraph::tryFinalizeSubmap(int sid, const ros::Time& stamp) {
         gmms_with_poses.push_back(std::move(input));
     }
 
-    if (gmms_with_poses.empty()) {
+    const int n_keys = static_cast<int>(key_indices.size());
+    const int n_ready = static_cast<int>(gmms_with_poses.size());
+
+    if (n_ready == 0) {
         ROS_DEBUG_THROTTLE(
             5.0,
             "[global_graph] S(%d): submap finalize waiting for async GMM fits "
@@ -372,23 +493,43 @@ bool GlobalPoseGraph::tryFinalizeSubmap(int sid, const ros::Time& stamp) {
         return false;
     }
 
-    GmmModel raw     = mergeGmmsConcatenate(gmms_with_poses, T_ref);
-    GmmModel merged  = map_cfg_.prune_enable
-                         ? pruneSimilarComponents(raw, map_cfg_)
-                         : raw;
-    if (merged.components.empty()) return true;
+    int required = 1;
+    if (submap_finalize_min_ready_fraction_ > 0.0 &&
+        submap_finalize_min_ready_fraction_ <= 1.0 && n_keys > 0) {
+        required = std::max(
+            required,
+            static_cast<int>(std::ceil(submap_finalize_min_ready_fraction_ *
+                                        static_cast<double>(n_keys))));
+    }
+    required = std::max(required, submap_finalize_min_ready_keyframes_);
+    required = std::min(required, std::max(1, n_keys));
 
-    submap_gmm[sid] = merged;
-    submap_gmm_components[sid] = precomputeGmmLocalData(merged);
-    submap_frozen_pose_by_idx[sid] = T_ref;
+    const double wait_s = (stamp - pending_since).toSec();
+    const bool wait_timed_out = submap_finalize_max_wait_s_ > 0.0 &&
+                               wait_s >= submap_finalize_max_wait_s_;
 
-    ROS_INFO("[global_graph] S(%d) finalized: %d components (raw %d, "
-             "pruned %d, gate D_B<%.2f) from %zu/%zu keyframes",
-             sid, merged.numComponents(),
-             raw.numComponents(),
-             raw.numComponents() - merged.numComponents(),
-             map_cfg_.prune_bhatt_threshold,
-             gmms_with_poses.size(), key_indices.size());
+    if (n_ready < required) {
+        if (!wait_timed_out) {
+            ROS_DEBUG_THROTTLE(
+                5.0,
+                "[global_graph] S(%d): submap finalize waiting for GMM fits "
+                "(%d/%d keyframes ready, need %d, max_wait_s=%.2f, waited=%.2fs)",
+                sid, n_ready, n_keys, required,
+                submap_finalize_max_wait_s_, wait_s);
+            return false;
+        }
+        ROS_WARN("[global_graph] S(%d): submap finalize readiness timeout "
+                 "(%.2fs >= %.2fs); finalizing with %d/%d keyframe GMMs (required was %d)",
+                 sid, wait_s, submap_finalize_max_wait_s_, n_ready, n_keys, required);
+    }
+
+    GmmModel raw = mergeGmmsConcatenate(gmms_with_poses, T_ref);
+    // Keep full (unpruned) merged GMM for overlap D2D; internal prune runs after the
+    // overlap registration wave for this submap (see maybeApplyDeferredInternalSubmapPrune).
+    if (raw.components.empty()) return true;
+
+    const std::vector<GmmLocalData> components_cache =
+        precomputeGmmLocalData(raw);
 
     const std::string gmm_path =
         gmm_dir_ + "/submap_" + [&]{
@@ -398,15 +539,35 @@ bool GlobalPoseGraph::tryFinalizeSubmap(int sid, const ros::Time& stamp) {
         }() + ".gmm";
 
     try {
-        saveGmmToFile(merged, gmm_path);
-        submap_gmm_path[sid] = gmm_path;
+        saveGmmToFile(raw, gmm_path);
     } catch (const std::exception& e) {
         ROS_WARN("[global_graph] failed to save S(%d) GMM: %s",
                  sid, e.what());
         return true;
     }
 
-    requestOverlapRegistrations(sid, stamp);
+    const int raw_n = raw.numComponents();
+
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        if (submap_gmm.count(sid)) return true;
+        submap_gmm[sid] = std::move(raw);
+        submap_gmm_components[sid] = components_cache;
+        submap_frozen_pose_by_idx[sid] = T_ref;
+        submap_gmm_path[sid] = gmm_path;
+    }
+
+    ROS_INFO("[global_graph] S(%d) finalized: %d components (internal prune deferred "
+             "until after overlap D2D; D_B gate %.2f) from %zu/%zu keyframes",
+             sid, raw_n,
+             map_cfg_.prune_bhatt_threshold,
+             gmms_with_poses.size(), key_indices.size());
+
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        requestOverlapRegistrations(sid, stamp);
+        maybeApplyDeferredInternalSubmapPrune(sid, stamp);
+    }
     return true;
 }
 
@@ -426,6 +587,7 @@ void GlobalPoseGraph::requestOverlapRegistrations(int sid_new,
     const Vector3d pos_new = it_new->second.block<3,1>(0,3);
     const std::string& new_path = it_path_new->second;
 
+    int n_published = 0;
     for (int sid_old : submap_ids) {
         if (sid_old >= sid_new) continue;
         if (sid_old == sid_new - 1) continue;
@@ -457,8 +619,283 @@ void GlobalPoseGraph::requestOverlapRegistrations(int sid_new,
         reg_request_pub_.publish(msg);
 
         pending_submap_registrations_.insert(edge);
+        ++n_published;
         ROS_INFO("[global_graph] requested registration "
                  "S(%d)<->S(%d) (d=%.2fm)", sid_old, sid_new, d);
+    }
+
+    submap_overlap_d2d_remaining_[sid_new] = n_published;
+    if (n_published == 0 && map_cfg_.prune_enable) {
+        submap_needs_internal_prune_after_overlap_wave_.insert(sid_new);
+    }
+}
+
+void GlobalPoseGraph::acknowledgeSubmapOverlapAttempt(int sid_prev, int sid_curr,
+                                                      const ros::Time& /*stamp*/) {
+    if (!enable) return;
+
+    const auto edge = std::make_pair(std::min(sid_prev, sid_curr),
+                                     std::max(sid_prev, sid_curr));
+    const int sid_new = std::max(sid_prev, sid_curr);
+
+    std::lock_guard<std::recursive_mutex> lk(lock);
+    pending_submap_registrations_.erase(edge);
+
+    auto it = submap_overlap_d2d_remaining_.find(sid_new);
+    if (it == submap_overlap_d2d_remaining_.end()) {
+        return;
+    }
+    if (it->second > 0) {
+        --(it->second);
+    }
+    if (it->second <= 0) {
+        submap_overlap_d2d_remaining_.erase(it);
+        if (map_cfg_.prune_enable) {
+            submap_needs_internal_prune_after_overlap_wave_.insert(sid_new);
+        }
+    }
+}
+
+void GlobalPoseGraph::maybeApplyDeferredInternalSubmapPrune(int sid_new,
+                                                            const ros::Time& /*stamp*/) {
+    if (!enable) return;
+
+    GmmModel input;
+    std::string path;
+    int before_n = 0;
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        if (!map_cfg_.prune_enable) {
+            submap_needs_internal_prune_after_overlap_wave_.erase(sid_new);
+            return;
+        }
+
+        // Atomically claim the deferred prune marker. The previous implementation
+        // read this set before locking while result/finalize callbacks mutated it,
+        // which is undefined behavior and can segfault under heavy submap D2D load.
+        if (!submap_needs_internal_prune_after_overlap_wave_.erase(sid_new)) {
+            return;
+        }
+
+        auto git = submap_gmm.find(sid_new);
+        if (git == submap_gmm.end() || git->second.components.empty()) {
+            return;
+        }
+        input = git->second;
+        before_n = input.numComponents();
+
+        const auto pit = submap_gmm_path.find(sid_new);
+        if (pit != submap_gmm_path.end()) {
+            path = pit->second;
+        }
+    }
+
+    GmmModel pruned = pruneSimilarComponents(input, map_cfg_);
+    if (pruned.components.empty()) {
+        ROS_WARN("[global_graph] deferred internal prune S(%d) would remove "
+                 "all components; keeping unpruned map", sid_new);
+        return;
+    }
+
+    GmmModel to_save;
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        const auto it = submap_gmm.find(sid_new);
+        if (it == submap_gmm.end()) {
+            return;
+        }
+        if (it->second.numComponents() != before_n) {
+            ROS_WARN_THROTTLE(
+                5.0,
+                "[global_graph] deferred internal prune S(%d): submap changed "
+                "during prune (%d -> %d comp); skipping apply",
+                sid_new, before_n, it->second.numComponents());
+            return;
+        }
+        it->second = std::move(pruned);
+        submap_gmm_components[sid_new] = precomputeGmmLocalData(it->second);
+        to_save = it->second;
+
+        ROS_INFO("[global_graph] deferred internal prune S(%d): %d -> %d components "
+                 "(after overlap D2D wave)",
+                 sid_new, before_n, it->second.numComponents());
+    }
+
+    if (!path.empty()) {
+        try {
+            saveGmmToFile(to_save, path);
+        } catch (const std::exception& e) {
+            ROS_WARN("[global_graph] deferred internal prune: failed to save S(%d): %s",
+                     sid_new, e.what());
+        }
+    }
+}
+
+void GlobalPoseGraph::pruneSubmapPairGmmsAfterLoop(
+        int sid_a, int sid_b, const ros::Time& stamp) {
+    if (!map_cfg_.prune_enable) return;
+    if (sid_a == sid_b) return;
+
+    const int s_lo = std::min(sid_a, sid_b);
+    const int s_hi = std::max(sid_a, sid_b);
+
+    GmmModel ga_copy, gb_copy;
+    Matrix4d Ta = Matrix4d::Identity();
+    Matrix4d Tb = Matrix4d::Identity();
+    std::map<int, int> key_sid_copy;
+    std::string path_a, path_b;
+    bool have_a_path = false;
+    bool have_b_path = false;
+
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        const auto ga_it = submap_gmm.find(sid_a);
+        const auto gb_it = submap_gmm.find(sid_b);
+        if (ga_it == submap_gmm.end() || gb_it == submap_gmm.end()) {
+            return;
+        }
+        if (ga_it->second.components.empty() ||
+            gb_it->second.components.empty()) {
+            return;
+        }
+        ga_copy = ga_it->second;
+        gb_copy = gb_it->second;
+
+        const auto pa = submap_pose_by_idx.find(sid_a);
+        const auto pb = submap_pose_by_idx.find(sid_b);
+        if (pa != submap_pose_by_idx.end() && pa->second.allFinite()) {
+            Ta = pa->second;
+        }
+        if (pb != submap_pose_by_idx.end() && pb->second.allFinite()) {
+            Tb = pb->second;
+        }
+
+        key_sid_copy = key_to_submap;
+
+        const auto path_it_a = submap_gmm_path.find(sid_a);
+        if (path_it_a != submap_gmm_path.end()) {
+            path_a = path_it_a->second;
+            have_a_path = true;
+        }
+        const auto path_it_b = submap_gmm_path.find(sid_b);
+        if (path_it_b != submap_gmm_path.end()) {
+            path_b = path_it_b->second;
+            have_b_path = true;
+        }
+    }
+
+    const int snap_na = ga_copy.numComponents();
+    const int snap_nb = gb_copy.numComponents();
+
+    GmmModel world_a = transformGmmRigid(ga_copy, Ta);
+    GmmModel world_b = transformGmmRigid(gb_copy, Tb);
+
+    GmmModel combined;
+    combined.components.reserve(world_a.components.size() +
+                                world_b.components.size());
+    combined.components.insert(
+        combined.components.end(),
+        std::make_move_iterator(world_a.components.begin()),
+        std::make_move_iterator(world_a.components.end()));
+    combined.components.insert(
+        combined.components.end(),
+        std::make_move_iterator(world_b.components.begin()),
+        std::make_move_iterator(world_b.components.end()));
+    normalizeGmmWeights(combined);
+
+    const GmmModel pruned = pruneSimilarComponents(combined, map_cfg_);
+    if (pruned.components.empty()) {
+        ROS_WARN("[global_graph] cross-submap prune S(%d)<->S(%d): "
+                 "prune removed all components; keeping originals",
+                 s_lo, s_hi);
+        return;
+    }
+
+    GmmModel new_a, new_b;
+    const Matrix4d invTa = Ta.inverse();
+    const Matrix4d invTb = Tb.inverse();
+    int dropped_keys = 0;
+    for (const auto& wc : pruned.components) {
+        const int kid = wc.source_key_idx;
+        const auto it = key_sid_copy.find(kid);
+        if (it == key_sid_copy.end()) {
+            ++dropped_keys;
+            continue;
+        }
+        const int owner = it->second;
+        if (owner == sid_a) {
+            new_a.components.push_back(transformComponentRigid(wc, invTa));
+        } else if (owner == sid_b) {
+            new_b.components.push_back(transformComponentRigid(wc, invTb));
+        } else {
+            ++dropped_keys;
+        }
+    }
+
+    normalizeGmmWeights(new_a);
+    normalizeGmmWeights(new_b);
+
+    if (new_a.components.empty() || new_b.components.empty()) {
+        ROS_WARN("[global_graph] cross-submap prune S(%d)<->S(%d): "
+                 "split would empty a submap (A=%d B=%d dropped_key=%d); "
+                 "keeping originals",
+                 s_lo, s_hi,
+                 static_cast<int>(new_a.components.size()),
+                 static_cast<int>(new_b.components.size()),
+                 dropped_keys);
+        return;
+    }
+
+    const int na_before = ga_copy.numComponents();
+    const int nb_before = gb_copy.numComponents();
+    const int na_after = new_a.numComponents();
+    const int nb_after = new_b.numComponents();
+
+    GmmModel to_save_a, to_save_b;
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        if (!submap_gmm.count(sid_a) || !submap_gmm.count(sid_b)) {
+            return;
+        }
+        if (submap_gmm.at(sid_a).numComponents() != snap_na ||
+            submap_gmm.at(sid_b).numComponents() != snap_nb) {
+            ROS_WARN_THROTTLE(
+                5.0,
+                "[global_graph] cross-submap prune S(%d)<->S(%d): "
+                "submap GMM changed during prune; skipping apply",
+                s_lo, s_hi);
+            return;
+        }
+        submap_gmm[sid_a] = std::move(new_a);
+        submap_gmm[sid_b] = std::move(new_b);
+        submap_gmm_components[sid_a] = precomputeGmmLocalData(submap_gmm[sid_a]);
+        submap_gmm_components[sid_b] = precomputeGmmLocalData(submap_gmm[sid_b]);
+        to_save_a = submap_gmm[sid_a];
+        to_save_b = submap_gmm[sid_b];
+    }
+
+    ROS_INFO("[global_graph] cross-submap prune after loop S(%d)<->S(%d): "
+             "S(%d) %d->%d comp, S(%d) %d->%d comp (dropped_key=%d)",
+             s_lo, s_hi,
+             sid_a, na_before, na_after,
+             sid_b, nb_before, nb_after,
+             dropped_keys);
+
+    try {
+        if (have_a_path) {
+            saveGmmToFile(to_save_a, path_a);
+        }
+    } catch (const std::exception& e) {
+        ROS_WARN("[global_graph] cross-submap prune: failed to save S(%d): %s",
+                 sid_a, e.what());
+    }
+    try {
+        if (have_b_path) {
+            saveGmmToFile(to_save_b, path_b);
+        }
+    } catch (const std::exception& e) {
+        ROS_WARN("[global_graph] cross-submap prune: failed to save S(%d): %s",
+                 sid_b, e.what());
     }
 }
 
@@ -470,43 +907,87 @@ void GlobalPoseGraph::handleSubmapRegistrationResult(
         int sid_prev, int sid_curr,
         const Matrix4d& T_rel, double score,
         const ros::Time& stamp) {
+    if (!enable) return;
+
+    const int sid_new = std::max(sid_prev, sid_curr);
+    struct RunDeferredPrune {
+        GlobalPoseGraph* graph = nullptr;
+        int sid = -1;
+        ros::Time st;
+        ~RunDeferredPrune() {
+            if (graph != nullptr) {
+                graph->maybeApplyDeferredInternalSubmapPrune(sid, st);
+            }
+        }
+    } defer{this, sid_new, stamp};
+
     const auto edge = std::make_pair(std::min(sid_prev, sid_curr),
                                      std::max(sid_prev, sid_curr));
-    pending_submap_registrations_.erase(edge);
-
-    if (score < submap_reg_score_threshold_) {
-        ROS_INFO("[global_graph] submap reg S(%d)->S(%d) "
-                 "rejected (score=%.4f < %.4f)",
-                 sid_prev, sid_curr, score, submap_reg_score_threshold_);
-        return;
-    }
-
-    if (loop_edges_added.count(edge)) {
-        ROS_DEBUG("[global_graph] submap edge S(%d)<->S(%d) "
-                  "already exists, skipping", sid_prev, sid_curr);
-        return;
-    }
-
-    const auto pos = T_rel.block<3,1>(0,3);
-    const auto [noise, sigma_t, sigma_r] = noiseFromScore(
-        score,
-        submap_loop_sigma_t_min_, submap_loop_sigma_t_max_,
-        submap_loop_sigma_r_min_, submap_loop_sigma_r_max_);
 
     {
-        std::lock_guard<std::mutex> lk(lock);
+        std::lock_guard<std::recursive_mutex> lk(lock);
+
+        if (score < submap_reg_score_threshold_) {
+            ROS_INFO("[global_graph] submap reg S(%d)->S(%d) "
+                     "rejected (score=%.4f < %.4f)",
+                     sid_prev, sid_curr, score, submap_reg_score_threshold_);
+            return;
+        }
+
+        if (loop_edges_added.count(edge)) {
+            ROS_DEBUG("[global_graph] submap edge S(%d)<->S(%d) "
+                      "already exists, skipping", sid_prev, sid_curr);
+            return;
+        }
+
+        if (!T_rel.allFinite()) {
+            ROS_WARN("[global_graph] submap reg S(%d)->S(%d) rejected (non-finite T)",
+                     sid_prev, sid_curr);
+            return;
+        }
+
+        // Absolute + consistency gates for overlap D2D (tight); reject outliers
+        // vs current submap anchor geometry. Trajectory chain uses traj_aux_gate_*.
+        {
+            const auto psp = submap_pose_by_idx.find(sid_prev);
+            const auto psc = submap_pose_by_idx.find(sid_curr);
+            if (psp != submap_pose_by_idx.end() && psc != submap_pose_by_idx.end()) {
+                const Matrix4d T_ref_rel = psp->second.inverse() * psc->second;
+                if (!passesAuxGate("overlap_reg", T_rel, &T_ref_rel, false)) {
+                    ROS_INFO("[global_graph] submap reg S(%d)->S(%d) "
+                             "rejected (aux gate vs anchor poses)",
+                             sid_prev, sid_curr);
+                    return;
+                }
+            } else {
+                if (!passesAuxGate("overlap_reg", T_rel, nullptr, false)) {
+                    ROS_INFO("[global_graph] submap reg S(%d)->S(%d) "
+                             "rejected (aux magnitude gate; missing anchor pose)",
+                             sid_prev, sid_curr);
+                    return;
+                }
+            }
+        }
+
+        const auto pos = T_rel.block<3,1>(0,3);
+        const auto [noise, sigma_t, sigma_r] = noiseFromScore(
+            score,
+            submap_loop_sigma_t_min_, submap_loop_sigma_t_max_,
+            submap_loop_sigma_r_min_, submap_loop_sigma_r_max_);
+
         new_factors_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             X(sid_prev), X(sid_curr), toPose3(T_rel), noise);
-    }
-    loop_edges_added.insert(edge);
+        loop_edges_added.insert(edge);
 
-    ROS_INFO("[global_graph] ADDED BetweenFactor "
-             "S(%d)->S(%d) score=%.4f t=[%.3f, %.3f, %.3f] "
-             "sigma_t=%.4f sigma_r=%.4f",
-             sid_prev, sid_curr, score,
-             pos(0), pos(1), pos(2), sigma_t, sigma_r);
+        ROS_INFO("[global_graph] ADDED BetweenFactor "
+                 "S(%d)->S(%d) score=%.4f t=[%.3f, %.3f, %.3f] "
+                 "sigma_t=%.4f sigma_r=%.4f",
+                 sid_prev, sid_curr, score,
+                 pos(0), pos(1), pos(2), sigma_t, sigma_r);
+    }
 
     commit(stamp);
+    pruneSubmapPairGmmsAfterLoop(sid_prev, sid_curr, stamp);
 }
 
 // ---------------------------------------------------------------
@@ -521,53 +1002,63 @@ void GlobalPoseGraph::addLoopFactor(
         double score) {
     if (!enable) return;
 
-    const auto it_prev = key_to_submap.find(prev_key_idx);
-    const auto it_curr = key_to_submap.find(curr_key_idx);
-    if (it_prev == key_to_submap.end() || it_curr == key_to_submap.end()) return;
-
-    const int sid_prev = it_prev->second;
-    const int sid_curr = it_curr->second;
-    if (sid_prev == sid_curr) return;
-
-    const auto edge = std::make_pair(std::min(sid_prev, sid_curr),
-                                     std::max(sid_prev, sid_curr));
-    if (loop_edges_added.count(edge)) return;
-
-    Matrix4d T_rel_sub = T_prev_to_curr;
-
-    const auto pkp = pose_by_idx.find(prev_key_idx);
-    const auto pkc = pose_by_idx.find(curr_key_idx);
-    const auto psp = submap_pose_by_idx.find(sid_prev);
-    const auto psc = submap_pose_by_idx.find(sid_curr);
-
-    if (pkp != pose_by_idx.end() && pkc != pose_by_idx.end() &&
-        psp != submap_pose_by_idx.end() && psc != submap_pose_by_idx.end()) {
-        const Matrix4d T_sp_kp = psp->second.inverse() * pkp->second;
-        const Matrix4d T_kc_sc = pkc->second.inverse() * psc->second;
-        T_rel_sub = T_sp_kp * T_prev_to_curr * T_kc_sc;
-    }
-
-    const double use_score = (score < 0.0) ? submap_reg_score_threshold_ : score;
-    const auto [noise, sigma_t, sigma_r] = noiseFromScore(
-        use_score,
-        loop_sigma_t_min_, loop_sigma_t_max_,
-        loop_sigma_r_min_, loop_sigma_r_max_);
-
+    int sid_prev = -1;
+    int sid_curr = -1;
     {
-        std::lock_guard<std::mutex> lk(lock);
+        std::lock_guard<std::recursive_mutex> lk(lock);
+
+        const auto it_prev = key_to_submap.find(prev_key_idx);
+        const auto it_curr = key_to_submap.find(curr_key_idx);
+        if (it_prev == key_to_submap.end() || it_curr == key_to_submap.end()) return;
+
+        sid_prev = it_prev->second;
+        sid_curr = it_curr->second;
+        if (sid_prev == sid_curr) return;
+
+        const auto edge = std::make_pair(std::min(sid_prev, sid_curr),
+                                         std::max(sid_prev, sid_curr));
+        if (loop_edges_added.count(edge)) return;
+
+        Matrix4d T_rel_sub = T_prev_to_curr;
+
+        const auto pkp = pose_by_idx.find(prev_key_idx);
+        const auto pkc = pose_by_idx.find(curr_key_idx);
+        const auto psp = submap_pose_by_idx.find(sid_prev);
+        const auto psc = submap_pose_by_idx.find(sid_curr);
+
+        if (pkp != pose_by_idx.end() && pkc != pose_by_idx.end() &&
+            psp != submap_pose_by_idx.end() && psc != submap_pose_by_idx.end()) {
+            const Matrix4d T_sp_kp = psp->second.inverse() * pkp->second;
+            const Matrix4d T_kc_sc = pkc->second.inverse() * psc->second;
+            T_rel_sub = T_sp_kp * T_prev_to_curr * T_kc_sc;
+        }
+
+        if (!T_rel_sub.allFinite()) {
+            ROS_WARN("[global_graph] keyframe loop X(%d)->X(%d) rejected (non-finite T)",
+                     prev_key_idx, curr_key_idx);
+            return;
+        }
+
+        const double use_score = (score < 0.0) ? submap_reg_score_threshold_ : score;
+        const auto [noise, sigma_t, sigma_r] = noiseFromScore(
+            use_score,
+            loop_sigma_t_min_, loop_sigma_t_max_,
+            loop_sigma_r_min_, loop_sigma_r_max_);
+
         new_factors_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             X(sid_prev), X(sid_curr), toPose3(T_rel_sub), noise);
-    }
-    loop_edges_added.insert(edge);
+        loop_edges_added.insert(edge);
 
-    const auto pos = T_rel_sub.block<3,1>(0,3);
-    ROS_INFO("[global_graph] ADDED BetweenFactor (keyframe loop) "
-             "S(%d)->S(%d) via X(%d)->X(%d) "
-             "t=[%.3f, %.3f, %.3f] score=%.4f sigma_t=%.4f sigma_r=%.4f",
-             sid_prev, sid_curr, prev_key_idx, curr_key_idx,
-             pos(0), pos(1), pos(2), use_score, sigma_t, sigma_r);
+        const auto pos = T_rel_sub.block<3,1>(0,3);
+        ROS_INFO("[global_graph] ADDED BetweenFactor (keyframe loop) "
+                 "S(%d)->S(%d) via X(%d)->X(%d) "
+                 "t=[%.3f, %.3f, %.3f] score=%.4f sigma_t=%.4f sigma_r=%.4f",
+                 sid_prev, sid_curr, prev_key_idx, curr_key_idx,
+                 pos(0), pos(1), pos(2), use_score, sigma_t, sigma_r);
+    }
 
     commit(stamp);
+    pruneSubmapPairGmmsAfterLoop(sid_prev, sid_curr, stamp);
 }
 
 // ---------------------------------------------------------------
@@ -577,7 +1068,7 @@ void GlobalPoseGraph::addLoopFactor(
 void GlobalPoseGraph::commit(const ros::Time& stamp) {
     if (!enable) return;
 
-    std::lock_guard<std::mutex> lk(lock);
+    std::lock_guard<std::recursive_mutex> lk(lock);
     try {
         isam_->update(new_factors_, new_values_);
         new_factors_.resize(0);

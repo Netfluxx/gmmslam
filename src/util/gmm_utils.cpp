@@ -104,7 +104,7 @@ double bhattacharyyaDistance(const Vector3d& mu_a, const Matrix3d& cov_a,
     const Matrix3d Cb = symRegularize(cov_b, cov_reg);
     const Matrix3d C  = 0.5 * (Ca + Cb);
 
-    Eigen::LLT<Matrix3d> llt(C);
+    Eigen::LLT<Matrix3d> llt(C); // CHolesky
     Eigen::LLT<Matrix3d> llt_a(Ca);
     Eigen::LLT<Matrix3d> llt_b(Cb);
     if (llt.info()  != Eigen::Success ||

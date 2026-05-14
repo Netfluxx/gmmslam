@@ -20,7 +20,11 @@ void loadRos(const YAML::Node& root, RosConfig& c) {
     c.sensor_frame = readOr<std::string>(n, "sensor_frame", c.sensor_frame);
     c.odom_frame = readOr<std::string>(n, "odom_frame", c.odom_frame);
     c.base_frame = readOr<std::string>(n, "base_frame", c.base_frame);
-    c.noisy_gt_topic = readOr<std::string>(n, "noisy_gt_topic", c.noisy_gt_topic);
+    c.odometry_input = readOr<std::string>(
+        n, "odometry_input",
+        readOr<std::string>(n, "noisy_gt_topic", c.odometry_input));
+    c.restart_state_path = readOr<std::string>(
+        n, "restart_state_path", c.restart_state_path);
     c.registration_request_topic = readOr<std::string>(n, "registration_request_topic", c.registration_request_topic);
     c.registration_result_topic = readOr<std::string>(n, "registration_result_topic", c.registration_result_topic);
 }
@@ -31,6 +35,7 @@ void loadPreprocess(const YAML::Node& root, PreprocessConfig& c) {
     c.min_range = readOr(n, "min_range", c.min_range);
     c.max_range = readOr(n, "max_range", c.max_range);
     c.voxel_leaf_size = readOr(n, "voxel_leaf_size", c.voxel_leaf_size);
+    c.target_points = readOr(n, "target_points", c.target_points);
     c.min_points = readOr(n, "min_points", c.min_points);
 }
 
@@ -156,12 +161,26 @@ void loadGlobalGraph(const YAML::Node& root, GlobalGraphConfig& c) {
     c.aux_gate_abs_rot_deg = readOr(n, "aux_gate_abs_rot_deg", c.aux_gate_abs_rot_deg);
     c.aux_gate_consistency_trans_m = readOr(n, "aux_gate_consistency_trans_m", c.aux_gate_consistency_trans_m);
     c.aux_gate_consistency_rot_deg = readOr(n, "aux_gate_consistency_rot_deg", c.aux_gate_consistency_rot_deg);
+    c.traj_aux_gate_abs_trans_m =
+        readOr(n, "traj_aux_gate_abs_trans_m", c.aux_gate_abs_trans_m);
+    c.traj_aux_gate_abs_rot_deg =
+        readOr(n, "traj_aux_gate_abs_rot_deg", c.aux_gate_abs_rot_deg);
+    c.traj_aux_gate_consistency_trans_m =
+        readOr(n, "traj_aux_gate_consistency_trans_m", c.aux_gate_consistency_trans_m);
+    c.traj_aux_gate_consistency_rot_deg =
+        readOr(n, "traj_aux_gate_consistency_rot_deg", c.aux_gate_consistency_rot_deg);
     c.submap_loop_sigma_t_min = readOr(n, "submap_loop_sigma_t_min", c.submap_loop_sigma_t_min);
     c.submap_loop_sigma_t_max = readOr(n, "submap_loop_sigma_t_max", c.submap_loop_sigma_t_max);
     c.submap_loop_sigma_r_min = readOr(n, "submap_loop_sigma_r_min", c.submap_loop_sigma_r_min);
     c.submap_loop_sigma_r_max = readOr(n, "submap_loop_sigma_r_max", c.submap_loop_sigma_r_max);
     c.reanchor_smoother_on_traj_gate_fail =
         readOr(n, "reanchor_smoother_on_traj_gate_fail", c.reanchor_smoother_on_traj_gate_fail);
+    c.submap_finalize_min_ready_keyframes =
+        readOr(n, "submap_finalize_min_ready_keyframes", c.submap_finalize_min_ready_keyframes);
+    c.submap_finalize_min_ready_fraction =
+        readOr(n, "submap_finalize_min_ready_fraction", c.submap_finalize_min_ready_fraction);
+    c.submap_finalize_max_wait_s =
+        readOr(n, "submap_finalize_max_wait_s", c.submap_finalize_max_wait_s);
 }
 
 void loadGtNoise(const YAML::Node& root, GtNoiseConfig& c) {
@@ -197,6 +216,8 @@ void loadVisualization(const YAML::Node& root, VisualizationConfig& c) {
     const auto& n = root["visualization"];
     c.gmm_marker_sigma = readOr(n, "gmm_marker_sigma", c.gmm_marker_sigma);
     c.global_gmm_publish_period_s = readOr(n, "global_gmm_publish_period_s", c.global_gmm_publish_period_s);
+    c.map_cloud_publish_hz = readOr(n, "map_cloud_publish_hz", c.map_cloud_publish_hz);
+    c.map_cloud_max_chunks = readOr(n, "map_cloud_max_chunks", c.map_cloud_max_chunks);
 }
 
 void loadMap(const YAML::Node& root, MapConfig& c) {

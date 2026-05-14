@@ -133,7 +133,8 @@ private:
         Eigen::MatrixXf pts = gmmslam::pc2ToEigen(*msg);
         pts = gmmslam::preprocess(pts, cfg_.preprocess.min_range,
                                   cfg_.preprocess.max_range,
-                                  cfg_.preprocess.voxel_leaf_size);
+                                  cfg_.preprocess.voxel_leaf_size,
+                                  cfg_.preprocess.target_points);
         if (pts.rows() < cfg_.preprocess.min_points) {
             ROS_WARN_THROTTLE(2.0, "[solid_bench] Too few points: %ld",
                               static_cast<long>(pts.rows()));

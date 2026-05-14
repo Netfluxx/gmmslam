@@ -129,6 +129,7 @@ RViz will show:
 - `/gmmslam_node/graph_nodes` — Per-keyframe pose markers
 - `/gmmslam_node/loop_closure_markers` — Loop-closure correspondences
 - `/gmmslam_node/latest_frame_cloud` — Most recent depth scan in world frame
+- `/gmmslam_node/map_cloud` — Accumulated depth scans (one chunk per smoother frame), reprojected with current `pose_by_idx` so fixed-lag and **keyframe-level** loop updates move the cloud; latched; rate set by `map_cloud_publish_hz` (default 0.5 Hz). Pure **submap–submap** graph edges alone do not move these points (they follow the smoother, not the global submap graph).
 
 The map is stored as one merged GMM per submap on disk (`gmm_dir`/`submap_XXXX.gmm`). Near-duplicate components produced by overlapping observations are pruned at submap finalization using optional R-tree spatial indexing, a Bhattacharyya-distance gate, and a keep-lower-pose-uncertainty rule; see the `map:` block in `config/params.yaml` to tune.
 
@@ -161,6 +162,7 @@ This repository **vendors or depends on** the following (versions may follow the
 | **dlib** | Pulled in via GIRA3D / registration stack | [davisking/dlib](https://github.com/davisking/dlib) |
 | **GIRA3D reconstruction** | SOGMM / Open3D colcon workspace (`self_organizing_gmm`, etc.) | [gira3d/gira3d-reconstruction](https://github.com/gira3d/gira3d-reconstruction) |
 | **GIRA3D registration** | GMM I/O, **D2D registration** (`gmm`, `gmm_d2d_registration`) | [gira3d/gira3d-registration](https://github.com/gira3d/gira3d-registration) |
+| **SOLiD** | **Place recognition for loop closure** — spatially organized LiDAR global descriptor (cosine gate on radius candidates, optional yaw prior for D2D init); see Kim et al., *IEEE RA-L* 2024 | [sparolab/SOLiD](https://github.com/sparolab/SOLiD/tree/main) (official implementation; BSD-3-Clause) |
 | **Open3D** | Built as part of the GIRA3D reconstruction image flow | [isl-org/Open3D](https://github.com/isl-org/Open3D) |
 | **nanoflann** | KD-tree headers in the GIRA3D dry install | [jlblancoc/nanoflann](https://github.com/jlblancoc/nanoflann) |
 | **NVIDIA CUDA** (base image) | GPU builds for reconstruction / SOGMM path | NVIDIA EULA |
