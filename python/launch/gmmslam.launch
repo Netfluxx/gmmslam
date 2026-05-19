@@ -46,6 +46,7 @@
   <arg name="submap_reanchor_smoother_on_traj_gate_fail" default="true"/>
   <arg name="solve_after_registration_factor" default="false"/>
   <arg name="registration_workers" default="6"/>
+  <arg name="suppress_registration_backend_output" default="true"/>
   <!-- Keyframe parameters -->
   <arg name="keyframe_translation_thresh_m" default="0.3"/>
   <arg name="keyframe_rotation_thresh_deg" default="7.0"/>
@@ -243,6 +244,7 @@
     <param name="result_topic"  value="/gmmslam_node/registration/result"/>
     <param name="num_workers"   value="$(arg registration_workers)"/>
     <param name="score_threshold" value="$(arg registration_score_threshold)"/>
+    <param name="suppress_backend_output" value="$(arg suppress_registration_backend_output)"/>
   </node>
 
   <node pkg="gmmslam" type="noisy_gt_publisher_node.py"

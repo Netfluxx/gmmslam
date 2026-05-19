@@ -14,6 +14,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <Eigen/Geometry>
 #include <filesystem>
 #include <functional>
 #include <limits>
@@ -47,6 +48,21 @@ bool jsonBool(const nlohmann::json& j, const char* key, bool fallback) {
     auto it = j.find(key);
     if (it == j.end() || it->is_null() || !it->is_boolean()) return fallback;
     return it->get<bool>();
+}
+
+double rotationAngleDeg(const Eigen::Matrix3d& R) {
+    const Eigen::AngleAxisd aa(R);
+    return std::abs(aa.angle()) * 180.0 / M_PI;
+}
+
+bool isSaneRigidTransform(const Eigen::Matrix4d& T) {
+    if (!T.allFinite()) return false;
+    const Eigen::Matrix3d R = T.block<3, 3>(0, 0);
+    const double det = R.determinant();
+    if (!std::isfinite(det) || std::abs(det - 1.0) > 0.10) return false;
+    const double ortho_err =
+        (R.transpose() * R - Eigen::Matrix3d::Identity()).norm();
+    return std::isfinite(ortho_err) && ortho_err < 0.25;
 }
 
 } // namespace
@@ -90,6 +106,8 @@ RegistrationManager::RegistrationManager(
       loop_closure_min_separation_deg_(lc_cfg.min_separation_deg),
       loop_closure_max_age_s_(lc_cfg.max_age_s),
       loop_closure_gmm_keep_keyframes_(lc_cfg.gmm_keep_keyframes),
+      loop_closure_consistency_gate_trans_m_(lc_cfg.consistency_gate_trans_m),
+      loop_closure_consistency_gate_rot_deg_(lc_cfg.consistency_gate_rot_deg),
       score_sigma_low_(reg_cfg.score_sigma_low),
       score_sigma_high_(reg_cfg.score_sigma_high),
       seq_sigma_t_min_(reg_cfg.seq_sigma_t_min),
@@ -564,6 +582,8 @@ void RegistrationManager::enqueueLoopClosureRequests(
     int dropped_by_gate = 0;
     int scored = 0;
     Ranked best{-1, 0.0, -1.0, {}};
+    Ranked best_rejected{-1, 0.0, -1.0, {}};
+    std::vector<Ranked> accepted;
     for (const auto& cand : near) {
         SolidDescriptor c_desc;
         if (!place_index_.get(cand.idx, c_desc)) continue;
@@ -571,21 +591,48 @@ void RegistrationManager::enqueueLoopClosureRequests(
         ++scored;
         if (cs < solid_cfg_.cos_similarity_threshold) {
             ++dropped_by_gate;
+            if (cs > best_rejected.cos_sim) {
+                best_rejected = Ranked{cand.idx, cand.distance, cs, cand.path};
+            }
             continue;
         }
         if (cs > best.cos_sim) {
             best = Ranked{cand.idx, cand.distance, cs, cand.path};
         }
+        accepted.push_back(Ranked{cand.idx, cand.distance, cs, cand.path});
     }
 
-    if (best.idx < 0) {
+    if (accepted.empty()) {
+        if (best_rejected.idx >= 0) {
+            ROS_INFO_THROTTLE(10.0,
+                "[registration] loop search @key %d: 0 accepted candidates "
+                "(radius=%zu, scored=%d, dropped_by_SOLiD=%d, "
+                "best_rejected=X(%d) cos=%.3f dist=%.2fm < threshold %.3f)",
+                curr_idx, near.size(), scored, dropped_by_gate,
+                best_rejected.idx, best_rejected.cos_sim, best_rejected.distance,
+                solid_cfg_.cos_similarity_threshold);
+        } else {
         ROS_INFO_THROTTLE(10.0,
             "[registration] loop search @key %d: 0 accepted candidates "
             "(radius=%zu, scored=%d, dropped_by_SOLiD=%d)",
             curr_idx, near.size(), scored, dropped_by_gate);
+        }
         return;
     }
-    selected.push_back(best);
+
+    std::sort(accepted.begin(), accepted.end(),
+              [](const Ranked& a, const Ranked& b) {
+                  if (a.cos_sim == b.cos_sim) {
+                      return a.distance < b.distance;
+                  }
+                  return a.cos_sim > b.cos_sim;
+              });
+    const int n_to_select = std::min(
+        loop_closure_max_candidates_,
+        static_cast<int>(accepted.size()));
+    selected.insert(selected.end(),
+                    accepted.begin(),
+                    accepted.begin() + n_to_select);
 
     // ------------------------------------------------------------------
     // Previous implementation: fused α·radius + β·cos ranking, optional
@@ -601,9 +648,10 @@ void RegistrationManager::enqueueLoopClosureRequests(
 
     const int n_selected = static_cast<int>(selected.size());
     ROS_INFO("[registration] loop search @key %d: radius=%zu scored=%d "
-             "dropped_by_SOLiD=%d, best_cos=%.3f dispatching %d",
+             "dropped_by_SOLiD=%d, best=X(%d) dist=%.2fm cos=%.3f "
+             "dispatching %d",
              curr_idx, near.size(), scored, dropped_by_gate,
-             best.cos_sim, n_selected);
+             best.idx, best.distance, best.cos_sim, n_selected);
 
     for (int i = 0; i < n_selected; ++i) {
         const auto& cand = selected[static_cast<std::size_t>(i)];
@@ -647,6 +695,10 @@ void RegistrationManager::enqueueLoopClosureRequests(
         std_msgs::String msg;
         msg.data = payload.dump();
         reg_pub_.publish(msg);
+
+        ROS_INFO("[registration] dispatched loop D2D X(%d)->X(%d): "
+                 "dist=%.2fm solid_cos=%.3f",
+                 cand.idx, curr_idx, cand.distance, cand.cos_sim);
 
         {
             std::lock_guard<std::mutex> lk(lock);
@@ -698,23 +750,56 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
         pending_loop_requests_.erase(edge);
     }
 
-    if (!jsonBool(data, "success", false)) return;
-
     const double score = jsonNumber<double>(data, "score", -1e30);
+    if (!jsonBool(data, "success", false)) {
+        if (is_loop) {
+            ROS_INFO("[registration] loop D2D failed X(%d)->X(%d) "
+                     "(score=%.4f, no factor staged)",
+                     prev_idx, curr_idx, score);
+        }
+        return;
+    }
+
     if (is_loop) {
-        if ((curr_idx - prev_idx) < loop_closure_min_keyframe_gap_) return;
-        if (score < loop_closure_detect_score_threshold_) return;
+        if ((curr_idx - prev_idx) < loop_closure_min_keyframe_gap_) {
+            ROS_INFO("[registration] rejected loop result X(%d)->X(%d): "
+                     "gap %d < min_keyframe_gap %d",
+                     prev_idx, curr_idx, curr_idx - prev_idx,
+                     loop_closure_min_keyframe_gap_);
+            return;
+        }
+        if (score < loop_closure_detect_score_threshold_) {
+            ROS_INFO("[registration] rejected loop result X(%d)->X(%d): "
+                     "score=%.4f < detect_score_threshold %.4f",
+                     prev_idx, curr_idx, score,
+                     loop_closure_detect_score_threshold_);
+            return;
+        }
     } else {
         if (score < registration_score_threshold_) return;
         if ((curr_idx % registration_factor_every_n_frames_) != 0) return;
     }
 
-    if (prev_idx >= curr_idx) return;
+    if (prev_idx >= curr_idx) {
+        if (is_loop) {
+            ROS_INFO("[registration] rejected loop result X(%d)->X(%d): "
+                     "prev_idx >= curr_idx",
+                     prev_idx, curr_idx);
+        }
+        return;
+    }
 
     // Parse the 4x4 transform (null-safe — a null entry yields NaN, which
-    // fails the allFinite() check below).
+    // fails the SE(3) sanity check below).
     auto t_it = data.find("transform");
-    if (t_it == data.end() || !t_it->is_array() || t_it->size() != 16) return;
+    if (t_it == data.end() || !t_it->is_array() || t_it->size() != 16) {
+        if (is_loop) {
+            ROS_WARN("[registration] rejected loop result X(%d)->X(%d): "
+                     "missing/invalid transform array",
+                     prev_idx, curr_idx);
+        }
+        return;
+    }
     Matrix4d T;
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 4; ++c) {
@@ -725,7 +810,12 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
         }
     }
 
-    if (!T.allFinite()) return;
+    if (!isSaneRigidTransform(T)) {
+        ROS_WARN_THROTTLE(2.0,
+            "[registration] rejected D2D result X(%d)->X(%d): invalid SE(3) transform",
+            prev_idx, curr_idx);
+        return;
+    }
 
     const bool force_loop = is_loop || (score >= loop_closure_score_threshold_);
     const bool use_super = is_loop && (score >= loop_closure_detect_score_threshold_);
@@ -908,7 +998,76 @@ void RegistrationManager::stageRegistrationFactor(
     }
 
     if ((t_latest_snapshot - t_curr_snapshot) > smoother_.fixed_lag_s * 1.1) {
+        if (is_loop_candidate) {
+            ROS_INFO("[registration] loop X(%d)->X(%d) is outside fixed-lag "
+                     "window; considering global-graph forwarding "
+                     "(latest_t - curr_t = %.2fs, lag = %.2fs)",
+                     prev_idx, curr_idx, t_latest_snapshot - t_curr_snapshot,
+                     smoother_.fixed_lag_s);
+            if (global_graph_ != nullptr &&
+                score >= loop_closure_detect_score_threshold_) {
+                std::map<int, Matrix4d> pose_snap;
+                {
+                    std::lock_guard<std::mutex> lk(smoother_.graph_lock);
+                    pose_snap = smoother_.pose_by_idx;
+                }
+                if (has_solid_cos_sim) {
+                    ROS_INFO("[registration] forwarding late loop X(%d)->X(%d) "
+                             "to global graph: score=%.4f solid_cos=%.3f",
+                             prev_idx, curr_idx, score, solid_cos_sim);
+                } else {
+                    ROS_INFO("[registration] forwarding late loop X(%d)->X(%d) "
+                             "to global graph: score=%.4f",
+                             prev_idx, curr_idx, score);
+                }
+                global_graph_->addLoopFactor(prev_idx, curr_idx,
+                                             T_prev_to_curr, stamp,
+                                             pose_snap, score);
+            } else if (global_graph_ != nullptr) {
+                ROS_INFO("[registration] not forwarding late loop X(%d)->X(%d) "
+                         "to global graph: score %.4f < detect threshold %.4f",
+                         prev_idx, curr_idx, score,
+                         loop_closure_detect_score_threshold_);
+            }
+        }
         return;
+    }
+
+    if (is_loop_candidate) {
+        Matrix4d T_w_prev = Matrix4d::Identity();
+        Matrix4d T_w_curr = Matrix4d::Identity();
+        {
+            std::lock_guard<std::mutex> gk(smoother_.graph_lock);
+            const auto prev_pose_it = smoother_.pose_by_idx.find(prev_idx);
+            const auto curr_pose_it = smoother_.pose_by_idx.find(curr_idx);
+            if (prev_pose_it == smoother_.pose_by_idx.end() ||
+                curr_pose_it == smoother_.pose_by_idx.end()) {
+                ROS_WARN("[registration] rejected loop X(%d)->X(%d): "
+                         "missing pose history for consistency check",
+                         prev_idx, curr_idx);
+                return;
+            }
+            T_w_prev = prev_pose_it->second;
+            T_w_curr = curr_pose_it->second;
+        }
+
+        const Matrix4d T_est_prev_to_curr = T_w_prev.inverse() * T_w_curr;
+        const Matrix4d T_err = T_est_prev_to_curr.inverse() * T_prev_to_curr;
+        const double trans_err = T_err.block<3, 1>(0, 3).norm();
+        const double rot_err_deg = rotationAngleDeg(T_err.block<3, 3>(0, 0));
+
+        if ((loop_closure_consistency_gate_trans_m_ > 0.0 &&
+             trans_err > loop_closure_consistency_gate_trans_m_) ||
+            (loop_closure_consistency_gate_rot_deg_ > 0.0 &&
+             rot_err_deg > loop_closure_consistency_gate_rot_deg_)) {
+            ROS_WARN("[registration] rejected loop X(%d)->X(%d): "
+                     "D2D/pose consistency error trans=%.3fm rot=%.2fdeg "
+                     "(limits %.3fm %.2fdeg)",
+                     prev_idx, curr_idx, trans_err, rot_err_deg,
+                     loop_closure_consistency_gate_trans_m_,
+                     loop_closure_consistency_gate_rot_deg_);
+            return;
+        }
     }
 
     const auto edge = std::make_pair(std::min(prev_idx, curr_idx),
@@ -1063,7 +1222,6 @@ void RegistrationManager::publishLoopClosureMarkers(
     b.z = p_curr.z();
     line.points.push_back(a);
     line.points.push_back(b);
-    arr.markers.push_back(std::move(line));
 
     visualization_msgs::Marker txt;
     txt.header.frame_id = map_frame_;
@@ -1092,7 +1250,13 @@ void RegistrationManager::publishLoopClosureMarkers(
         oss << " [rescue]";
     }
     txt.text = oss.str();
-    arr.markers.push_back(std::move(txt));
+
+    {
+        std::lock_guard<std::mutex> lk(loop_viz_mutex_);
+        loop_closure_marker_history_.markers.push_back(std::move(line));
+        loop_closure_marker_history_.markers.push_back(std::move(txt));
+        arr = loop_closure_marker_history_;
+    }
 
     loop_closure_markers_pub_.publish(arr);
 }

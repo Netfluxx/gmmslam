@@ -15,7 +15,10 @@
   <arg name="base_frame" default="m500_1_base_link"/>
   <arg name="gt_topic" default="/m500_1/mavros/local_position/pose"/>
   <arg name="registration_workers" default="6"/>
+  <arg name="suppress_registration_backend_output" default="true"/>
   <arg name="odometry_input" default="/gmmslam_node/noisy_gt_pose"/>
+  <arg name="gmmslam_respawn" default="true"/>
+  <arg name="gmmslam_launch_prefix" default=""/>
 
   <!-- ========== Load YAML onto the parameter server under /gmmslam ========== -->
   <rosparam command="load" file="$(arg config_file)" ns="gmmslam"/>
@@ -31,7 +34,9 @@
 
   <!-- ========== Main GMM-SLAM node ========== -->
   <node pkg="gmmslam" type="gmmslam_node"
-        name="gmmslam_node" output="screen" respawn="true">
+        name="gmmslam_node" output="screen"
+        respawn="$(arg gmmslam_respawn)"
+        launch-prefix="$(arg gmmslam_launch_prefix)">
     <!-- Path passed to the node if it re-reads settings from disk -->
     <param name="config_file" value="$(arg config_file)"/>
     <!-- Topic / frame overrides from launch args (on top of /gmmslam YAML) -->
@@ -50,6 +55,7 @@
     <param name="request_topic" value="/gmmslam_node/registration/request"/>
     <param name="result_topic" value="/gmmslam_node/registration/result"/>
     <param name="num_workers" value="$(arg registration_workers)"/>
+    <param name="suppress_backend_output" value="$(arg suppress_registration_backend_output)"/>
   </node>
 
   <!-- ========== Noisy ground-truth publisher (feeds optional GT factors) ========== -->

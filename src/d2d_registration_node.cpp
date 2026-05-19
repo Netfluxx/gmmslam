@@ -9,12 +9,16 @@
 #include <atomic>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <filesystem>
 #include <mutex>
 #include <queue>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <fcntl.h>
+#include <unistd.h>
 
 using json = nlohmann::json;
 
@@ -29,6 +33,7 @@ public:
         pnh.param<int>("num_workers", num_workers_, 2);
         num_workers_ = std::max(1, num_workers_);
         pnh.param<double>("score_threshold", score_threshold_, -1.0e9);
+        pnh.param<bool>("suppress_backend_output", suppress_backend_output_, true);
 
         result_pub_ = nh.advertise<std_msgs::String>(result_topic, 50);
 
@@ -39,8 +44,9 @@ public:
         request_sub_ = nh.subscribe(request_topic, 200,
                                     &D2DRegistrationNode::requestCallback, this);
 
-        ROS_INFO("[d2d_reg] ready | workers=%d | %s -> %s",
-                 num_workers_, request_topic.c_str(), result_topic.c_str());
+        ROS_INFO("[d2d_reg] ready | workers=%d | %s -> %s | suppress_backend_output=%s",
+                 num_workers_, request_topic.c_str(), result_topic.c_str(),
+                 suppress_backend_output_ ? "true" : "false");
     }
 
     ~D2DRegistrationNode() {
@@ -56,6 +62,52 @@ public:
 
 private:
     static constexpr std::size_t kMaxQueueSize = 64;
+
+    class ScopedBackendOutputSilencer {
+    public:
+        explicit ScopedBackendOutputSilencer(bool enable) {
+            if (!enable) return;
+            std::fflush(stdout);
+            std::fflush(stderr);
+            saved_stdout_ = ::dup(STDOUT_FILENO);
+            saved_stderr_ = ::dup(STDERR_FILENO);
+            null_fd_ = ::open("/dev/null", O_WRONLY);
+            if (saved_stdout_ < 0 || saved_stderr_ < 0 || null_fd_ < 0) {
+                cleanup();
+                return;
+            }
+            ::dup2(null_fd_, STDOUT_FILENO);
+            ::dup2(null_fd_, STDERR_FILENO);
+            active_ = true;
+        }
+
+        ~ScopedBackendOutputSilencer() {
+            if (active_) {
+                std::fflush(stdout);
+                std::fflush(stderr);
+                ::dup2(saved_stdout_, STDOUT_FILENO);
+                ::dup2(saved_stderr_, STDERR_FILENO);
+            }
+            cleanup();
+        }
+
+        ScopedBackendOutputSilencer(const ScopedBackendOutputSilencer&) = delete;
+        ScopedBackendOutputSilencer& operator=(const ScopedBackendOutputSilencer&) = delete;
+
+    private:
+        void cleanup() {
+            if (null_fd_ >= 0) ::close(null_fd_);
+            if (saved_stdout_ >= 0) ::close(saved_stdout_);
+            if (saved_stderr_ >= 0) ::close(saved_stderr_);
+            null_fd_ = saved_stdout_ = saved_stderr_ = -1;
+            active_ = false;
+        }
+
+        int saved_stdout_ = -1;
+        int saved_stderr_ = -1;
+        int null_fd_ = -1;
+        bool active_ = false;
+    };
 
     void requestCallback(const std_msgs::String::ConstPtr& msg) {
         std::lock_guard<std::mutex> lk(queue_mutex_);
@@ -138,16 +190,35 @@ private:
                 }
             }
 
-            auto iso_result =
-                gmmslam::isoplanarRegistration(T_init, source_path, target_path);
+            gmmslam::RegistrationResult iso_result;
+            gmmslam::RegistrationResult aniso_result;
+            if (suppress_backend_output_) {
+                // The linked GIRA3D registration library prints covariance inversion
+                // diagnostics directly to stdout/stderr. File-descriptor redirection
+                // is process-wide, so serialize backend calls while silencing is on.
+                std::lock_guard<std::mutex> lk(backend_call_mutex_);
+                ScopedBackendOutputSilencer silence(true);
+                iso_result =
+                    gmmslam::isoplanarRegistration(T_init, source_path, target_path);
+            } else {
+                iso_result =
+                    gmmslam::isoplanarRegistration(T_init, source_path, target_path);
+            }
             Eigen::Matrix4f T_iso = iso_result.transform;
             if (!std::isfinite(iso_result.score) || T_iso.hasNaN()) {
                 T_iso = T_init;
             }
 
             // Step 2: anisotropic registration
-            const auto aniso_result =
-                gmmslam::anisotropicRegistration(T_iso, source_path, target_path);
+            if (suppress_backend_output_) {
+                std::lock_guard<std::mutex> lk(backend_call_mutex_);
+                ScopedBackendOutputSilencer silence(true);
+                aniso_result =
+                    gmmslam::anisotropicRegistration(T_iso, source_path, target_path);
+            } else {
+                aniso_result =
+                    gmmslam::anisotropicRegistration(T_iso, source_path, target_path);
+            }
             const Eigen::Matrix4f T_final = aniso_result.transform;
             const float score_final = aniso_result.score;
 
@@ -200,9 +271,11 @@ private:
     ros::Publisher result_pub_;
     int num_workers_ = 2;
     double score_threshold_ = -1.0e9;
+    bool suppress_backend_output_ = true;
 
     bool running_ = true;
     std::mutex queue_mutex_;
+    std::mutex backend_call_mutex_;
     std::condition_variable queue_cv_;
     std::queue<std::string> task_queue_;
     std::vector<std::thread> workers_;

@@ -103,6 +103,10 @@ void loadLoopClosure(const YAML::Node& root, LoopClosureConfig& c) {
     c.detect_score_threshold = readOr(n, "detect_score_threshold", c.detect_score_threshold);
     c.super_sigma_t = readOr(n, "super_sigma_t", c.super_sigma_t);
     c.super_sigma_r = readOr(n, "super_sigma_r", c.super_sigma_r);
+    c.consistency_gate_trans_m =
+        readOr(n, "consistency_gate_trans_m", c.consistency_gate_trans_m);
+    c.consistency_gate_rot_deg =
+        readOr(n, "consistency_gate_rot_deg", c.consistency_gate_rot_deg);
 }
 
 void loadSolid(const YAML::Node& root, SolidConfig& c) {
@@ -155,6 +159,8 @@ void loadGlobalGraph(const YAML::Node& root, GlobalGraphConfig& c) {
     c.prior_sigma_r = readOr(n, "prior_sigma_r", c.prior_sigma_r);
     c.overlap_radius_m = readOr(n, "overlap_radius_m", c.overlap_radius_m);
     c.reg_score_threshold = readOr(n, "reg_score_threshold", c.reg_score_threshold);
+    c.min_loop_submap_gap = readOr(n, "min_loop_submap_gap", c.min_loop_submap_gap);
+    c.enable_traj_aux_factors = readOr(n, "enable_traj_aux_factors", c.enable_traj_aux_factors);
     c.traj_sigma_t = readOr(n, "traj_sigma_t", c.traj_sigma_t);
     c.traj_sigma_r = readOr(n, "traj_sigma_r", c.traj_sigma_r);
     c.aux_gate_abs_trans_m = readOr(n, "aux_gate_abs_trans_m", c.aux_gate_abs_trans_m);
@@ -215,7 +221,10 @@ void loadVisualization(const YAML::Node& root, VisualizationConfig& c) {
     if (!root["visualization"]) return;
     const auto& n = root["visualization"];
     c.gmm_marker_sigma = readOr(n, "gmm_marker_sigma", c.gmm_marker_sigma);
+    c.global_gmm_markers_enable =
+        readOr(n, "global_gmm_markers_enable", c.global_gmm_markers_enable);
     c.global_gmm_publish_period_s = readOr(n, "global_gmm_publish_period_s", c.global_gmm_publish_period_s);
+    c.output_pose_lpf_cutoff_hz = readOr(n, "output_pose_lpf_cutoff_hz", c.output_pose_lpf_cutoff_hz);
     c.map_cloud_publish_hz = readOr(n, "map_cloud_publish_hz", c.map_cloud_publish_hz);
     c.map_cloud_max_chunks = readOr(n, "map_cloud_max_chunks", c.map_cloud_max_chunks);
 }

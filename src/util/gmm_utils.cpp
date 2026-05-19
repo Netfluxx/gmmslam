@@ -5,8 +5,13 @@
 #include <gmm/GMM3.h>
 #include <ros/ros.h>
 #include <algorithm>
+#include <cerrno>
 #include <cmath>
+#include <cstdio>
+#include <cstring>
 #include <limits>
+#include <mutex>
+#include <stdexcept>
 #include <vector>
 
 namespace gmmslam {
@@ -18,6 +23,8 @@ const std::vector<std::array<double, 3>> SUBMAP_COLORS = {
     {0.84, 0.15, 0.16}, {0.58, 0.40, 0.74}, {0.55, 0.34, 0.29},
     {0.89, 0.47, 0.76}, {0.74, 0.74, 0.13}, {0.09, 0.75, 0.81},
     {0.98, 0.60, 0.60}};
+
+std::mutex gmm_file_io_mutex;
 
 // Symmetrize and add Tikhonov regularization so the covariance is safe to
 // Cholesky-factor even when the source GMM produced a near-degenerate one.
@@ -158,6 +165,31 @@ GmmModel filterWellConditioned(const GmmModel& model, double reg) {
     }
 
     return filtered;
+}
+
+Matrix3d covarianceForRegistrationFile(const Matrix3d& cov_in) {
+    Matrix3d cov = 0.5 * (cov_in + cov_in.transpose());
+    if (!cov.allFinite()) {
+        return Matrix3d::Identity() * 1e-3;
+    }
+
+    Eigen::SelfAdjointEigenSolver<Matrix3d> solver(cov);
+    if (solver.info() != Eigen::Success ||
+        !solver.eigenvalues().allFinite() ||
+        !solver.eigenvectors().allFinite()) {
+        return Matrix3d::Identity() * 1e-3;
+    }
+
+    // D2D registration in the external GIRA3D backend explicitly inverts these
+    // matrices. SOGMM can produce very thin components (especially during
+    // turn-in-place / planar views), so floor variances before saving.
+    Vector3d lam = solver.eigenvalues();
+    lam = lam.cwiseMax(1e-4).cwiseMin(25.0);
+    Matrix3d safe = solver.eigenvectors() * lam.asDiagonal() *
+                    solver.eigenvectors().transpose();
+    safe = 0.5 * (safe + safe.transpose());
+    safe.diagonal().array() += 1e-6;
+    return safe;
 }
 
 std::vector<GmmLocalData> precomputeGmmLocalData(const GmmModel& model) {
@@ -419,6 +451,8 @@ void saveGmmToFile(const GmmModel& model, const std::string& filepath) {
     const int K = model.numComponents();
     if (K == 0) return;
 
+    std::lock_guard<std::mutex> io_lk(gmm_file_io_mutex);
+
     gmm_utils::GMM3f gmm;
 
     Eigen::VectorXf weights(K);
@@ -430,15 +464,32 @@ void saveGmmToFile(const GmmModel& model, const std::string& filepath) {
         weights(k) = static_cast<float>(comp.weight);
         means.col(k) = comp.mean.cast<float>();
 
+        const Matrix3d cov_safe = covarianceForRegistrationFile(comp.covariance);
         // Flatten 3x3 covariance column-major into a 9-element vector
-        Eigen::Map<const Eigen::Matrix<double, 9, 1>> cov_flat(comp.covariance.data());
+        Eigen::Map<const Eigen::Matrix<double, 9, 1>> cov_flat(cov_safe.data());
         covs.col(k) = cov_flat.cast<float>();
     }
 
     gmm.setWeights(weights);
     gmm.setMeans(means);
     gmm.setCovs(covs);
-    gmm.save(filepath);
+
+    // GMM3f::save is used from SOGMM worker threads and global-submap pruning.
+    // Serialize it and replace atomically so D2D never reads a half-written file.
+    const std::string tmp_path = filepath + ".tmp.gmm";
+    try {
+        gmm.save(tmp_path);
+        if (std::rename(tmp_path.c_str(), filepath.c_str()) != 0) {
+            const int err = errno;
+            std::remove(tmp_path.c_str());
+            throw std::runtime_error(
+                "rename(" + tmp_path + " -> " + filepath + ") failed: " +
+                std::strerror(err));
+        }
+    } catch (...) {
+        std::remove(tmp_path.c_str());
+        throw;
+    }
 }
 
 const std::vector<std::array<double, 3>>& submapColors() {

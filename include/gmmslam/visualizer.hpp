@@ -47,6 +47,7 @@ public:
                const VisualizationConfig& vis_cfg,
                Publishers publishers);
 
+    Matrix4d filterOutputPose(const Matrix4d& T, const ros::Time& stamp);
     void publishPoseOnly(const Matrix4d& T, const ros::Time& stamp);
 
     /// @param smoother_pose_key Pose graph index `X(k)` for this scan when
@@ -75,6 +76,7 @@ private:
                              int frame_count, const Matrix4d& capture_pose,
                              int smoother_pose_key);
     void maybePublishMapCloud(const ros::Time& header_stamp);
+    void publishGraphNodeMarkers(const ros::Time& stamp, double now_t);
     void publishGlobalGraphMarkers(const ros::Time& stamp, double now_t);
     void publishGmmMarkers(const ros::Time& stamp, const Matrix4d& T);
 
@@ -95,7 +97,9 @@ private:
     std::string odom_frame_;
     std::string base_frame_;
     double gmm_marker_sigma_;
+    bool global_gmm_markers_enable_;
     double global_gmm_publish_period_s_;
+    double output_pose_lpf_cutoff_hz_;
     double map_cloud_publish_period_s_;
     int map_cloud_max_chunks_;
 
@@ -104,10 +108,13 @@ private:
     static constexpr std::size_t kMaxGraphNodeMarkers = 2000;
 
     nav_msgs::Path path_;
+    bool output_pose_filter_initialized_ = false;
+    Matrix4d output_pose_filtered_ = Matrix4d::Identity();
+    ros::Time output_pose_filter_stamp_;
     double global_gmm_markers_last_pub_t_ = 0.0;
+    bool global_gmm_markers_cleared_ = false;
     int last_global_gmm_processed_idx_ = -1;
     std::vector<std::pair<int, std::vector<GmmLocalData>>> global_gmm_cache_;
-    visualization_msgs::MarkerArray graph_node_markers_;
     double graph_nodes_last_pub_t_ = 0.0;
     double global_graph_markers_last_pub_t_ = 0.0;
 

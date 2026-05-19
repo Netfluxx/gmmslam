@@ -86,6 +86,7 @@ public:
     std::map<int, int> submap_anchor_key;
     std::map<int, double> submap_anchor_time_sec;
     std::map<int, int> key_to_submap;
+    std::map<int, Matrix4d> keyframe_pose_by_idx;
     std::map<int, std::vector<int>> submap_keyframes;
     std::map<int, GmmModel> submap_gmm;
     std::map<int, std::string> submap_gmm_path;
@@ -135,6 +136,8 @@ private:
     int submap_keyframes_per_submap_;
     double overlap_radius_m_;
     double submap_reg_score_threshold_;
+    int min_loop_submap_gap_;
+    bool enable_traj_aux_factors_;
     double score_sigma_low_;
     double score_sigma_high_;
 
@@ -143,6 +146,8 @@ private:
     double loop_sigma_r_min_, loop_sigma_r_max_;
     double submap_loop_sigma_t_min_, submap_loop_sigma_t_max_;
     double submap_loop_sigma_r_min_, submap_loop_sigma_r_max_;
+    double keyframe_loop_consistency_trans_m_;
+    double keyframe_loop_consistency_rot_deg_;
     double aux_gate_abs_trans_m_, aux_gate_abs_rot_deg_;
     double aux_gate_consistency_trans_m_, aux_gate_consistency_rot_deg_;
     double traj_aux_gate_abs_trans_m_, traj_aux_gate_abs_rot_deg_;

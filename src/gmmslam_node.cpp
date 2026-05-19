@@ -222,6 +222,10 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
                   cfg_.loop_closure.detect_score_threshold, 1.1);
         pnh.param("loop_closure_super_sigma_t",  cfg_.loop_closure.super_sigma_t, 0.01);
         pnh.param("loop_closure_super_sigma_r",  cfg_.loop_closure.super_sigma_r, 0.01);
+        pnh.param("loop_closure_consistency_gate_trans_m",
+                  cfg_.loop_closure.consistency_gate_trans_m, 2.0);
+        pnh.param("loop_closure_consistency_gate_rot_deg",
+                  cfg_.loop_closure.consistency_gate_rot_deg, 45.0);
 
         pnh.param("solid_enable",             cfg_.solid.enable, true);
         pnh.param("solid_fov_up_deg",         cfg_.solid.fov_up_deg, 30.0);
@@ -266,6 +270,9 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("submap_prior_sigma_r",           cfg_.global_graph.prior_sigma_r, 0.02);
         pnh.param("submap_overlap_radius_m",        cfg_.global_graph.overlap_radius_m, 3.0);
         pnh.param("submap_reg_score_threshold",     cfg_.global_graph.reg_score_threshold, 0.5);
+        pnh.param("submap_min_loop_submap_gap",     cfg_.global_graph.min_loop_submap_gap, 5);
+        pnh.param("submap_enable_traj_aux_factors",
+                  cfg_.global_graph.enable_traj_aux_factors, false);
         pnh.param("submap_traj_sigma_t",            cfg_.global_graph.traj_sigma_t, 0.15);
         pnh.param("submap_traj_sigma_r",            cfg_.global_graph.traj_sigma_r, 0.15);
         pnh.param("submap_aux_gate_abs_trans_m",    cfg_.global_graph.aux_gate_abs_trans_m, 6.0);
@@ -314,7 +321,9 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("imu_bias_prior_sigma",       cfg_.imu.bias_prior_sigma, 0.1);
 
         pnh.param("gmm_marker_sigma",            cfg_.visualization.gmm_marker_sigma, 3.0);
+        pnh.param("global_gmm_markers_enable",   cfg_.visualization.global_gmm_markers_enable, true);
         pnh.param("global_gmm_publish_period_s",  cfg_.visualization.global_gmm_publish_period_s, 1.0);
+        pnh.param("output_pose_lpf_cutoff_hz",   cfg_.visualization.output_pose_lpf_cutoff_hz, 0.0);
         pnh.param("map_cloud_publish_hz",        cfg_.visualization.map_cloud_publish_hz, 0.5);
         pnh.param("map_cloud_max_chunks",        cfg_.visualization.map_cloud_max_chunks, 3000);
 
@@ -1217,8 +1226,9 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         }
 
         // 8. Publish
-        visualizer_->publishPoseOnly(T_pub, stamp);
-        visualizer_->enqueueFrame(stamp, pts, frame_count_, T_pub, smoother_pose_key);
+        const Matrix4d T_vis = visualizer_->filterOutputPose(T_pub, stamp);
+        visualizer_->publishPoseOnly(T_vis, stamp);
+        visualizer_->enqueueFrame(stamp, pts, frame_count_, T_vis, smoother_pose_key);
 
         logBackpressure(stamp);
         ++frame_count_;

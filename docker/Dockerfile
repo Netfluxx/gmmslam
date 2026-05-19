@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl lsb-releas
 # --- Install ROS1 Noetic ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake git wget curl lsb-release \
+    gdb procps \
     python3-pip python3-vcstool \
     python3-rosdep python3-catkin-tools \
     ros-noetic-ros-base ros-noetic-catkin \

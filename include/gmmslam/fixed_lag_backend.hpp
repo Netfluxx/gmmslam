@@ -83,7 +83,8 @@ private:
     gtsam::NonlinearFactorGraph filterStaleFactors(
         const gtsam::NonlinearFactorGraph& factors,
         const gtsam::Values& new_values,
-        double t_latest) const;
+        double t_latest,
+        bool require_active_keys) const;
 
     int pose_history_keep_;
     bool enable_imu_;
@@ -104,11 +105,13 @@ private:
 
     // GTSAM state
     std::unique_ptr<gtsam::IncrementalFixedLagSmoother> fixed_lag_;
+    std::mutex new_data_lock_;
     gtsam::NonlinearFactorGraph new_factors_;
     gtsam::Values new_values_;
     gtsam::FixedLagSmootherKeyTimestampMap new_timestamps_;
     bool initialized_ = false;
     std::set<int> inserted_pose_keys_;
+    std::set<gtsam::Key> active_gtsam_keys_;
 
     // Solve queue
     ThreadSafeQueue<SolveBatch> solve_queue_{16};

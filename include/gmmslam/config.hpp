@@ -85,6 +85,8 @@ struct LoopClosureConfig {
     double detect_score_threshold = 1.1;
     double super_sigma_t = 0.02;
     double super_sigma_r = 0.02;
+    double consistency_gate_trans_m = 2.0;
+    double consistency_gate_rot_deg = 45.0;
 };
 
 // SOLiD (Kim et al. 2024) — spatially organized, lightweight global descriptor
@@ -146,6 +148,8 @@ struct GlobalGraphConfig {
     double prior_sigma_r = 0.02;
     double overlap_radius_m = 3.0;
     double reg_score_threshold = 0.5;
+    int min_loop_submap_gap = 5;
+    bool enable_traj_aux_factors = false;
     double traj_sigma_t = 0.15;
     double traj_sigma_r = 0.15;
     double aux_gate_abs_trans_m = 6.0;
@@ -209,7 +213,10 @@ struct ImuConfig {
 
 struct VisualizationConfig {
     double gmm_marker_sigma = 3.0;
+    bool global_gmm_markers_enable = true;
     double global_gmm_publish_period_s = 1.0;
+    /// First-order low-pass cutoff for published TF/odom/RViz pose. <=0 disables.
+    double output_pose_lpf_cutoff_hz = 0.0;
     /// Accumulated map PointCloud2 publish rate (Hz); period = 1/rate.
     double map_cloud_publish_hz = 0.5;
     /// Max smoother-frame scans retained (oldest dropped when exceeded).

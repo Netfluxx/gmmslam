@@ -21,6 +21,7 @@
 
 #include <ros/ros.h>
 #include <std_msgs/String.h>
+#include <visualization_msgs/MarkerArray.h>
 
 namespace gmmslam {
 
@@ -150,6 +151,8 @@ private:
     ros::Publisher reg_pub_;
     ros::Publisher loop_closure_markers_pub_;
     std::string map_frame_;
+    std::mutex loop_viz_mutex_;
+    visualization_msgs::MarkerArray loop_closure_marker_history_;
 
     // Config
     SogmmConfig sogmm_cfg_;
@@ -169,6 +172,8 @@ private:
     double loop_closure_min_separation_deg_;
     double loop_closure_max_age_s_;
     int loop_closure_gmm_keep_keyframes_;
+    double loop_closure_consistency_gate_trans_m_;
+    double loop_closure_consistency_gate_rot_deg_;
     double score_sigma_low_;
     double score_sigma_high_;
     double seq_sigma_t_min_, seq_sigma_t_max_;

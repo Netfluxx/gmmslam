@@ -6,9 +6,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CATKIN_WS="${CATKIN_WS:-/root/catkin_ws}"
 GIRA_WS="${GIRA_WS:-/root/gira_ws}"
 ROS_DISTRO="${ROS_DISTRO:-noetic}"
+BUILD_TYPE="${BUILD_TYPE:-Release}"
 
 # ─── Source ROS ─────────────────────────────────────────────────────
+set +u
 source "/opt/ros/${ROS_DISTRO}/setup.bash"
+set -u
 
 # ─── GIRA3D runtime library paths (needed by gmmslam_lib at runtime) ─
 GIRA_REG="${GIRA_WS}/gira3d-registration"
@@ -44,14 +47,16 @@ for arg in "$@"; do
 done
 
 if [ "${SKIP_BUILD}" = false ]; then
-    echo "[run_gmmslam_cpp] Building catkin workspace ..."
+    echo "[run_gmmslam_cpp] Building catkin workspace (${BUILD_TYPE}) ..."
     cd "${CATKIN_WS}"
-    catkin_make -DCMAKE_BUILD_TYPE=Release -j"$(nproc)" 2>&1
+    catkin_make -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -j"$(nproc)" 2>&1
     echo "[run_gmmslam_cpp] Build complete."
 fi
 
 # ─── Source the workspace overlay ───────────────────────────────────
+set +u
 source "${CATKIN_WS}/devel/setup.bash"
+set -u
 
 # ─── Optionally launch RViz in the background ──────────────────────
 if [ "${LAUNCH_RVIZ}" = true ]; then

@@ -7,6 +7,8 @@ Designed to run in a separate process/core from gmmslam.py.
 
 import json
 import os
+import threading
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
@@ -37,6 +39,31 @@ except ImportError:
     gmm_d2d_registration_py = None
 
 
+@contextmanager
+def _silence_process_output(enabled: bool):
+    if not enabled:
+        yield
+        return
+
+    sys.stdout.flush()
+    sys.stderr.flush()
+    saved_stdout = os.dup(1)
+    saved_stderr = os.dup(2)
+    null_fd = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(null_fd, 1)
+        os.dup2(null_fd, 2)
+        yield
+    finally:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os.dup2(saved_stdout, 1)
+        os.dup2(saved_stderr, 2)
+        os.close(null_fd)
+        os.close(saved_stdout)
+        os.close(saved_stderr)
+
+
 class D2DRegistrationNode:
     def __init__(self):
         rospy.init_node("d2d_registration_node", anonymous=False)
@@ -48,6 +75,10 @@ class D2DRegistrationNode:
         )
         self.num_workers = max(1, int(rospy.get_param("~num_workers", 2)))
         self.score_threshold = float(rospy.get_param("~score_threshold", -1.0e9))
+        self.suppress_backend_output = bool(
+            rospy.get_param("~suppress_backend_output", True)
+        )
+        self.backend_io_lock = threading.Lock()
 
         self.result_pub = rospy.Publisher(self.result_topic, String, queue_size=50)
         self.executor = ThreadPoolExecutor(max_workers=self.num_workers)
@@ -55,7 +86,9 @@ class D2DRegistrationNode:
             self.request_topic, String, self._request_callback, queue_size=200
         )
         rospy.loginfo(
-            f"[d2d_reg] ready | workers={self.num_workers} | {self.request_topic} -> {self.result_topic}"
+            f"[d2d_reg] ready | workers={self.num_workers} | "
+            f"{self.request_topic} -> {self.result_topic} | "
+            f"suppress_backend_output={self.suppress_backend_output}"
         )
 
     def _request_callback(self, msg: String):
@@ -96,9 +129,17 @@ class D2DRegistrationNode:
 
         try:
             T_init = np.eye(4, dtype=np.float64)
-            result_iso = gmm_d2d_registration_py.isoplanar_registration(
-                T_init, source_path, target_path
-            )
+            if self.suppress_backend_output:
+                # The linked GIRA3D backend prints covariance inversion diagnostics
+                # directly to stdout/stderr. Redirection is process-wide, so guard it.
+                with self.backend_io_lock, _silence_process_output(True):
+                    result_iso = gmm_d2d_registration_py.isoplanar_registration(
+                        T_init, source_path, target_path
+                    )
+            else:
+                result_iso = gmm_d2d_registration_py.isoplanar_registration(
+                    T_init, source_path, target_path
+                )
             T_iso = result_iso[0]
             score_iso = result_iso[1]
             if (
@@ -109,9 +150,15 @@ class D2DRegistrationNode:
             ):
                 T_iso = T_init
 
-            result_aniso = gmm_d2d_registration_py.anisotropic_registration(
-                T_iso, source_path, target_path
-            )
+            if self.suppress_backend_output:
+                with self.backend_io_lock, _silence_process_output(True):
+                    result_aniso = gmm_d2d_registration_py.anisotropic_registration(
+                        T_iso, source_path, target_path
+                    )
+            else:
+                result_aniso = gmm_d2d_registration_py.anisotropic_registration(
+                    T_iso, source_path, target_path
+                )
             T_final = np.array(result_aniso[0], dtype=np.float64)
             score_final = float(result_aniso[1])
             if (

@@ -142,7 +142,8 @@ void FixedLagBackend::resetNewData() {
 gtsam::NonlinearFactorGraph FixedLagBackend::filterStaleFactors(
         const gtsam::NonlinearFactorGraph& factors,
         const gtsam::Values& new_vals,
-        double t_latest) const {
+        double t_latest,
+        bool require_active_keys) const {
 
     std::lock_guard<std::mutex> lk(graph_lock);
     const double t_cutoff = t_latest - fixed_lag_s * 0.85;
@@ -155,9 +156,13 @@ gtsam::NonlinearFactorGraph FixedLagBackend::filterStaleFactors(
         bool stale = false;
         for (const gtsam::Key key : f->keys()) {
             if (new_vals.exists(key)) { continue; }
+            if (require_active_keys && active_gtsam_keys_.count(key) == 0) {
+                stale = true;
+                break;
+            }
             const auto idx = static_cast<int>(Symbol(key).index());
             auto it = key_t_sec.find(idx);
-            if (it != key_t_sec.end() && it->second < t_cutoff) {
+            if (it == key_t_sec.end() || it->second < t_cutoff) {
                 stale = true;
                 break;
             }
@@ -236,6 +241,12 @@ void FixedLagBackend::rebuildSmootherCore(int anchor_idx, const Matrix4d& anchor
     pose = anchor_pose;
     latest_key_idx = anchor_idx;
     inserted_pose_keys_ = {anchor_idx};
+    active_gtsam_keys_.clear();
+    active_gtsam_keys_.insert(key0);
+    if (enable_imu_) {
+        active_gtsam_keys_.insert(keyV(anchor_idx));
+        active_gtsam_keys_.insert(keyB(anchor_idx));
+    }
 
     solve_queue_.clear();
     resetNewData();
@@ -247,20 +258,20 @@ void FixedLagBackend::rebuildSmootherCore(int anchor_idx, const Matrix4d& anchor
 
 void FixedLagBackend::rebuildSmoother(int anchor_idx) {
     Matrix4d anchor_pose = Matrix4d::Identity();
+    double t_sec = 0.0;
     {
+        std::lock_guard<std::mutex> lk(graph_lock);
         auto it = pose_by_idx.find(anchor_idx);
         if (it != pose_by_idx.end()) {
             anchor_pose = it->second;
         } else {
             anchor_pose = pose;
         }
+        auto tit = key_t_sec.find(anchor_idx);
+        t_sec = (tit != key_t_sec.end()) ? tit->second : 0.0;
     }
-    const double t_sec = [&]{
-        auto it = key_t_sec.find(anchor_idx);
-        return (it != key_t_sec.end()) ? it->second : 0.0;
-    }();
 
-    std::lock_guard<std::mutex> lk(graph_lock);
+    std::scoped_lock lk(new_data_lock_, graph_lock);
     rebuildSmootherCore(anchor_idx, anchor_pose, t_sec,
                         "consecutive GTSAM failures", false);
 }
@@ -285,7 +296,7 @@ void FixedLagBackend::applyScheduledReanchorIfNeeded() {
     const double ts = reanchor_t_sec_;
     rk.unlock();
 
-    std::lock_guard<std::mutex> gk(graph_lock);
+    std::scoped_lock gk(new_data_lock_, graph_lock);
     rebuildSmootherCore(aid, T, ts, "GT re-anchor after submap traj divergence",
                         true);
 }
@@ -298,7 +309,7 @@ bool FixedLagBackend::initialize(const Matrix4d& init_pose, const ros::Time& sta
     if (initialized_) return true;
 
     try {
-        std::lock_guard<std::mutex> lk(graph_lock);
+        std::scoped_lock lk(new_data_lock_, graph_lock);
         pose = init_pose;
 
         const gtsam::Key key0 = X(0);
@@ -330,10 +341,14 @@ bool FixedLagBackend::initialize(const Matrix4d& init_pose, const ros::Time& sta
         pose_by_idx[0] = init_pose;
         key_t_sec[0] = t0;
         inserted_pose_keys_ = {0};
+        active_gtsam_keys_.clear();
+        active_gtsam_keys_.insert(key0);
 
         if (enable_imu_) {
             velocity_by_idx[0] = Vector3d::Zero();
             bias_by_idx[0] = Eigen::Matrix<double,6,1>::Zero();
+            active_gtsam_keys_.insert(keyV(0));
+            active_gtsam_keys_.insert(keyB(0));
         }
 
         initialized_ = true;
@@ -359,20 +374,28 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
     }
 
     const double t_sec = stampToSec(stamp);
-    const gtsam::Key key_prev = X(prev_idx);
-    const gtsam::Key key_curr = X(curr_idx);
-    // Use pose_by_idx (updated synchronously at the end of each addFrame), not
-    // inserted_pose_keys_ (updated only after the async backend solve). Otherwise
-    // a fast lidar thread can add X(k+1) before the backend has marked X(k) as
-    // inserted → spurious "missing predecessor", weak IMU links, and GTSAM errors.
+    int factor_prev_idx = prev_idx;
     bool prev_exists = false;
+    Matrix4d fallback_rel = Matrix4d::Identity();
     {
         std::lock_guard<std::mutex> lk(graph_lock);
-        prev_exists = pose_by_idx.count(prev_idx) > 0;
+        prev_exists = pose_by_idx.count(factor_prev_idx) > 0;
+        if (!prev_exists && latest_key_idx >= 0 &&
+            pose_by_idx.count(latest_key_idx) > 0 &&
+            latest_key_idx != curr_idx) {
+            factor_prev_idx = latest_key_idx;
+            prev_exists = true;
+            fallback_rel = pose_by_idx.at(factor_prev_idx).inverse() * predicted_pose;
+        }
     }
 
+    const gtsam::Key key_prev = X(factor_prev_idx);
+    const gtsam::Key key_curr = X(curr_idx);
+
+    std::unique_lock<std::mutex> new_data_lk(new_data_lock_);
+
     // ---- Pose factor ----
-    if (prev_exists && gt_rel_mat != nullptr) {
+    if (prev_exists && factor_prev_idx == prev_idx && gt_rel_mat != nullptr) {
         new_factors_.push_back(
             gtsam::BetweenFactor<Pose3>(key_prev, key_curr,
                                         pose3FromMatrix(*gt_rel_mat),
@@ -380,8 +403,15 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
     } else if (prev_exists) {
         new_factors_.push_back(
             gtsam::BetweenFactor<Pose3>(key_prev, key_curr,
-                                        Pose3::Identity(),
-                                        odom_noise_lost_));
+                                        pose3FromMatrix(fallback_rel),
+                                        factor_prev_idx == prev_idx
+                                            ? odom_noise_lost_
+                                            : odom_noise_lost_));
+        if (factor_prev_idx != prev_idx) {
+            ROS_WARN_THROTTLE(2.0,
+                "[smoother] missing predecessor X(%d); linking X(%d)->X(%d) instead",
+                prev_idx, factor_prev_idx, curr_idx);
+        }
     } else {
         new_factors_.addPrior(key_curr, pose3FromMatrix(predicted_pose), prior_noise_);
         ROS_WARN_THROTTLE(2.0,
@@ -398,14 +428,14 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
 
     // ---- Optional IMU preintegration ----
     if (enable_imu_) {
-        const gtsam::Key kv_prev = keyV(prev_idx);
+        const gtsam::Key kv_prev = keyV(factor_prev_idx);
         const gtsam::Key kv_curr = keyV(curr_idx);
-        const gtsam::Key kb_prev = keyB(prev_idx);
+        const gtsam::Key kb_prev = keyB(factor_prev_idx);
         const gtsam::Key kb_curr = keyB(curr_idx);
 
         {
             std::lock_guard<std::mutex> lk(graph_lock);
-            auto it = bias_by_idx.find(prev_idx);
+            auto it = bias_by_idx.find(factor_prev_idx);
             if (it != bias_by_idx.end()) bias_vec_wb = it->second;
         }
         const ConstantBias prev_bias(bias_vec_wb.head<3>(), bias_vec_wb.tail<3>());
@@ -421,7 +451,8 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
             }
         }
 
-        const bool has_imu_link = prev_exists && (n_imu > 0);
+        const bool has_imu_link =
+            prev_exists && (factor_prev_idx == prev_idx) && (n_imu > 0);
         if (has_imu_link) {
             new_factors_.push_back(
                 gtsam::CombinedImuFactor(key_prev, kv_prev,
@@ -433,18 +464,18 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
         // Velocity initial guess
         const double t_prev = [&]{
             std::lock_guard<std::mutex> lk(graph_lock);
-            auto it = key_t_sec.find(prev_idx);
+            auto it = key_t_sec.find(factor_prev_idx);
             return (it != key_t_sec.end()) ? it->second : (t_sec - 1e-3);
         }();
         const double dt_pose = std::max(1e-3, t_sec - t_prev);
 
         {
             std::lock_guard<std::mutex> lk(graph_lock);
-            auto it = pose_by_idx.find(prev_idx);
+            auto it = pose_by_idx.find(factor_prev_idx);
             if (it != pose_by_idx.end()) {
                 vel_wb = (predicted_pose.block<3,1>(0,3) - it->second.block<3,1>(0,3)) / dt_pose;
             } else {
-                auto vit = velocity_by_idx.find(prev_idx);
+                auto vit = velocity_by_idx.find(factor_prev_idx);
                 if (vit != velocity_by_idx.end()) vel_wb = vit->second;
             }
         }
@@ -466,7 +497,7 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
     }
 
     // Drop stale factors
-    new_factors_ = filterStaleFactors(new_factors_, new_values_, t_sec);
+    new_factors_ = filterStaleFactors(new_factors_, new_values_, t_sec, false);
 
     // Snapshot and enqueue
     SolveBatch batch;
@@ -486,6 +517,7 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
         new_timestamps_ = std::move(batch.timestamps);
         deferred_batches.fetch_add(1, std::memory_order_relaxed);
     }
+    new_data_lk.unlock();
 
     {
         std::lock_guard<std::mutex> lk(graph_lock);
@@ -502,10 +534,12 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
 }
 
 void FixedLagBackend::stageFactor(const gtsam::NonlinearFactor::shared_ptr& factor) {
+    std::lock_guard<std::mutex> lk(new_data_lock_);
     new_factors_.push_back(factor);
 }
 
 bool FixedLagBackend::flushStagedFactors() {
+    std::unique_lock<std::mutex> new_data_lk(new_data_lock_);
     if (new_factors_.empty()) return false;
 
     SolveBatch batch;
@@ -554,6 +588,53 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
         const int curr_idx = batch.curr_idx;
 
         try {
+            double latest_t = -1.0;
+            double batch_t = -1.0;
+            {
+                std::lock_guard<std::mutex> lk(graph_lock);
+                auto lit = key_t_sec.find(latest_key_idx);
+                if (lit != key_t_sec.end()) {
+                    latest_t = lit->second;
+                }
+                auto bit = key_t_sec.find(curr_idx);
+                if (bit != key_t_sec.end()) {
+                    batch_t = bit->second;
+                }
+            }
+            if (!batch.timestamps.empty()) {
+                for (const auto& [key, t] : batch.timestamps) {
+                    (void)key;
+                    batch_t = std::max(batch_t, t);
+                }
+            }
+            if (latest_t >= 0.0 && batch_t >= 0.0 &&
+                (latest_t - batch_t) > fixed_lag_s * 0.75) {
+                // The callback thread has already propagated the live pose.
+                // Feeding old variables into IncrementalFixedLagSmoother after
+                // they are near/immediately beyond the lag boundary can trigger
+                // fragile leaf marginalization paths in GTSAM.
+                ROS_WARN_THROTTLE(
+                    1.0,
+                    "[smoother] dropping stale backend batch X(%d): "
+                    "latest_t - batch_t = %.2fs exceeds %.2fs guard",
+                    curr_idx, latest_t - batch_t, fixed_lag_s * 0.75);
+                continue;
+            }
+            if (latest_t >= 0.0) {
+                // Registration results are produced asynchronously and can sit
+                // behind frame updates. Re-check their keys at solve time so
+                // GTSAM never receives factors for variables it may already
+                // have marginalized from the fixed-lag smoother.
+                batch.factors = filterStaleFactors(batch.factors,
+                                                   batch.values,
+                                                   latest_t,
+                                                   true);
+            }
+
+            if (batch.factors.empty() && batch.values.empty()) {
+                continue;
+            }
+
             fixed_lag_->update(batch.factors, batch.values, batch.timestamps);
             const gtsam::Values estimate = fixed_lag_->calculateEstimate();
 
@@ -578,6 +659,11 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
                     auto it = key_t_sec.find(curr_idx);
                     return (it != key_t_sec.end()) ? it->second : -1.0;
                 }();
+
+                active_gtsam_keys_.clear();
+                for (const gtsam::Key key : estimate.keys()) {
+                    active_gtsam_keys_.insert(key);
+                }
 
                 inserted_pose_keys_.insert(curr_idx);
 

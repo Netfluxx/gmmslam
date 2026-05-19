@@ -13,6 +13,10 @@
 
 namespace gmmslam {
 
+namespace {
+constexpr double kTwoPi = 6.28318530717958647692;
+} // namespace
+
 // =====================================================================
 // Constructor
 // =====================================================================
@@ -30,7 +34,9 @@ Visualizer::Visualizer(FixedLagBackend& smoother,
     , odom_frame_(odom_frame)
     , base_frame_(base_frame)
     , gmm_marker_sigma_(vis_cfg.gmm_marker_sigma)
+    , global_gmm_markers_enable_(vis_cfg.global_gmm_markers_enable)
     , global_gmm_publish_period_s_(vis_cfg.global_gmm_publish_period_s)
+    , output_pose_lpf_cutoff_hz_(vis_cfg.output_pose_lpf_cutoff_hz)
     , map_cloud_publish_period_s_(vis_cfg.map_cloud_publish_hz > 1e-6
                                       ? 1.0 / vis_cfg.map_cloud_publish_hz
                                       : 9999.0)
@@ -38,6 +44,53 @@ Visualizer::Visualizer(FixedLagBackend& smoother,
     , pubs_(std::move(publishers))
 {
     path_.header.frame_id = odom_frame_;
+}
+
+// =====================================================================
+// Output pose low-pass filter
+// =====================================================================
+
+Matrix4d Visualizer::filterOutputPose(const Matrix4d& T,
+                                      const ros::Time& stamp) {
+    if (output_pose_lpf_cutoff_hz_ <= 0.0 || !T.allFinite()) {
+        output_pose_filter_initialized_ = false;
+        return T;
+    }
+
+    if (!output_pose_filter_initialized_ ||
+        output_pose_filter_stamp_.isZero()) {
+        output_pose_filtered_ = T;
+        output_pose_filter_stamp_ = stamp;
+        output_pose_filter_initialized_ = true;
+        return output_pose_filtered_;
+    }
+
+    const double dt = (stamp - output_pose_filter_stamp_).toSec();
+    if (dt <= 0.0 || !std::isfinite(dt)) {
+        output_pose_filtered_ = T;
+        output_pose_filter_stamp_ = stamp;
+        return output_pose_filtered_;
+    }
+
+    const double tau = 1.0 / (kTwoPi * output_pose_lpf_cutoff_hz_);
+    const double alpha = std::clamp(dt / (tau + dt), 0.0, 1.0);
+
+    const Vector3d p_prev = output_pose_filtered_.block<3, 1>(0, 3);
+    const Vector3d p_curr = T.block<3, 1>(0, 3);
+
+    Eigen::Quaterniond q_prev(output_pose_filtered_.block<3, 3>(0, 0));
+    Eigen::Quaterniond q_curr(T.block<3, 3>(0, 0));
+    q_prev.normalize();
+    q_curr.normalize();
+
+    Matrix4d filtered = Matrix4d::Identity();
+    filtered.block<3, 3>(0, 0) =
+        q_prev.slerp(alpha, q_curr).normalized().toRotationMatrix();
+    filtered.block<3, 1>(0, 3) = p_prev + alpha * (p_curr - p_prev);
+
+    output_pose_filtered_ = filtered;
+    output_pose_filter_stamp_ = stamp;
+    return output_pose_filtered_;
 }
 
 // =====================================================================
@@ -141,32 +194,8 @@ void Visualizer::publishScanProducts(const ros::Time& stamp,
 
     const double now_t = stampToSec(stamp);
 
-    // --- Graph node marker (red sphere at keyframe position) ---
-    {
-        visualization_msgs::Marker m;
-        m.header.stamp    = stamp;
-        m.header.frame_id = odom_frame_;
-        m.ns              = "graph_nodes";
-        m.id              = frame_count;
-        m.type            = visualization_msgs::Marker::SPHERE;
-        m.action          = visualization_msgs::Marker::ADD;
-        m.pose.position.x = T(0, 3);
-        m.pose.position.y = T(1, 3);
-        m.pose.position.z = T(2, 3);
-        m.pose.orientation.w = 1.0;
-        m.scale.x = m.scale.y = m.scale.z = 0.08;
-        m.color.r = 1.0;
-        m.color.a = 1.0;
-        if (graph_node_markers_.markers.size() >= kMaxGraphNodeMarkers) {
-            auto& mk = graph_node_markers_.markers;
-            mk.erase(mk.begin(), mk.begin() + static_cast<long>(mk.size() / 4));
-        }
-        graph_node_markers_.markers.push_back(m);
-    }
-    if ((now_t - graph_nodes_last_pub_t_) >= 0.5) {
-        pubs_.graph_nodes.publish(graph_node_markers_);
-        graph_nodes_last_pub_t_ = now_t;
-    }
+    // --- Graph node markers ---
+    publishGraphNodeMarkers(stamp, now_t);
 
     // --- Global submap graph markers ---
     publishGlobalGraphMarkers(stamp, now_t);
@@ -263,6 +292,104 @@ void Visualizer::maybePublishMapCloud(const ros::Time& header_stamp) {
 }
 
 // =====================================================================
+// publishGraphNodeMarkers
+// =====================================================================
+
+void Visualizer::publishGraphNodeMarkers(const ros::Time& stamp,
+                                         double now_t) {
+    if ((now_t - graph_nodes_last_pub_t_) < 0.5) {
+        return;
+    }
+
+    std::map<int, Matrix4d> smoother_poses;
+    {
+        std::lock_guard<std::mutex> lk(smoother_.graph_lock);
+        smoother_poses = smoother_.pose_by_idx;
+    }
+
+    std::map<int, Matrix4d> submap_poses;
+    std::map<int, int> submap_anchor_key;
+    std::map<int, std::vector<int>> submap_keyframes;
+    if (global_graph_ != nullptr && global_graph_->enable) {
+        std::lock_guard<std::recursive_mutex> lk(global_graph_->lock);
+        submap_poses = global_graph_->submap_pose_by_idx;
+        submap_anchor_key = global_graph_->submap_anchor_key;
+        submap_keyframes = global_graph_->submap_keyframes;
+    }
+
+    std::vector<std::pair<int, Matrix4d>> nodes;
+    if (!submap_poses.empty() && !submap_keyframes.empty()) {
+        for (const auto& [sid, keys] : submap_keyframes) {
+            const auto sid_pose_it = submap_poses.find(sid);
+            const auto anchor_it = submap_anchor_key.find(sid);
+            if (sid_pose_it == submap_poses.end() ||
+                anchor_it == submap_anchor_key.end()) {
+                continue;
+            }
+
+            const auto anchor_pose_it = smoother_poses.find(anchor_it->second);
+            if (anchor_pose_it == smoother_poses.end() ||
+                !anchor_pose_it->second.allFinite() ||
+                !sid_pose_it->second.allFinite()) {
+                continue;
+            }
+
+            const Matrix4d T_anchor_inv = anchor_pose_it->second.inverse();
+            for (int key_idx : keys) {
+                const auto key_pose_it = smoother_poses.find(key_idx);
+                if (key_pose_it == smoother_poses.end() ||
+                    !key_pose_it->second.allFinite()) {
+                    continue;
+                }
+                const Matrix4d T_key_in_submap =
+                    T_anchor_inv * key_pose_it->second;
+                nodes.emplace_back(key_idx, sid_pose_it->second * T_key_in_submap);
+            }
+        }
+    } else {
+        nodes.assign(smoother_poses.begin(), smoother_poses.end());
+    }
+
+    if (nodes.size() > kMaxGraphNodeMarkers) {
+        nodes.erase(nodes.begin(),
+                    nodes.end() - static_cast<long>(kMaxGraphNodeMarkers));
+    }
+
+    visualization_msgs::MarkerArray ma;
+
+    visualization_msgs::Marker clear;
+    clear.header.stamp = stamp;
+    clear.header.frame_id = odom_frame_;
+    clear.ns = "graph_nodes";
+    clear.id = 0;
+    clear.action = visualization_msgs::Marker::DELETEALL;
+    ma.markers.push_back(clear);
+
+    int marker_id = 0;
+    for (const auto& [key_idx, T_node] : nodes) {
+        (void)key_idx;
+        visualization_msgs::Marker m;
+        m.header.stamp = stamp;
+        m.header.frame_id = odom_frame_;
+        m.ns = "graph_nodes";
+        m.id = marker_id++;
+        m.type = visualization_msgs::Marker::SPHERE;
+        m.action = visualization_msgs::Marker::ADD;
+        m.pose.position.x = T_node(0, 3);
+        m.pose.position.y = T_node(1, 3);
+        m.pose.position.z = T_node(2, 3);
+        m.pose.orientation.w = 1.0;
+        m.scale.x = m.scale.y = m.scale.z = 0.08;
+        m.color.r = 1.0;
+        m.color.a = 1.0;
+        ma.markers.push_back(m);
+    }
+
+    pubs_.graph_nodes.publish(ma);
+    graph_nodes_last_pub_t_ = now_t;
+}
+
+// =====================================================================
 // publishGlobalGraphMarkers
 // =====================================================================
 
@@ -291,6 +418,11 @@ void Visualizer::publishGlobalGraphMarkers(const ros::Time& stamp,
     }
 
     visualization_msgs::MarkerArray ma;
+    visualization_msgs::Marker clear;
+    clear.header.stamp = stamp;
+    clear.header.frame_id = odom_frame_;
+    clear.action = visualization_msgs::Marker::DELETEALL;
+    ma.markers.push_back(clear);
 
     // Green sphere for each submap
     for (int sid : sids) {
@@ -331,6 +463,7 @@ void Visualizer::publishGlobalGraphMarkers(const ros::Time& stamp,
     loop_marker.color.b         = 1.0;
     loop_marker.color.a         = 0.95;
 
+    int loop_label_id = 0;
     for (const auto& [sid_a, sid_b] : loop_edges) {
         auto ia = submap_poses.find(sid_a);
         auto ib = submap_poses.find(sid_b);
@@ -346,6 +479,26 @@ void Visualizer::publishGlobalGraphMarkers(const ros::Time& stamp,
         p1.z = ib->second(2, 3);
         loop_marker.points.push_back(p0);
         loop_marker.points.push_back(p1);
+
+        visualization_msgs::Marker label;
+        label.header.stamp = stamp;
+        label.header.frame_id = odom_frame_;
+        label.ns = "global_loop_labels";
+        label.id = loop_label_id++;
+        label.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+        label.action = visualization_msgs::Marker::ADD;
+        label.pose.position.x = 0.5 * (p0.x + p1.x);
+        label.pose.position.y = 0.5 * (p0.y + p1.y);
+        label.pose.position.z = 0.5 * (p0.z + p1.z) + 0.35;
+        label.pose.orientation.w = 1.0;
+        label.scale.z = 0.28;
+        label.color.r = 1.0;
+        label.color.g = 0.8;
+        label.color.b = 1.0;
+        label.color.a = 1.0;
+        label.text = "S(" + std::to_string(sid_a) + ")->S(" +
+                     std::to_string(sid_b) + ")";
+        ma.markers.push_back(label);
     }
     if (!loop_marker.points.empty()) {
         ma.markers.push_back(loop_marker);
@@ -391,11 +544,35 @@ void Visualizer::publishGmmMarkers(const ros::Time& stamp,
 
     // --- Global GMM map: per-submap with distinct colors ---
     const double now_t = stampToSec(stamp);
+    if (!global_gmm_markers_enable_) {
+        if (!global_gmm_markers_cleared_) {
+            visualization_msgs::MarkerArray clear_ma;
+            visualization_msgs::Marker clear;
+            clear.header.stamp = stamp;
+            clear.header.frame_id = odom_frame_;
+            clear.ns = "gmm_global";
+            clear.id = 0;
+            clear.action = visualization_msgs::Marker::DELETEALL;
+            clear_ma.markers.push_back(clear);
+            pubs_.gmm_global_markers.publish(clear_ma);
+            global_gmm_markers_cleared_ = true;
+        }
+        return;
+    }
     if ((now_t - global_gmm_markers_last_pub_t_) < global_gmm_publish_period_s_) {
         return;
     }
 
     visualization_msgs::MarkerArray global_ma;
+    // Component counts can shrink after deferred pruning. Clear the previous
+    // latched marker set first, otherwise RViz keeps stale high-ID ellipsoids.
+    visualization_msgs::Marker clear;
+    clear.header.stamp = stamp;
+    clear.header.frame_id = odom_frame_;
+    clear.ns = "gmm_global";
+    clear.id = 0;
+    clear.action = visualization_msgs::Marker::DELETEALL;
+    global_ma.markers.push_back(clear);
     int id_counter = 0;
     int n_submaps_rendered = 0;
 

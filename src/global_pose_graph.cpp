@@ -190,6 +190,8 @@ GlobalPoseGraph::GlobalPoseGraph(
     , submap_keyframes_per_submap_(gg_cfg.submap_keyframes_per_submap)
     , overlap_radius_m_(gg_cfg.overlap_radius_m)
     , submap_reg_score_threshold_(gg_cfg.reg_score_threshold)
+    , min_loop_submap_gap_(std::max(0, gg_cfg.min_loop_submap_gap))
+    , enable_traj_aux_factors_(gg_cfg.enable_traj_aux_factors)
     , score_sigma_low_(reg_cfg.score_sigma_low)
     , score_sigma_high_(reg_cfg.score_sigma_high)
     , loop_sigma_t_min_(reg_cfg.loop_sigma_t_min)
@@ -200,6 +202,8 @@ GlobalPoseGraph::GlobalPoseGraph(
     , submap_loop_sigma_t_max_(gg_cfg.submap_loop_sigma_t_max)
     , submap_loop_sigma_r_min_(gg_cfg.submap_loop_sigma_r_min)
     , submap_loop_sigma_r_max_(gg_cfg.submap_loop_sigma_r_max)
+    , keyframe_loop_consistency_trans_m_(lc_cfg.consistency_gate_trans_m)
+    , keyframe_loop_consistency_rot_deg_(lc_cfg.consistency_gate_rot_deg)
     , aux_gate_abs_trans_m_(gg_cfg.aux_gate_abs_trans_m)
     , aux_gate_abs_rot_deg_(gg_cfg.aux_gate_abs_rot_deg)
     , aux_gate_consistency_trans_m_(gg_cfg.aux_gate_consistency_trans_m)
@@ -261,6 +265,7 @@ void GlobalPoseGraph::updateWithKeyframe(int key_idx, const ros::Time& stamp,
 
     {
         std::lock_guard<std::recursive_mutex> lk(lock);
+        keyframe_pose_by_idx[key_idx] = T_curr;
         if (last_submap_idx_ >= 0) {
             submap_keyframes[last_submap_idx_].push_back(key_idx);
             key_to_submap[key_idx] = last_submap_idx_;
@@ -288,14 +293,16 @@ void GlobalPoseGraph::updateWithKeyframe(int key_idx, const ros::Time& stamp,
         new_factors_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             X(last_submap_idx_), key_sid, toPose3(rel), between_noise_);
 
-        addTransitionAuxFactors(
-            last_submap_idx_, sid, rel,
-            submap_anchor_key.count(last_submap_idx_)
-                ? submap_anchor_key.at(last_submap_idx_) : -1,
-            key_idx,
-            submap_anchor_time_sec.count(last_submap_idx_)
-                ? submap_anchor_time_sec.at(last_submap_idx_) : 0.0,
-            t_sec);
+        if (enable_traj_aux_factors_) {
+            addTransitionAuxFactors(
+                last_submap_idx_, sid, rel,
+                submap_anchor_key.count(last_submap_idx_)
+                    ? submap_anchor_key.at(last_submap_idx_) : -1,
+                key_idx,
+                submap_anchor_time_sec.count(last_submap_idx_)
+                    ? submap_anchor_time_sec.at(last_submap_idx_) : 0.0,
+                t_sec);
+        }
     }
 
     submap_ids.push_back(sid);
@@ -591,6 +598,7 @@ void GlobalPoseGraph::requestOverlapRegistrations(int sid_new,
     for (int sid_old : submap_ids) {
         if (sid_old >= sid_new) continue;
         if (sid_old == sid_new - 1) continue;
+        if ((sid_new - sid_old) < min_loop_submap_gap_) continue;
 
         const auto edge = std::make_pair(std::min(sid_old, sid_new),
                                          std::max(sid_old, sid_new));
@@ -934,9 +942,18 @@ void GlobalPoseGraph::handleSubmapRegistrationResult(
             return;
         }
 
+        const int submap_gap = std::abs(sid_curr - sid_prev);
+        if (submap_gap < min_loop_submap_gap_) {
+            ROS_INFO("[global_graph] submap reg S(%d)->S(%d) rejected "
+                     "(submap gap %d < min_loop_submap_gap %d)",
+                     sid_prev, sid_curr, submap_gap, min_loop_submap_gap_);
+            return;
+        }
+
         if (loop_edges_added.count(edge)) {
-            ROS_DEBUG("[global_graph] submap edge S(%d)<->S(%d) "
-                      "already exists, skipping", sid_prev, sid_curr);
+            ROS_INFO("[global_graph] submap reg S(%d)->S(%d) rejected "
+                     "(edge already exists)",
+                     sid_prev, sid_curr);
             return;
         }
 
@@ -1009,28 +1026,73 @@ void GlobalPoseGraph::addLoopFactor(
 
         const auto it_prev = key_to_submap.find(prev_key_idx);
         const auto it_curr = key_to_submap.find(curr_key_idx);
-        if (it_prev == key_to_submap.end() || it_curr == key_to_submap.end()) return;
+        if (it_prev == key_to_submap.end() || it_curr == key_to_submap.end()) {
+            ROS_INFO("[global_graph] keyframe loop X(%d)->X(%d) rejected "
+                     "(missing key_to_submap: prev=%s curr=%s)",
+                     prev_key_idx, curr_key_idx,
+                     it_prev == key_to_submap.end() ? "missing" : "ok",
+                     it_curr == key_to_submap.end() ? "missing" : "ok");
+            return;
+        }
 
         sid_prev = it_prev->second;
         sid_curr = it_curr->second;
-        if (sid_prev == sid_curr) return;
+        if (sid_prev == sid_curr) {
+            ROS_INFO("[global_graph] keyframe loop X(%d)->X(%d) rejected "
+                     "(same submap S(%d))",
+                     prev_key_idx, curr_key_idx, sid_prev);
+            return;
+        }
+
+        const int submap_gap = std::abs(sid_curr - sid_prev);
+        if (submap_gap < min_loop_submap_gap_) {
+            ROS_INFO("[global_graph] keyframe loop X(%d)->X(%d) rejected "
+                     "(submap gap S(%d)->S(%d) is %d < min_loop_submap_gap %d)",
+                     prev_key_idx, curr_key_idx, sid_prev, sid_curr,
+                     submap_gap, min_loop_submap_gap_);
+            return;
+        }
 
         const auto edge = std::make_pair(std::min(sid_prev, sid_curr),
                                          std::max(sid_prev, sid_curr));
-        if (loop_edges_added.count(edge)) return;
+        if (loop_edges_added.count(edge)) {
+            ROS_INFO("[global_graph] keyframe loop X(%d)->X(%d) rejected "
+                     "(submap edge S(%d)<->S(%d) already exists)",
+                     prev_key_idx, curr_key_idx, edge.first, edge.second);
+            return;
+        }
 
         Matrix4d T_rel_sub = T_prev_to_curr;
 
         const auto pkp = pose_by_idx.find(prev_key_idx);
         const auto pkc = pose_by_idx.find(curr_key_idx);
+        const auto gkp = keyframe_pose_by_idx.find(prev_key_idx);
+        const auto gkc = keyframe_pose_by_idx.find(curr_key_idx);
         const auto psp = submap_pose_by_idx.find(sid_prev);
         const auto psc = submap_pose_by_idx.find(sid_curr);
 
-        if (pkp != pose_by_idx.end() && pkc != pose_by_idx.end() &&
+        const Matrix4d* T_w_prev_key = nullptr;
+        const Matrix4d* T_w_curr_key = nullptr;
+        if (pkp != pose_by_idx.end()) {
+            T_w_prev_key = &pkp->second;
+        } else if (gkp != keyframe_pose_by_idx.end()) {
+            T_w_prev_key = &gkp->second;
+        }
+        if (pkc != pose_by_idx.end()) {
+            T_w_curr_key = &pkc->second;
+        } else if (gkc != keyframe_pose_by_idx.end()) {
+            T_w_curr_key = &gkc->second;
+        }
+
+        if (T_w_prev_key != nullptr && T_w_curr_key != nullptr &&
             psp != submap_pose_by_idx.end() && psc != submap_pose_by_idx.end()) {
-            const Matrix4d T_sp_kp = psp->second.inverse() * pkp->second;
-            const Matrix4d T_kc_sc = pkc->second.inverse() * psc->second;
+            const Matrix4d T_sp_kp = psp->second.inverse() * *T_w_prev_key;
+            const Matrix4d T_kc_sc = T_w_curr_key->inverse() * psc->second;
             T_rel_sub = T_sp_kp * T_prev_to_curr * T_kc_sc;
+        } else {
+            ROS_WARN("[global_graph] keyframe loop X(%d)->X(%d): missing "
+                     "keyframe/submap pose context, using raw relative transform",
+                     prev_key_idx, curr_key_idx);
         }
 
         if (!T_rel_sub.allFinite()) {
@@ -1039,11 +1101,37 @@ void GlobalPoseGraph::addLoopFactor(
             return;
         }
 
+        if (psp != submap_pose_by_idx.end() && psc != submap_pose_by_idx.end()) {
+            const Matrix4d T_ref_rel = psp->second.inverse() * psc->second;
+            const Matrix4d T_err = T_ref_rel.inverse() * T_rel_sub;
+            const double trans_err = T_err.block<3, 1>(0, 3).norm();
+            const double rot_err_deg = rotAngleDeg(T_err.block<3, 3>(0, 0));
+            if ((keyframe_loop_consistency_trans_m_ > 0.0 &&
+                 trans_err > keyframe_loop_consistency_trans_m_) ||
+                (keyframe_loop_consistency_rot_deg_ > 0.0 &&
+                 rot_err_deg > keyframe_loop_consistency_rot_deg_)) {
+                ROS_WARN("[global_graph] rejected keyframe_loop submap factor "
+                         "(consistency trans %.3fm rot %.2fdeg > %.3fm %.2fdeg)",
+                         trans_err, rot_err_deg,
+                         keyframe_loop_consistency_trans_m_,
+                         keyframe_loop_consistency_rot_deg_);
+                ROS_INFO("[global_graph] keyframe loop X(%d)->X(%d) "
+                         "rejected (aux gate vs submap poses)",
+                         prev_key_idx, curr_key_idx);
+                return;
+            }
+        } else {
+            ROS_INFO("[global_graph] keyframe loop X(%d)->X(%d) "
+                     "rejected (missing submap pose context)",
+                     prev_key_idx, curr_key_idx);
+            return;
+        }
+
         const double use_score = (score < 0.0) ? submap_reg_score_threshold_ : score;
         const auto [noise, sigma_t, sigma_r] = noiseFromScore(
             use_score,
-            loop_sigma_t_min_, loop_sigma_t_max_,
-            loop_sigma_r_min_, loop_sigma_r_max_);
+            submap_loop_sigma_t_min_, submap_loop_sigma_t_max_,
+            submap_loop_sigma_r_min_, submap_loop_sigma_r_max_);
 
         new_factors_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             X(sid_prev), X(sid_curr), toPose3(T_rel_sub), noise);
