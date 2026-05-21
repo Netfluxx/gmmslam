@@ -16,6 +16,8 @@ High-level data flow:
 6. **Global pose graph** — Submaps are anchored on the smoother; when a submap closes, its keyframe GMMs are merged in the submap frame, optionally **pruned** (R-tree candidate search, Bhattacharyya gate, then keeping the Gaussian with lower associated pose uncertainty), saved to disk, and used for overlap-based submap registration. **iSAM2** refines submap poses when new between / loop factors arrive.
 7. **Visualization** — RViz markers for trajectory, latest GMM, **global per-submap GMM map**, submap graph, and loop-closure debug markers.
 
+<img width="2445" height="1418" alt="image(1)" src="https://github.com/user-attachments/assets/00e01e80-a79f-4379-97a0-99e9175d9f6b" />
+
 
 <img width="1817" height="1289" alt="Screenshot from 2026-05-12 16-45-49" src="https://github.com/user-attachments/assets/1f8a086c-b764-4b56-8edc-c76e757a6f80" />
 
