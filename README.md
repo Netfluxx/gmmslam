@@ -13,7 +13,7 @@ High-level data flow:
 3. **Local odometry / smoothing** — A fixed-lag factor graph (`FixedLagBackend`) integrates relative motion (e.g. noisy GT–based odometry) at a high rate and keeps a sliding window of poses and keyframes.
 4. **Keyframe GMM fitting** — On selected keyframes, a **self-organizing GMM (SOGMM)** is fit asynchronously (GPU path where available) and stored per keyframe for registration and map building.
 5. **Registration** — Sequential and loop-closure requests use **SOLiD**-style descriptors for candidates where configured, and **D2D GMM registration** to estimate relative transforms and scores for factors.
-6. **Global pose graph** — Submaps are anchored on the smoother; when a submap closes, its keyframe GMMs are merged in the submap frame, optionally **pruned** (R-tree candidate search, Bhattacharyya gate, then keeping the Gaussian with lower associated pose uncertainty), saved to disk, and used for overlap-based submap registration. **iSAM2** refines submap poses when new between / loop factors arrive.
+6. **Global pose graph** — Submaps are anchored on the smoother; when a submap closes, its keyframe GMMs are merged in the submap frame, pruned (R-tree candidate search, Bhattacharyya gate, then keeping the Gaussian with lower associated pose uncertainty), saved to disk, and used for overlap-based submap registration. **iSAM2** refines submap poses when new between / loop factors arrive.
 7. **Visualization** — RViz markers for trajectory, latest GMM, **global per-submap GMM map**, submap graph, and loop-closure debug markers.
 
 <img width="2445" height="1418" alt="image(1)" src="https://github.com/user-attachments/assets/00e01e80-a79f-4379-97a0-99e9175d9f6b" />
