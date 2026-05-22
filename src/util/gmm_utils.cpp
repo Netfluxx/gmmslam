@@ -49,6 +49,57 @@ GmmComponent keepLowerUncertainty(const GmmComponent& a,
     return kept;
 }
 
+GmmComponent keepOlderMeasurement(const GmmComponent& a,
+                                  const GmmComponent& b) {
+    const double total_weight = a.weight + b.weight;
+    const bool a_known = a.source_key_idx >= 0;
+    const bool b_known = b.source_key_idx >= 0;
+
+    bool keep_a = true;
+    if (a_known && b_known && a.source_key_idx != b.source_key_idx) {
+        keep_a = a.source_key_idx < b.source_key_idx;
+    } else {
+        keep_a = (a.pose_uncertainty < b.pose_uncertainty) ||
+                 (a.pose_uncertainty == b.pose_uncertainty &&
+                  a.source_key_idx <= b.source_key_idx);
+    }
+
+    GmmComponent kept = keep_a ? a : b;
+    if (total_weight > 0.0) {
+        kept.weight = total_weight;
+    }
+    return kept;
+}
+
+bool sameKnownSourceFrame(const GmmComponent& a, const GmmComponent& b) {
+    return a.source_key_idx >= 0 &&
+           b.source_key_idx >= 0 &&
+           a.source_key_idx == b.source_key_idx;
+}
+
+void logFramePruneMerge(const GmmComponent& a,
+                        const GmmComponent& b,
+                        const GmmComponent& kept,
+                        double d_b,
+                        int pass,
+                        std::size_t i,
+                        std::size_t j) {
+    (void)a;
+    (void)b;
+    (void)kept;
+    (void)d_b;
+    (void)pass;
+    (void)i;
+    (void)j;
+    // Per-pair frame-to-frame prune logs are too noisy for normal runs.
+    // ROS_INFO("[gmm_utils] frame-to-frame prune pass=%d pair=(%zu,%zu) "
+    //          "D_B=%.4f dist=%.3fm keep_frame=X(%d) drop_newer_frame=X(%d) "
+    //          "weights=(%.4f, %.4f)->%.4f",
+    //          pass + 1, i, j, d_b, delta.norm(),
+    //          kept.source_key_idx, dropped.source_key_idx,
+    //          a.weight, b.weight, kept.weight);
+}
+
 // Axis-aligned box that contains the Mahalanobis ellipsoid
 // { x : (x-μ)ᵀ Σ⁻¹ (x-μ) ≤ χ² } by bounding it in the principal frame.
 void componentToWorldAabb(
@@ -181,10 +232,14 @@ Matrix3d covarianceForRegistrationFile(const Matrix3d& cov_in) {
     }
 
     // D2D registration in the external GIRA3D backend explicitly inverts these
-    // matrices. SOGMM can produce very thin components (especially during
-    // turn-in-place / planar views), so floor variances before saving.
+    // matrices and becomes unstable with very thin / high-condition covariances
+    // (inverse entries around 1e4 show up as "Matrix not invertible" NaNs).
+    // Save a gentler registration copy than the visualization/map covariance.
     Vector3d lam = solver.eigenvalues();
-    lam = lam.cwiseMax(1e-4).cwiseMin(25.0);
+    lam = lam.cwiseMax(1e-2).cwiseMin(9.0);
+    const double min_lam = lam.minCoeff();
+    const double max_allowed = std::max(min_lam * 50.0, min_lam);
+    lam = lam.cwiseMin(max_allowed);
     Matrix3d safe = solver.eigenvectors() * lam.asDiagonal() *
                     solver.eigenvectors().transpose();
     safe = 0.5 * (safe + safe.transpose());
@@ -270,7 +325,10 @@ GmmModel mergeGmmsConcatenate(
     return merged;
 }
 
-GmmModel pruneSimilarComponents(const GmmModel& in, const MapConfig& map_cfg) {
+GmmModel pruneSimilarComponentsImpl(const GmmModel& in, const MapConfig& map_cfg,
+                                    bool only_between_source_frames,
+                                    bool prefer_older_measurement,
+                                    const char* log_label) {
     if (!map_cfg.prune_enable || in.components.size() < 2) {
         return in;
     }
@@ -336,6 +394,10 @@ GmmModel pruneSimilarComponents(const GmmModel& in, const MapConfig& map_cfg) {
                         if (absorbed[sj]) {
                             continue;
                         }
+                        if (only_between_source_frames &&
+                            sameKnownSourceFrame(base, comps[sj])) {
+                            continue;
+                        }
                         const double d_b = bhattacharyyaDistance(
                             base.mean, base.covariance,
                             comps[sj].mean, comps[sj].covariance,
@@ -344,7 +406,14 @@ GmmModel pruneSimilarComponents(const GmmModel& in, const MapConfig& map_cfg) {
                             continue;
                         }
                         if (d_b < map_cfg.prune_bhatt_threshold) {
-                            base = keepLowerUncertainty(base, comps[sj]);
+                            GmmComponent kept = prefer_older_measurement
+                                                ? keepOlderMeasurement(base, comps[sj])
+                                                : keepLowerUncertainty(base, comps[sj]);
+                            if (prefer_older_measurement) {
+                                logFramePruneMerge(base, comps[sj], kept,
+                                                   d_b, pass, i, sj);
+                            }
+                            base = std::move(kept);
                             absorbed[sj] = true;
                             ++merges_this_pass;
                             merged_one = true;
@@ -360,6 +429,10 @@ GmmModel pruneSimilarComponents(const GmmModel& in, const MapConfig& map_cfg) {
                     if (absorbed[j]) {
                         continue;
                     }
+                    if (only_between_source_frames &&
+                        sameKnownSourceFrame(base, comps[j])) {
+                        continue;
+                    }
                     const Vector3d delta = base.mean - comps[j].mean;
                     if (delta.squaredNorm() > radius_sq) {
                         continue;
@@ -373,7 +446,14 @@ GmmModel pruneSimilarComponents(const GmmModel& in, const MapConfig& map_cfg) {
                         continue;
                     }
                     if (d_b < map_cfg.prune_bhatt_threshold) {
-                        base = keepLowerUncertainty(base, comps[j]);
+                        GmmComponent kept = prefer_older_measurement
+                                            ? keepOlderMeasurement(base, comps[j])
+                                            : keepLowerUncertainty(base, comps[j]);
+                        if (prefer_older_measurement) {
+                            logFramePruneMerge(base, comps[j], kept,
+                                               d_b, pass, i, j);
+                        }
+                        base = std::move(kept);
                         absorbed[j] = true;
                         ++merges_this_pass;
                     }
@@ -410,15 +490,38 @@ GmmModel pruneSimilarComponents(const GmmModel& in, const MapConfig& map_cfg) {
     out.components = std::move(comps);
     const int components_after = out.numComponents();
     const int removed = components_before - components_after;
-    ROS_INFO("[gmm_utils] GMM prune summary: %d -> %d component(s) "
+    ROS_INFO("[gmm_utils] %s prune summary: %d -> %d component(s) "
              "(%d removed), %zu merge(s) in %d pass(es), "
-             "D_B < %.4f, rtree=%s, chi_sq=%.2f, margin_m=%.3f",
-             components_before, components_after, removed,
+             "D_B < %.4f, rtree=%s, chi_sq=%.2f, margin_m=%.3f, "
+             "between_frames=%s, prefer_older=%s",
+             log_label, components_before, components_after, removed,
              total_merges, passes_run,
              map_cfg.prune_bhatt_threshold,
              map_cfg.prune_use_rtree ? "on" : "off",
-             chi_sq, margin_m);
+             chi_sq, margin_m,
+             only_between_source_frames ? "true" : "false",
+             prefer_older_measurement ? "true" : "false");
     return out;
+}
+
+GmmModel pruneSimilarComponents(const GmmModel& in, const MapConfig& map_cfg) {
+    return pruneSimilarComponentsImpl(
+        in, map_cfg,
+        false, false,
+        "GMM");
+}
+
+GmmModel pruneNewerFrameComponents(const GmmModel& in,
+                                   const MapConfig& map_cfg) {
+    if (!map_cfg.prune_frame_to_frame_enable) {
+        ROS_INFO("[gmm_utils] frame-to-frame GMM prune disabled; keeping %d component(s)",
+                 in.numComponents());
+        return in;
+    }
+    return pruneSimilarComponentsImpl(
+        in, map_cfg,
+        true, true,
+        "frame-to-frame GMM");
 }
 
 GmmModel mergeGmmsAndPrune(
@@ -444,11 +547,26 @@ GmmModel mergeGmmsAndPrune(
     if (!map_cfg.prune_enable) {
         return concatenated;
     }
-    return pruneSimilarComponents(concatenated, map_cfg);
+    return pruneNewerFrameComponents(concatenated, map_cfg);
 }
 
 void saveGmmToFile(const GmmModel& model, const std::string& filepath) {
-    const int K = model.numComponents();
+    std::vector<const GmmComponent*> components;
+    components.reserve(model.components.size());
+    for (const auto& comp : model.components) {
+        if (!comp.mean.allFinite() || !comp.covariance.allFinite() ||
+            !std::isfinite(comp.weight) || comp.weight <= 0.0) {
+            continue;
+        }
+        // Far-fill depth support is useful for RViz/map coverage, but extreme
+        // oblique components destabilize the GIRA D2D backend covariance inversions.
+        if (comp.mean.norm() > 60.0) {
+            continue;
+        }
+        components.push_back(&comp);
+    }
+
+    const int K = static_cast<int>(components.size());
     if (K == 0) return;
 
     std::lock_guard<std::mutex> io_lk(gmm_file_io_mutex);
@@ -460,7 +578,7 @@ void saveGmmToFile(const GmmModel& model, const std::string& filepath) {
     Eigen::Matrix<float, 9, Eigen::Dynamic> covs(9, K);
 
     for (int k = 0; k < K; ++k) {
-        const auto& comp = model.components[static_cast<size_t>(k)];
+        const auto& comp = *components[static_cast<size_t>(k)];
         weights(k) = static_cast<float>(comp.weight);
         means.col(k) = comp.mean.cast<float>();
 

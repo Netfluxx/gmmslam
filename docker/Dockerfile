@@ -51,10 +51,12 @@ RUN /bin/bash -c "source /opt/ros/${ROS_DISTRO}/setup.bash && catkin_make"
 # --- GIRA3D system dependencies ---
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.8 python3.8-venv python3.8-dev \
-    libboost-all-dev libblas-dev \
+    libboost-all-dev libblas-dev liblapack-dev \
+    libdlib-dev \
     libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev \
     libxext-dev libx11-dev libgl1-mesa-dev \
-    libc++-dev libc++abi-dev && \
+    libc++-dev libc++abi-dev \
+    libfmt-dev libjsoncpp-dev && \
     rm -rf /var/lib/apt/lists/*
 
 # --- Update SSL certs (needed for GitHub downloads during Open3D build) ---
@@ -74,6 +76,18 @@ RUN git clone --branch 3.4.0 https://gitlab.com/libeigen/eigen.git /tmp/eigen &&
     mkdir /tmp/eigen/build && cd /tmp/eigen/build && \
     cmake .. && make install && ldconfig && \
     rm -rf /tmp/eigen
+
+# --- GMMap: optional fast local GMM fitting backend for gmmslam ---
+ENV GMMAP_SOURCE_DIR=/opt/GMMap
+ENV GMMAP_BUILD_DIR=/opt/GMMap/build
+ENV LD_LIBRARY_PATH=${GMMAP_BUILD_DIR}:${LD_LIBRARY_PATH}
+RUN git clone --recursive --depth 1 https://github.com/mit-lean/GMMap.git ${GMMAP_SOURCE_DIR} && \
+    cmake -S ${GMMAP_SOURCE_DIR} -B ${GMMAP_BUILD_DIR} \
+      -DGMMAP_BUILD_CUDA=OFF \
+      -DGMMAP_BUILD_EXAMPLES=OFF \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON && \
+    cmake --build ${GMMAP_BUILD_DIR} -j$(nproc)
 
 # --- GIRA3D Registration ---
 WORKDIR ${GIRA_WS}

@@ -7,6 +7,23 @@ CATKIN_WS="${CATKIN_WS:-/root/catkin_ws}"
 GIRA_WS="${GIRA_WS:-/root/gira_ws}"
 ROS_DISTRO="${ROS_DISTRO:-noetic}"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
+GMMSLAM_USE_GMMAP="${GMMSLAM_USE_GMMAP:-ON}"
+
+# If launched from the host, enter the project Docker container first.  The
+# container bind-mounts this repo at /root/catkin_ws/src/gmmslam; running on the
+# host would otherwise try to write into /root/catkin_ws and fail.
+if [[ "${GMMSLAM_CPP_IN_CONTAINER:-0}" != "1" && ! -f /.dockerenv ]]; then
+    DOCKER_RUN="${SCRIPT_DIR}/docker/run.sh"
+    CONTAINER_SCRIPT="/root/catkin_ws/src/gmmslam/run_gmmslam_cpp.sh"
+    if [[ -x "${DOCKER_RUN}" ]]; then
+        echo "[run_gmmslam_cpp] Entering Docker container ..."
+        exec env GMMSLAM_CPP_IN_CONTAINER=1 \
+            ROS_DISTRO="${ROS_DISTRO}" \
+            BUILD_TYPE="${BUILD_TYPE}" \
+            GMMSLAM_USE_GMMAP="${GMMSLAM_USE_GMMAP}" \
+            "${DOCKER_RUN}" -- "${CONTAINER_SCRIPT}" "$@"
+    fi
+fi
 
 # ─── Source ROS ─────────────────────────────────────────────────────
 set +u
@@ -49,7 +66,9 @@ done
 if [ "${SKIP_BUILD}" = false ]; then
     echo "[run_gmmslam_cpp] Building catkin workspace (${BUILD_TYPE}) ..."
     cd "${CATKIN_WS}"
-    catkin_make -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -j"$(nproc)" 2>&1
+    catkin_make -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" \
+        -DGMMSLAM_USE_GMMAP="${GMMSLAM_USE_GMMAP}" \
+        -j"$(nproc)" 2>&1
     echo "[run_gmmslam_cpp] Build complete."
 fi
 

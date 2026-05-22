@@ -40,6 +40,40 @@ endif()
 message(STATUS "System Eigen (for SOGMM): ${EIGEN3_INCLUDE_DIR}")
 find_package(yaml-cpp REQUIRED)
 
+option(GMMSLAM_USE_GMMAP "Enable optional GMMap fitting backend" OFF)
+if(GMMSLAM_USE_GMMAP)
+  find_package(OpenMP REQUIRED)
+  find_package(fmt REQUIRED)
+  find_path(GMMAP_INCLUDE_DIR
+    NAMES gmm_map/map.h
+    HINTS ENV GMMAP_ROOT ENV GMMAP_SOURCE_DIR
+    PATH_SUFFIXES include)
+  find_library(GMMAP_LIBRARY
+    NAMES gmm_map
+    HINTS ENV GMMAP_ROOT ENV GMMAP_BUILD_DIR
+    PATH_SUFFIXES lib build .)
+  find_path(GMMAP_RTREE_INCLUDE_DIR
+    NAMES RTree/RTree.h
+    HINTS ENV GMMAP_ROOT ENV GMMAP_SOURCE_DIR
+    PATH_SUFFIXES libs/rtree/include)
+  find_path(GMMAP_NIGH_INCLUDE_DIR
+    NAMES nigh/lp_space.hpp
+    HINTS ENV GMMAP_ROOT ENV GMMAP_SOURCE_DIR
+    PATH_SUFFIXES libs/nigh/src)
+  if(NOT GMMAP_INCLUDE_DIR OR NOT GMMAP_LIBRARY OR NOT GMMAP_RTREE_INCLUDE_DIR)
+    message(FATAL_ERROR
+      "GMMSLAM_USE_GMMAP=ON but GMMap was not found completely. Set "
+      "GMMAP_SOURCE_DIR=/opt/GMMap and GMMAP_BUILD_DIR=/opt/GMMap/build, "
+      "or leave GMMSLAM_USE_GMMAP=OFF.")
+  endif()
+  message(STATUS "GMMap include: ${GMMAP_INCLUDE_DIR}")
+  message(STATUS "GMMap RTree include: ${GMMAP_RTREE_INCLUDE_DIR}")
+  if(GMMAP_NIGH_INCLUDE_DIR)
+    message(STATUS "GMMap nigh include: ${GMMAP_NIGH_INCLUDE_DIR}")
+  endif()
+  message(STATUS "GMMap library: ${GMMAP_LIBRARY}")
+endif()
+
 # --- nlohmann/json (header-only) ------------------------------------------
 find_package(nlohmann_json QUIET)
 if(NOT nlohmann_json_FOUND)
@@ -70,7 +104,6 @@ list(APPEND CMAKE_PREFIX_PATH
 )
 find_package(self_organizing_gmm REQUIRED)
 find_package(gmm REQUIRED)
-find_package(gmm_d2d_registration REQUIRED)
 find_package(dlib REQUIRED)
 
 # Resolve per-package include dirs: colcon may expose them via
@@ -89,11 +122,9 @@ endmacro()
 
 gira3d_include_dir(self_organizing_gmm ${GIRA3D_REC_INSTALL} SOGMM_INCLUDE_DIR)
 gira3d_include_dir(gmm                 ${GIRA3D_REG_INSTALL} GMM_INCLUDE_DIR)
-gira3d_include_dir(gmm_d2d_registration ${GIRA3D_REG_INSTALL} GMM_D2D_INCLUDE_DIR)
 
 message(STATUS "self_organizing_gmm include: ${SOGMM_INCLUDE_DIR}")
 message(STATUS "gmm include:                 ${GMM_INCLUDE_DIR}")
-message(STATUS "gmm_d2d_registration include: ${GMM_D2D_INCLUDE_DIR}")
 
 # ===========================================================================
 # Catkin
@@ -129,6 +160,7 @@ add_library(gmmslam_lib SHARED
   src/util/gmm_utils.cpp
   src/d2d_registration.cpp
   src/fixed_lag_backend.cpp
+  src/gmmap_fitting.cpp
   src/global_pose_graph.cpp
   src/registration_manager.cpp
   src/solid.cpp
@@ -142,9 +174,16 @@ target_include_directories(gmmslam_lib PUBLIC
   ${GTSAM_ALL_INCLUDE_DIRS}    # GTSAM + bundled Eigen 3.3 — MUST precede catkin
   ${catkin_INCLUDE_DIRS}
   ${GMM_INCLUDE_DIR}
-  ${GMM_D2D_INCLUDE_DIR}
   ${NANOFLANN_INCLUDE_DIR}
 )
+if(GMMSLAM_USE_GMMAP)
+  target_include_directories(gmmslam_lib PRIVATE
+    ${GMMAP_INCLUDE_DIR}
+    ${GMMAP_RTREE_INCLUDE_DIR}
+    ${GMMAP_NIGH_INCLUDE_DIR}
+  )
+  target_compile_definitions(gmmslam_lib PRIVATE GMMSLAM_HAS_GMMAP=1)
+endif()
 # util/rtree.h (header-only), included from gmm_utils.cpp only
 target_include_directories(gmmslam_lib PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -158,6 +197,13 @@ target_link_libraries(gmmslam_lib
   dlib::dlib
   nlohmann_json::nlohmann_json
 )
+if(GMMSLAM_USE_GMMAP)
+  target_link_libraries(gmmslam_lib
+    ${GMMAP_LIBRARY}
+    OpenMP::OpenMP_CXX
+    fmt::fmt
+  )
+endif()
 
 # ===========================================================================
 # Executables

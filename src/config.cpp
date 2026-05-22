@@ -46,6 +46,117 @@ void loadSogmm(const YAML::Node& root, SogmmConfig& c) {
     c.max_points = readOr(n, "max_points", c.max_points);
     c.n_components = readOr(n, "n_components", c.n_components);
     c.compute = readOr<std::string>(n, "compute", c.compute);
+    c.backend = readOr<std::string>(n, "backend", c.backend);
+}
+
+void loadGmmap(const YAML::Node& root, SogmmConfig& c) {
+    if (!root["gmmap"]) return;
+    const auto& n = root["gmmap"];
+    const auto& frame = n["frame"];
+    const auto& map = n["map"];
+    const auto& adapter = n["adapter"];
+
+    if (frame) {
+        c.gmmap_dataset =
+            readOr<std::string>(frame, "dataset", c.gmmap_dataset);
+        c.gmmap_occ_x_threshold =
+            readOr(frame, "occ_x_t", c.gmmap_occ_x_threshold);
+        c.gmmap_noise_threshold =
+            readOr(frame, "noise_thresh", c.gmmap_noise_threshold);
+        c.gmmap_sparse_threshold =
+            readOr(frame, "sparse_t", c.gmmap_sparse_threshold);
+        c.gmmap_ncheck_threshold =
+            readOr(frame, "ncheck_t", c.gmmap_ncheck_threshold);
+        c.gmmap_adaptive_threshold_scale =
+            readOr(frame, "adaptive_thresh_scale",
+                   c.gmmap_adaptive_threshold_scale);
+        c.gmmap_line_threshold =
+            readOr(frame, "line_t", c.gmmap_line_threshold);
+        c.gmmap_angle_threshold =
+            readOr(frame, "angle_t", c.gmmap_angle_threshold);
+        c.gmmap_noise_floor =
+            readOr(frame, "noise_floor", c.gmmap_noise_floor);
+        c.gmmap_num_line_threshold =
+            readOr(frame, "num_line_t", c.gmmap_num_line_threshold);
+        c.gmmap_num_pixels_threshold =
+            readOr(frame, "num_pixels_t", c.gmmap_num_pixels_threshold);
+        c.gmmap_max_incomplete_clusters =
+            readOr(frame, "max_incomplete_clusters",
+                   c.gmmap_max_incomplete_clusters);
+        c.gmmap_free_space_dist_scale =
+            readOr(frame, "free_space_dist_scale",
+                   c.gmmap_free_space_dist_scale);
+        c.gmmap_debug_row_idx =
+            readOr(frame, "debug_row_idx", c.gmmap_debug_row_idx);
+    }
+
+    if (map) {
+        c.gmmap_num_threads =
+            readOr(map, "num_threads", c.gmmap_num_threads);
+        c.gmmap_measure_memory =
+            readOr(map, "measure_memory", c.gmmap_measure_memory);
+        c.gmmap_frame_alg_name =
+            readOr<std::string>(map, "frame_alg_name",
+                                c.gmmap_frame_alg_name);
+        c.gmmap_max_depth =
+            readOr(map, "max_depth", c.gmmap_max_depth);
+        c.gmmap_hell_thresh_squared_oversized_gau =
+            readOr(map, "hell_thresh_squard_oversized_gau",
+                   c.gmmap_hell_thresh_squared_oversized_gau);
+        c.gmmap_hell_thresh_squared_free =
+            readOr(map, "hell_thresh_squard_free",
+                   c.gmmap_hell_thresh_squared_free);
+        c.gmmap_hell_thresh_squared_obs_scale =
+            readOr(map, "hell_thresh_squard_obs_scale",
+                   c.gmmap_hell_thresh_squared_obs_scale);
+        c.gmmap_min_gaussian_length =
+            readOr(map, "min_gau_len", c.gmmap_min_gaussian_length);
+        c.gmmap_frame_max_scale =
+            readOr(map, "frame_max_scale", c.gmmap_frame_max_scale);
+        c.gmmap_min_num_neighbor_clusters =
+            readOr(map, "min_num_neighbor_clusters",
+                   c.gmmap_min_num_neighbor_clusters);
+        c.gmmap_hell_thresh_squared_min =
+            readOr(map, "hell_thresh_squard_min",
+                   c.gmmap_hell_thresh_squared_min);
+        c.gmmap_fusion_bound =
+            readOr(map, "gau_fusion_bd", c.gmmap_fusion_bound);
+        c.gmmap_rtree_bound_scale =
+            readOr(map, "gau_rtree_bd", c.gmmap_rtree_bound_scale);
+        c.gmmap_depth_scale =
+            readOr(map, "depth_scale", c.gmmap_depth_scale);
+        c.gmmap_track_color =
+            readOr(map, "track_color", c.gmmap_track_color);
+        c.gmmap_track_intensity =
+            readOr(map, "track_intensity", c.gmmap_track_intensity);
+        c.gmmap_cur_debug_frame =
+            readOr(map, "cur_debug_frame", c.gmmap_cur_debug_frame);
+    }
+
+    if (adapter) {
+        c.gmmap_far_fill_enable =
+            readOr(adapter, "far_fill_enable", c.gmmap_far_fill_enable);
+        c.gmmap_far_fill_start_m =
+            readOr(adapter, "far_fill_start_m", c.gmmap_far_fill_start_m);
+        c.gmmap_far_fill_voxel_m =
+            readOr(adapter, "far_fill_voxel_m", c.gmmap_far_fill_voxel_m);
+        c.gmmap_far_fill_max_components =
+            readOr(adapter, "far_fill_max_components",
+                   c.gmmap_far_fill_max_components);
+        c.gmmap_far_fill_skip_max_depth_margin_m =
+            readOr(adapter, "far_fill_skip_max_depth_margin_m",
+                   c.gmmap_far_fill_skip_max_depth_margin_m);
+        c.gmmap_estimate_intrinsics =
+            readOr(adapter, "estimate_intrinsics",
+                   c.gmmap_estimate_intrinsics);
+        c.gmmap_horizontal_fov_deg =
+            readOr(adapter, "horizontal_fov_deg",
+                   c.gmmap_horizontal_fov_deg);
+        c.gmmap_fx = readOr(adapter, "fx", c.gmmap_fx);
+        c.gmmap_fy = readOr(adapter, "fy", c.gmmap_fy);
+        c.gmmap_cx = readOr(adapter, "cx", c.gmmap_cx);
+        c.gmmap_cy = readOr(adapter, "cy", c.gmmap_cy);
+    }
 }
 
 void loadSmoother(const YAML::Node& root, SmootherConfig& c) {
@@ -158,6 +269,8 @@ void loadGlobalGraph(const YAML::Node& root, GlobalGraphConfig& c) {
     c.prior_sigma_t = readOr(n, "prior_sigma_t", c.prior_sigma_t);
     c.prior_sigma_r = readOr(n, "prior_sigma_r", c.prior_sigma_r);
     c.overlap_radius_m = readOr(n, "overlap_radius_m", c.overlap_radius_m);
+    c.max_overlap_registrations =
+        readOr(n, "max_overlap_registrations", c.max_overlap_registrations);
     c.reg_score_threshold = readOr(n, "reg_score_threshold", c.reg_score_threshold);
     c.min_loop_submap_gap = readOr(n, "min_loop_submap_gap", c.min_loop_submap_gap);
     c.enable_traj_aux_factors = readOr(n, "enable_traj_aux_factors", c.enable_traj_aux_factors);
@@ -224,6 +337,15 @@ void loadVisualization(const YAML::Node& root, VisualizationConfig& c) {
     c.global_gmm_markers_enable =
         readOr(n, "global_gmm_markers_enable", c.global_gmm_markers_enable);
     c.global_gmm_publish_period_s = readOr(n, "global_gmm_publish_period_s", c.global_gmm_publish_period_s);
+    c.d2d_frame_to_frame_text_enable =
+        readOr(n, "d2d_frame_to_frame_text_enable",
+               c.d2d_frame_to_frame_text_enable);
+    c.d2d_submap_overlap_text_enable =
+        readOr(n, "d2d_submap_overlap_text_enable",
+               c.d2d_submap_overlap_text_enable);
+    c.d2d_loop_closure_text_enable =
+        readOr(n, "d2d_loop_closure_text_enable",
+               c.d2d_loop_closure_text_enable);
     c.output_pose_lpf_cutoff_hz = readOr(n, "output_pose_lpf_cutoff_hz", c.output_pose_lpf_cutoff_hz);
     c.map_cloud_publish_hz = readOr(n, "map_cloud_publish_hz", c.map_cloud_publish_hz);
     c.map_cloud_max_chunks = readOr(n, "map_cloud_max_chunks", c.map_cloud_max_chunks);
@@ -233,6 +355,9 @@ void loadMap(const YAML::Node& root, MapConfig& c) {
     if (!root["map"]) return;
     const auto& n = root["map"];
     c.prune_enable = readOr(n, "prune_enable", c.prune_enable);
+    c.prune_frame_to_frame_enable =
+        readOr(n, "prune_frame_to_frame_enable",
+               c.prune_frame_to_frame_enable);
     c.prune_bhatt_threshold = readOr(n, "prune_bhatt_threshold", c.prune_bhatt_threshold);
     c.prune_search_radius_m = readOr(n, "prune_search_radius_m", c.prune_search_radius_m);
     c.prune_use_rtree = readOr(n, "prune_use_rtree", c.prune_use_rtree);
@@ -250,6 +375,7 @@ Config loadConfig(const std::string& yaml_path) {
     loadRos(root, cfg.ros);
     loadPreprocess(root, cfg.preprocess);
     loadSogmm(root, cfg.sogmm);
+    loadGmmap(root, cfg.sogmm);
     loadSmoother(root, cfg.smoother);
     loadRegistration(root, cfg.registration);
     loadLoopClosure(root, cfg.loop_closure);
@@ -261,6 +387,7 @@ Config loadConfig(const std::string& yaml_path) {
     loadVisualization(root, cfg.visualization);
     loadMap(root, cfg.map);
 
+    cfg.debug_prints = readOr(root, "DEBUG_PRINTS", cfg.debug_prints);
     cfg.gmm_dir = readOr<std::string>(root, "gmm_dir", cfg.gmm_dir);
 
     return cfg;

@@ -135,6 +135,7 @@ private:
     MapConfig map_cfg_;
     int submap_keyframes_per_submap_;
     double overlap_radius_m_;
+    int max_overlap_registrations_;
     double submap_reg_score_threshold_;
     int min_loop_submap_gap_;
     bool enable_traj_aux_factors_;

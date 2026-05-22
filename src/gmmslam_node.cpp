@@ -8,6 +8,7 @@
 #include "gmmslam/util/gmm_utils.hpp"
 
 #include <ros/ros.h>
+#include <ros/console.h>
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <nav_msgs/Odometry.h>
@@ -27,6 +28,7 @@
 #include <iomanip>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <thread>
@@ -35,6 +37,18 @@
 #include <unistd.h>
 
 namespace gmmslam {
+
+namespace {
+
+void applyDebugPrints(bool enable) {
+    if (!enable) {
+        ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME,
+                                       ros::console::levels::Warn);
+        ros::console::notifyLoggerLevelsChanged();
+    }
+}
+
+} // namespace
 
 class GMMSLAMNode {
 public:
@@ -132,6 +146,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         cfg_ = loadConfig(config_path);
     } else {
         // ROS param fallback — mirrors the Python node's rospy.get_param("~xxx", default)
+        pnh.param("DEBUG_PRINTS", cfg_.debug_prints, cfg_.debug_prints);
         pnh.param<std::string>("lidar_topic",  cfg_.ros.lidar_topic,  "/m500_1/mpa/depth/points");
         pnh.param<std::string>("gt_topic",     cfg_.ros.gt_topic,     "/m500_1/mavros/local_position/pose");
         pnh.param<std::string>("imu_topic",    cfg_.ros.imu_topic,    "/m500_1/mavros/imu/data");
@@ -158,10 +173,59 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("target_points",   cfg_.preprocess.target_points,   0);
         pnh.param("min_points",      cfg_.preprocess.min_points,      50);
 
+        pnh.param<std::string>("sogmm_backend", cfg_.sogmm.backend, "sogmm");
         pnh.param("sogmm_bandwidth",     cfg_.sogmm.bandwidth,     0.02);
         pnh.param("sogmm_max_points",    cfg_.sogmm.max_points,    2000);
         pnh.param("sogmm_n_components",  cfg_.sogmm.n_components,  0);
         pnh.param<std::string>("sogmm_compute", cfg_.sogmm.compute, "GPU");
+        pnh.param("sogmm_gmmap_num_threads",
+                  cfg_.sogmm.gmmap_num_threads,
+                  cfg_.sogmm.gmmap_num_threads);
+        pnh.param("sogmm_gmmap_min_gaussian_length",
+                  cfg_.sogmm.gmmap_min_gaussian_length,
+                  cfg_.sogmm.gmmap_min_gaussian_length);
+        pnh.param("sogmm_gmmap_frame_max_scale",
+                  cfg_.sogmm.gmmap_frame_max_scale,
+                  cfg_.sogmm.gmmap_frame_max_scale);
+        pnh.param("sogmm_gmmap_fusion_max_scale",
+                  cfg_.sogmm.gmmap_fusion_max_scale,
+                  cfg_.sogmm.gmmap_fusion_max_scale);
+        pnh.param("sogmm_gmmap_rtree_bound_scale",
+                  cfg_.sogmm.gmmap_rtree_bound_scale,
+                  cfg_.sogmm.gmmap_rtree_bound_scale);
+        pnh.param("sogmm_gmmap_noise_threshold",
+                  cfg_.sogmm.gmmap_noise_threshold,
+                  cfg_.sogmm.gmmap_noise_threshold);
+        pnh.param("sogmm_gmmap_line_threshold",
+                  cfg_.sogmm.gmmap_line_threshold,
+                  cfg_.sogmm.gmmap_line_threshold);
+        pnh.param("sogmm_gmmap_sparse_threshold",
+                  cfg_.sogmm.gmmap_sparse_threshold,
+                  cfg_.sogmm.gmmap_sparse_threshold);
+        pnh.param("sogmm_gmmap_ncheck_threshold",
+                  cfg_.sogmm.gmmap_ncheck_threshold,
+                  cfg_.sogmm.gmmap_ncheck_threshold);
+        pnh.param("sogmm_gmmap_num_line_threshold",
+                  cfg_.sogmm.gmmap_num_line_threshold,
+                  cfg_.sogmm.gmmap_num_line_threshold);
+        pnh.param("sogmm_gmmap_num_pixels_threshold",
+                  cfg_.sogmm.gmmap_num_pixels_threshold,
+                  cfg_.sogmm.gmmap_num_pixels_threshold);
+        pnh.param("sogmm_gmmap_max_incomplete_clusters",
+                  cfg_.sogmm.gmmap_max_incomplete_clusters,
+                  cfg_.sogmm.gmmap_max_incomplete_clusters);
+        pnh.param("sogmm_gmmap_adaptive_threshold_scale",
+                  cfg_.sogmm.gmmap_adaptive_threshold_scale,
+                  cfg_.sogmm.gmmap_adaptive_threshold_scale);
+        pnh.param("sogmm_gmmap_noise_floor",
+                  cfg_.sogmm.gmmap_noise_floor,
+                  cfg_.sogmm.gmmap_noise_floor);
+        pnh.param("sogmm_gmmap_angle_threshold",
+                  cfg_.sogmm.gmmap_angle_threshold,
+                  cfg_.sogmm.gmmap_angle_threshold);
+        pnh.param("sogmm_gmmap_free_space_dist_scale",
+                  cfg_.sogmm.gmmap_free_space_dist_scale,
+                  cfg_.sogmm.gmmap_free_space_dist_scale);
 
         pnh.param("fixed_lag_s",         cfg_.smoother.fixed_lag_s,         4.0);
         pnh.param("smoother_stride",     cfg_.smoother.smoother_stride,     3);
@@ -323,6 +387,12 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("gmm_marker_sigma",            cfg_.visualization.gmm_marker_sigma, 3.0);
         pnh.param("global_gmm_markers_enable",   cfg_.visualization.global_gmm_markers_enable, true);
         pnh.param("global_gmm_publish_period_s",  cfg_.visualization.global_gmm_publish_period_s, 1.0);
+        pnh.param("d2d_frame_to_frame_text_enable",
+                  cfg_.visualization.d2d_frame_to_frame_text_enable, true);
+        pnh.param("d2d_submap_overlap_text_enable",
+                  cfg_.visualization.d2d_submap_overlap_text_enable, true);
+        pnh.param("d2d_loop_closure_text_enable",
+                  cfg_.visualization.d2d_loop_closure_text_enable, true);
         pnh.param("output_pose_lpf_cutoff_hz",   cfg_.visualization.output_pose_lpf_cutoff_hz, 0.0);
         pnh.param("map_cloud_publish_hz",        cfg_.visualization.map_cloud_publish_hz, 0.5);
         pnh.param("map_cloud_max_chunks",        cfg_.visualization.map_cloud_max_chunks, 3000);
@@ -337,6 +407,10 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
 
         pnh.param<std::string>("gmm_dir", cfg_.gmm_dir, "/tmp/gmmslam_gmms");
     }
+
+    pnh.param("DEBUG_PRINTS", cfg_.debug_prints, cfg_.debug_prints);
+    pnh.param("debug_prints", cfg_.debug_prints, cfg_.debug_prints);
+    applyDebugPrints(cfg_.debug_prints);
 
     {
         std::string oin;
@@ -376,6 +450,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
     const auto path_pub         = pnh.advertise<nav_msgs::Path>("path", 1);
     const auto gg_path_pub      = pnh.advertise<nav_msgs::Path>("global_graph_path", 1);
     const auto odom_pub         = pnh.advertise<nav_msgs::Odometry>("odom", 1);
+    const auto odom_lpf_pub     = pnh.advertise<nav_msgs::Odometry>("odom_lpf", 1);
     const auto latest_frame_pub = pnh.advertise<sensor_msgs::PointCloud2>("latest_frame_cloud", 1);
     const auto map_cloud_pub    = pnh.advertise<sensor_msgs::PointCloud2>("map_cloud", 1, true);
     gt_path_pub_                = pnh.advertise<nav_msgs::Path>("gt_path", 1);
@@ -428,6 +503,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         cfg_.loop_closure,
         cfg_.solid,
         cfg_.sogmm,
+        cfg_.visualization,
         cfg_.gmm_dir,
         loop_closure_markers_pub,
         cfg_.ros.odom_frame);
@@ -437,14 +513,15 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
                 global_graph_->processPendingSubmapFinalizations(stamp);
             }
         });
-    ROS_INFO("[gmmslam] loop_closure_markers -> %s (MarkerArray, latched; "
-             "frame_id=%s)",
+    ROS_INFO("[gmmslam] D2D registration markers -> %s (MarkerArray, latched; "
+             "labels: seq/submap/loop closure; frame_id=%s)",
              (pnh.getNamespace() + "/loop_closure_markers").c_str(),
              cfg_.ros.odom_frame.c_str());
 
     Visualizer::Publishers vis_pubs;
     vis_pubs.path              = path_pub;
     vis_pubs.odom              = odom_pub;
+    vis_pubs.odom_lpf          = odom_lpf_pub;
     vis_pubs.latest_frame_cloud = latest_frame_pub;
     vis_pubs.map_cloud          = map_cloud_pub;
     vis_pubs.gmm_markers       = gmm_markers_pub;
@@ -1061,6 +1138,15 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         maybeReanchorSmootherFromGt(stamp, t_cloud);
 
         // 1. Convert & preprocess
+        std::optional<OrganizedDepthImage> organized_depth;
+        if (cfg_.sogmm.backend == "gmmap" || cfg_.sogmm.backend == "GMMap") {
+            organized_depth = pc2ToOrganizedDepth(
+                *msg, cfg_.preprocess.min_range, cfg_.preprocess.max_range,
+                cfg_.sogmm.gmmap_estimate_intrinsics,
+                cfg_.sogmm.gmmap_fx, cfg_.sogmm.gmmap_fy,
+                cfg_.sogmm.gmmap_cx, cfg_.sogmm.gmmap_cy,
+                cfg_.sogmm.gmmap_horizontal_fov_deg);
+        }
         Eigen::MatrixXf pts = pc2ToEigen(*msg);
         if (pts.rows() == 0) {
             ROS_WARN_THROTTLE(5.0,
@@ -1202,7 +1288,8 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
                 {
                     const double capture_t = stampToSec(stamp);
                     const bool ok = registration_->enqueueFit(
-                        curr_odom, stamp, pts, capture_t, T_curr);
+                        curr_odom, stamp, pts, organized_depth,
+                        capture_t, T_curr);
                     ROS_INFO("[gmmslam][DBG] enqueueFit result X(%d) ok=%d",
                              curr_odom, ok ? 1 : 0);
                     if (!ok && cfg_.registration.enqueue_cooldown_frames > 0) {
@@ -1226,9 +1313,10 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         }
 
         // 8. Publish
-        const Matrix4d T_vis = visualizer_->filterOutputPose(T_pub, stamp);
-        visualizer_->publishPoseOnly(T_vis, stamp);
-        visualizer_->enqueueFrame(stamp, pts, frame_count_, T_vis, smoother_pose_key);
+        const Matrix4d T_lpf = visualizer_->filterOutputPose(T_pub, stamp);
+        visualizer_->publishPoseOnly(T_pub, stamp);
+        visualizer_->publishPoseLpf(T_lpf, stamp);
+        visualizer_->enqueueFrame(stamp, pts, frame_count_, T_pub, smoother_pose_key);
 
         logBackpressure(stamp);
         ++frame_count_;

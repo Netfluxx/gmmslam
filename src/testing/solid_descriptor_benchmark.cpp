@@ -1,17 +1,20 @@
 /**
- * solid_descriptor_benchmark — ROS node for SOLiD-only timing and metrics.
+ * solid_descriptor_benchmark - ROS node for SOLiD-only timing and metrics.
  *
  * Subscribes to a lidar PointCloud2 (same preprocessing as gmmslam) and optionally
- * a pose topic to log yaw vs SOLiD range-head cosine similarity vs. the first scan.
+ * a pose topic to log pose/yaw vs SOLiD descriptor similarity vs. the first scan.
  *
  * Typical use with Webots apartment + orbit supervisor:
  *   roslaunch gmmslam solid_descriptor_benchmark.launch
  *
- * ~metrics (std_msgs/Float64MultiArray): [t_sec, yaw_rad, delta_yaw_deg, cos_range,
+ * ~metrics (std_msgs/Float64MultiArray): [t_sec, x_m, y_m, z_m, yaw_rad,
+ *                                         delta_yaw_deg, solid_score,
+ *                                         range_cos, angle_cos, polar_cos,
  *                                         solid_ms, n_pts, ref_valid]
  * Optional CSV: ~csv_path
  */
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -47,6 +50,14 @@ double radDiff(double a, double b) {
         d += 2.0 * M_PI;
     }
     return d;
+}
+
+double cosineSafe(const Eigen::VectorXd& a, const Eigen::VectorXd& b) {
+    const double denom = a.norm() * b.norm();
+    if (denom < 1e-12) {
+        return 0.0;
+    }
+    return std::clamp(a.dot(b) / denom, 0.0, 1.0);
 }
 
 class BenchNode {
@@ -86,7 +97,8 @@ public:
             csv_.open(csv_path_, std::ios::out | std::ios::trunc);
             if (csv_.good()) {
                 have_csv_ = true;
-                csv_ << "t_sec,yaw_rad,delta_yaw_deg,cos_range,solid_ms,n_pts,ref_valid\n";
+                csv_ << "t_sec,x_m,y_m,z_m,yaw_rad,delta_yaw_deg,solid_score,"
+                        "range_cos,angle_cos,polar_cos,solid_ms,n_pts,ref_valid\n";
                 csv_.flush();
                 ROS_INFO("[solid_bench] Writing CSV: %s", csv_path_.c_str());
             } else {
@@ -118,7 +130,11 @@ private:
         const double yaw = yawFromQuatXYZW(q.x, q.y, q.z, q.w);
         std::lock_guard<std::mutex> lk(pose_mu_);
         latest_yaw_ = yaw;
+        latest_x_m_ = msg->pose.position.x;
+        latest_y_m_ = msg->pose.position.y;
+        latest_z_m_ = msg->pose.position.z;
         latest_pose_stamp_ = msg->header.stamp;
+        latest_pose_valid_ = true;
     }
 
     void onOdom(const nav_msgs::Odometry::ConstPtr& msg) {
@@ -126,7 +142,11 @@ private:
         const double yaw = yawFromQuatXYZW(q.x, q.y, q.z, q.w);
         std::lock_guard<std::mutex> lk(pose_mu_);
         latest_yaw_ = yaw;
+        latest_x_m_ = msg->pose.pose.position.x;
+        latest_y_m_ = msg->pose.pose.position.y;
+        latest_z_m_ = msg->pose.pose.position.z;
         latest_pose_stamp_ = msg->header.stamp;
+        latest_pose_valid_ = true;
     }
 
     void onCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
@@ -152,10 +172,13 @@ private:
             return;
         }
 
+        const Eigen::VectorXd polar_context = makePolarContext(pts);
+
         {
             std::lock_guard<std::mutex> lk(ref_mu_);
             if (!ref_desc_.has_value()) {
                 ref_desc_ = desc;
+                ref_polar_context_ = polar_context;
                 ROS_INFO("[solid_bench] Reference descriptor set (pts=%ld, dim=%ld)",
                          static_cast<long>(pts.rows()),
                          static_cast<long>(desc.vec.size()));
@@ -166,32 +189,49 @@ private:
             }
         }
 
-        double cos_sim = 0.0;
+        double solid_score = 0.0;
+        double range_cos = 0.0;
+        double angle_cos = 0.0;
+        double polar_cos = 0.0;
         bool ref_valid = false;
         {
             std::lock_guard<std::mutex> lk(ref_mu_);
             if (ref_desc_.has_value()) {
-                cos_sim = solid_->rangeCosine(ref_desc_.value(), desc);
+                const auto& ref = ref_desc_.value();
+                const int nr = solid_->numRange();
+                const int na = solid_->numAngle();
+                solid_score = cosineSafe(ref.vec, desc.vec);
+                range_cos = solid_->rangeCosine(ref, desc);
+                angle_cos = cosineSafe(ref.vec.segment(nr, na), desc.vec.segment(nr, na));
+                if (ref_polar_context_.has_value()) {
+                    polar_cos = cosineSafe(ref_polar_context_.value(), polar_context);
+                }
                 ref_valid = true;
             }
         }
 
+        double x_m = 0.0;
+        double y_m = 0.0;
+        double z_m = 0.0;
         double yaw_rad = 0.0;
         double d_yaw_deg = 0.0;
-        bool have_synced_yaw = false;
+        bool have_synced_pose = false;
         {
             std::lock_guard<std::mutex> lk(pose_mu_);
-            if (latest_yaw_.has_value()) {
+            if (latest_pose_valid_) {
                 const double dt =
                     std::abs((msg->header.stamp - latest_pose_stamp_).toSec());
                 if (dt <= 0.2) {
+                    x_m = latest_x_m_;
+                    y_m = latest_y_m_;
+                    z_m = latest_z_m_;
                     yaw_rad = latest_yaw_.value();
-                    have_synced_yaw = true;
+                    have_synced_pose = true;
                 }
             }
         }
 
-        if (have_synced_yaw) {
+        if (have_synced_pose) {
             std::lock_guard<std::mutex> lk(ref_mu_);
             if (ref_yaw_rad_.has_value()) {
                 d_yaw_deg =
@@ -208,20 +248,64 @@ private:
         const double t_sec = msg->header.stamp.toSec();
 
         std_msgs::Float64MultiArray out;
-        out.data = {t_sec, yaw_rad, d_yaw_deg, cos_sim, ms,
+        out.data = {t_sec, x_m, y_m, z_m, yaw_rad, d_yaw_deg, solid_score,
+                    range_cos, angle_cos, polar_cos, ms,
                     static_cast<double>(desc.point_count),
                     ref_valid ? 1.0 : 0.0};
         metrics_pub_.publish(out);
 
-        ROS_INFO("[solid_bench] t=%.3f d_yaw=%.1f° cos_range=%.4f SOLiD=%.2fms n=%d",
-                 t_sec, d_yaw_deg, cos_sim, ms, desc.point_count);
+        ROS_INFO("[solid_bench] t=%.3f p=(%.2f,%.2f,%.2f) d_yaw=%.1fdeg "
+                 "solid=%.4f range=%.4f angle=%.4f polar=%.4f SOLiD=%.2fms n=%d",
+                 t_sec, x_m, y_m, z_m, d_yaw_deg, solid_score, range_cos,
+                 angle_cos, polar_cos, ms, desc.point_count);
 
         if (have_csv_) {
-            csv_ << t_sec << ',' << yaw_rad << ',' << d_yaw_deg << ',' << cos_sim
-                 << ',' << ms << ',' << desc.point_count << ','
-                 << (ref_valid ? 1 : 0) << '\n';
+            csv_ << t_sec << ',' << x_m << ',' << y_m << ',' << z_m << ','
+                 << yaw_rad << ',' << d_yaw_deg << ',' << solid_score << ','
+                 << range_cos << ',' << angle_cos << ',' << polar_cos << ','
+                 << ms << ',' << desc.point_count << ',' << (ref_valid ? 1 : 0)
+                 << '\n';
             csv_.flush();
         }
+    }
+
+    Eigen::VectorXd makePolarContext(const Eigen::MatrixXf& pts) const {
+        const int nr = std::max(1, cfg_.solid.num_range);
+        const int na = std::max(1, cfg_.solid.num_angle);
+        Eigen::VectorXd context = Eigen::VectorXd::Zero(nr * na);
+
+        const double min_r = cfg_.solid.min_distance_m;
+        const double max_r = std::max(cfg_.solid.max_distance_m, min_r + 1.0e-3);
+        const double inv_range = static_cast<double>(nr) / (max_r - min_r);
+        const double angle_bin_deg = 360.0 / static_cast<double>(na);
+
+        for (int i = 0; i < pts.rows(); ++i) {
+            const double x = pts(i, 0);
+            const double y = pts(i, 1);
+            const double z = pts(i, 2);
+            const double dist_xy = std::sqrt(x * x + y * y);
+            if (dist_xy < min_r || dist_xy > max_r) {
+                continue;
+            }
+
+            const double phi_deg = std::atan2(z, dist_xy) * 180.0 / M_PI;
+            if (phi_deg < cfg_.solid.fov_down_deg || phi_deg > cfg_.solid.fov_up_deg) {
+                continue;
+            }
+
+            double theta_deg = std::atan2(y, x) * 180.0 / M_PI;
+            if (theta_deg < 0.0) {
+                theta_deg += 360.0;
+            }
+
+            const int r = std::clamp(static_cast<int>((dist_xy - min_r) * inv_range),
+                                     0, nr - 1);
+            const int a = std::clamp(static_cast<int>(theta_deg / angle_bin_deg),
+                                     0, na - 1);
+            context(r * na + a) += 1.0;
+        }
+
+        return context;
     }
 
     ros::NodeHandle nh_;
@@ -239,10 +323,15 @@ private:
 
     std::mutex pose_mu_;
     std::optional<double> latest_yaw_;
+    double latest_x_m_ = 0.0;
+    double latest_y_m_ = 0.0;
+    double latest_z_m_ = 0.0;
     ros::Time latest_pose_stamp_;
+    bool latest_pose_valid_ = false;
 
     std::mutex ref_mu_;
     std::optional<gmmslam::SolidDescriptor> ref_desc_;
+    std::optional<Eigen::VectorXd> ref_polar_context_;
     std::optional<double> ref_yaw_rad_;
 
     std::ofstream csv_;

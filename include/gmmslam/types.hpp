@@ -31,6 +31,20 @@ struct GmmModel {
     int numComponents() const { return static_cast<int>(components.size()); }
 };
 
+struct OrganizedDepthImage {
+    Eigen::MatrixXf depth;
+    double fx = 0.0;
+    double fy = 0.0;
+    double cx = 0.0;
+    double cy = 0.0;
+    int valid_points = 0;
+
+    bool valid() const {
+        return depth.rows() > 1 && depth.cols() > 1 &&
+               valid_points > 0 && fx != 0.0 && fy != 0.0;
+    }
+};
+
 struct GmmFrame {
     using Ptr = std::shared_ptr<GmmFrame>;
     using ConstPtr = std::shared_ptr<const GmmFrame>;

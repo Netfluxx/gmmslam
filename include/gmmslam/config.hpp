@@ -34,6 +34,53 @@ struct SogmmConfig {
     int max_points = 2000;
     int n_components = 0;
     std::string compute = "GPU";
+    /// "sogmm" preserves the legacy GIRA/SOGMM fitter. "gmmap" uses the
+    /// optional GMMap adapter when the input cloud is organized and GMMap was
+    /// enabled at build time.
+    std::string backend = "sogmm";
+    std::string gmmap_dataset = "tum";
+    int gmmap_num_threads = 0;
+    bool gmmap_measure_memory = true;
+    std::string gmmap_frame_alg_name = "spgf_extended";
+    double gmmap_max_depth = 0.0;
+    double gmmap_hell_thresh_squared_oversized_gau = 0.20;
+    double gmmap_hell_thresh_squared_free = 0.10;
+    double gmmap_hell_thresh_squared_obs_scale = 1.0;
+    double gmmap_hell_thresh_squared_min = 0.01;
+    double gmmap_min_gaussian_length = 0.05;
+    double gmmap_frame_max_scale = 4.0;
+    double gmmap_fusion_max_scale = 4.0;
+    double gmmap_fusion_bound = 2.0;
+    double gmmap_rtree_bound_scale = 2.0;
+    double gmmap_depth_scale = 1.0;
+    bool gmmap_track_color = false;
+    bool gmmap_track_intensity = false;
+    bool gmmap_cur_debug_frame = false;
+    int gmmap_min_num_neighbor_clusters = 3;
+    int gmmap_occ_x_threshold = 2;
+    double gmmap_noise_threshold = 0.05;
+    double gmmap_line_threshold = 0.05;
+    int gmmap_sparse_threshold = 8;
+    int gmmap_ncheck_threshold = 20;
+    int gmmap_num_line_threshold = 3;
+    int gmmap_num_pixels_threshold = 6;
+    int gmmap_max_incomplete_clusters = 20;
+    double gmmap_adaptive_threshold_scale = 1.2;
+    double gmmap_noise_floor = 0.05;
+    double gmmap_angle_threshold = 0.95;
+    double gmmap_free_space_dist_scale = 1.0;
+    int gmmap_debug_row_idx = -1;
+    bool gmmap_far_fill_enable = true;
+    double gmmap_far_fill_start_m = 10.0;
+    double gmmap_far_fill_voxel_m = 1.0;
+    int gmmap_far_fill_max_components = 300;
+    double gmmap_far_fill_skip_max_depth_margin_m = 0.5;
+    bool gmmap_estimate_intrinsics = false;
+    double gmmap_horizontal_fov_deg = 120.0;
+    double gmmap_fx = 0.0;
+    double gmmap_fy = 0.0;
+    double gmmap_cx = -1.0;
+    double gmmap_cy = -1.0;
 };
 
 struct SmootherConfig {
@@ -147,6 +194,7 @@ struct GlobalGraphConfig {
     double prior_sigma_t = 0.02;
     double prior_sigma_r = 0.02;
     double overlap_radius_m = 3.0;
+    int max_overlap_registrations = 3;
     double reg_score_threshold = 0.5;
     int min_loop_submap_gap = 5;
     bool enable_traj_aux_factors = false;
@@ -215,6 +263,9 @@ struct VisualizationConfig {
     double gmm_marker_sigma = 3.0;
     bool global_gmm_markers_enable = true;
     double global_gmm_publish_period_s = 1.0;
+    bool d2d_frame_to_frame_text_enable = true;
+    bool d2d_submap_overlap_text_enable = true;
+    bool d2d_loop_closure_text_enable = true;
     /// First-order low-pass cutoff for published TF/odom/RViz pose. <=0 disables.
     double output_pose_lpf_cutoff_hz = 0.0;
     /// Accumulated map PointCloud2 publish rate (Hz); period = 1/rate.
@@ -228,6 +279,9 @@ struct VisualizationConfig {
 // by overlapping observations of the same physical structure.
 struct MapConfig {
     bool prune_enable = true;
+    // If true, map pruning removes duplicate components across different
+    // source GMM frames by keeping the older measurement.
+    bool prune_frame_to_frame_enable = true;
     // Bhattacharyya distance threshold under which two components are merged.
     // For two equal isotropic gaussians 3 sigma apart D_B ~= 1.125, so a
     // value around 1.5 merges aggressively only on near-duplicates.
@@ -250,6 +304,7 @@ struct MapConfig {
 };
 
 struct Config {
+    bool debug_prints = true;
     RosConfig ros;
     PreprocessConfig preprocess;
     SogmmConfig sogmm;

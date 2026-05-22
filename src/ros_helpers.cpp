@@ -1,8 +1,10 @@
 #include "gmmslam/ros_helpers.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <numeric>
 #include <random>
 #include <stdexcept>
@@ -155,6 +157,132 @@ Eigen::MatrixXf pc2ToEigen(const sensor_msgs::PointCloud2& msg) {
 
     result.conservativeResize(valid_count, 3);
     return result;
+}
+
+std::optional<OrganizedDepthImage> pc2ToOrganizedDepth(
+    const sensor_msgs::PointCloud2& msg,
+    double min_range,
+    double max_range,
+    bool estimate_intrinsics,
+    double fx,
+    double fy,
+    double cx,
+    double cy,
+    double horizontal_fov_deg) {
+
+    if (msg.height <= 1 || msg.width <= 1) {
+        return std::nullopt;
+    }
+
+    OrganizedDepthImage organized;
+    organized.depth =
+        Eigen::MatrixXf::Zero(static_cast<int>(msg.height),
+                              static_cast<int>(msg.width));
+
+    sensor_msgs::PointCloud2ConstIterator<float> it_x(msg, "x");
+    sensor_msgs::PointCloud2ConstIterator<float> it_y(msg, "y");
+    sensor_msgs::PointCloud2ConstIterator<float> it_z(msg, "z");
+
+    const double min_r = std::max(0.0, min_range);
+    const double max_r = max_range > 0.0 ? max_range
+                                         : std::numeric_limits<double>::infinity();
+
+    double sum_u = 0.0, sum_u2 = 0.0, sum_xz = 0.0, sum_u_xz = 0.0;
+    double sum_v = 0.0, sum_v2 = 0.0, sum_yz = 0.0, sum_v_yz = 0.0;
+    int n_fit = 0;
+
+    for (uint32_t v = 0; v < msg.height; ++v) {
+        for (uint32_t u = 0; u < msg.width; ++u, ++it_x, ++it_y, ++it_z) {
+            const float x = *it_x;
+            const float y = *it_y;
+            const float z = *it_z;
+            // Webots RangeFinder point clouds are published in the camera body
+            // frame used by the autopilot: X forward, Y left, Z up.  GMMap
+            // wants the original pinhole depth image, so depth is the forward
+            // X coordinate, not the ROS/Webots Z coordinate.
+            if (!std::isfinite(x) || !std::isfinite(y) ||
+                !std::isfinite(z) || x <= 0.0f) {
+                continue;
+            }
+
+            const double depth_m = static_cast<double>(x);
+            if (depth_m < min_r || depth_m > max_r) {
+                continue;
+            }
+
+            organized.depth(static_cast<int>(v), static_cast<int>(u)) = x;
+            ++organized.valid_points;
+
+            const double du = static_cast<double>(u);
+            const double dv = static_cast<double>(v);
+            const double right_over_depth = -static_cast<double>(y) / x;
+            const double down_over_depth = -static_cast<double>(z) / x;
+            sum_u += du;
+            sum_u2 += du * du;
+            sum_xz += right_over_depth;
+            sum_u_xz += du * right_over_depth;
+            sum_v += dv;
+            sum_v2 += dv * dv;
+            sum_yz += down_over_depth;
+            sum_v_yz += dv * down_over_depth;
+            ++n_fit;
+        }
+    }
+
+    if (organized.valid_points < 16) {
+        return std::nullopt;
+    }
+
+    const double width = static_cast<double>(msg.width);
+    const double height = static_cast<double>(msg.height);
+    if (fx > 0.0 && fy > 0.0) {
+        organized.fx = fx;
+        organized.fy = fy;
+        organized.cx = (cx >= 0.0) ? cx : (width - 1.0) * 0.5;
+        organized.cy = (cy >= 0.0) ? cy : (height - 1.0) * 0.5;
+    } else if (!estimate_intrinsics) {
+        const double pi = std::acos(-1.0);
+        const double fov_rad =
+            std::clamp(horizontal_fov_deg, 1.0, 179.0) * pi / 180.0;
+        const double focal = width / (2.0 * std::tan(0.5 * fov_rad));
+        organized.fx = focal;
+        organized.fy = focal;
+        organized.cx = (cx >= 0.0) ? cx : (width - 1.0) * 0.5;
+        organized.cy = (cy >= 0.0) ? cy : (height - 1.0) * 0.5;
+    } else {
+        const double denom_u =
+            static_cast<double>(n_fit) * sum_u2 - sum_u * sum_u;
+        const double denom_v =
+            static_cast<double>(n_fit) * sum_v2 - sum_v * sum_v;
+        if (std::abs(denom_u) < 1e-9 || std::abs(denom_v) < 1e-9) {
+            return std::nullopt;
+        }
+
+        const double ax =
+            (static_cast<double>(n_fit) * sum_u_xz - sum_u * sum_xz) / denom_u;
+        const double bx = (sum_xz - ax * sum_u) / static_cast<double>(n_fit);
+        const double ay =
+            (static_cast<double>(n_fit) * sum_v_yz - sum_v * sum_yz) / denom_v;
+        const double by = (sum_yz - ay * sum_v) / static_cast<double>(n_fit);
+        if (std::abs(ax) < 1e-9 || std::abs(ay) < 1e-9) {
+            return std::nullopt;
+        }
+
+        organized.fx = 1.0 / ax;
+        organized.fy = 1.0 / ay;
+        organized.cx = -bx / ax;
+        organized.cy = -by / ay;
+    }
+
+    if (!std::isfinite(organized.fx) || !std::isfinite(organized.fy) ||
+        !std::isfinite(organized.cx) || !std::isfinite(organized.cy) ||
+        organized.fx <= 0.0 || organized.fy <= 0.0 ||
+        organized.cx < -width || organized.cx > 2.0 * width ||
+        organized.cy < -height || organized.cy > 2.0 * height) {
+        return std::nullopt;
+    }
+
+    return organized;
 }
 
 sensor_msgs::PointCloud2 eigenToPc2Rgb(

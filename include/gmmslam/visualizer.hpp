@@ -30,6 +30,7 @@ public:
     struct Publishers {
         ros::Publisher path;
         ros::Publisher odom;
+        ros::Publisher odom_lpf;
         ros::Publisher latest_frame_cloud;
         ros::Publisher map_cloud;
         ros::Publisher gmm_markers;
@@ -49,6 +50,7 @@ public:
 
     Matrix4d filterOutputPose(const Matrix4d& T, const ros::Time& stamp);
     void publishPoseOnly(const Matrix4d& T, const ros::Time& stamp);
+    void publishPoseLpf(const Matrix4d& T, const ros::Time& stamp);
 
     /// @param smoother_pose_key Pose graph index `X(k)` for this scan when
     ///        `pts` was captured (smoother frames only); `-1` skips map buffer.

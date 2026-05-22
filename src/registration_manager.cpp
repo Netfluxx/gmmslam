@@ -1,5 +1,6 @@
 #include "gmmslam/registration_manager.hpp"
 #include "gmmslam/fixed_lag_backend.hpp"
+#include "gmmslam/gmmap_fitting.hpp"
 #include "gmmslam/global_pose_graph.hpp"
 #include "gmmslam/sogmm_fitting.hpp"
 #include "gmmslam/util/gmm_utils.hpp"
@@ -14,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cctype>
 #include <Eigen/Geometry>
 #include <filesystem>
 #include <functional>
@@ -65,6 +67,14 @@ bool isSaneRigidTransform(const Eigen::Matrix4d& T) {
     return std::isfinite(ortho_err) && ortho_err < 0.25;
 }
 
+std::string lowercase(std::string s) {
+    std::transform(s.begin(), s.end(), s.begin(),
+                   [](unsigned char c) {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    return s;
+}
+
 } // namespace
 
 namespace gmmslam {
@@ -81,6 +91,7 @@ RegistrationManager::RegistrationManager(
     const LoopClosureConfig& lc_cfg,
     const SolidConfig& solid_cfg,
     const SogmmConfig& sogmm_cfg,
+    const VisualizationConfig& vis_cfg,
     const std::string& gmm_dir,
     ros::Publisher loop_closure_markers_pub,
     std::string map_frame)
@@ -108,6 +119,9 @@ RegistrationManager::RegistrationManager(
       loop_closure_gmm_keep_keyframes_(lc_cfg.gmm_keep_keyframes),
       loop_closure_consistency_gate_trans_m_(lc_cfg.consistency_gate_trans_m),
       loop_closure_consistency_gate_rot_deg_(lc_cfg.consistency_gate_rot_deg),
+      d2d_frame_to_frame_text_enable_(vis_cfg.d2d_frame_to_frame_text_enable),
+      d2d_submap_overlap_text_enable_(vis_cfg.d2d_submap_overlap_text_enable),
+      d2d_loop_closure_text_enable_(vis_cfg.d2d_loop_closure_text_enable),
       score_sigma_low_(reg_cfg.score_sigma_low),
       score_sigma_high_(reg_cfg.score_sigma_high),
       seq_sigma_t_min_(reg_cfg.seq_sigma_t_min),
@@ -124,6 +138,10 @@ RegistrationManager::RegistrationManager(
       result_queue_(static_cast<std::size_t>(reg_cfg.result_queue_size))
 {
     std::filesystem::create_directories(gmm_dir_);
+    ROS_INFO("[registration] GMM fitting backend requested: %s%s",
+             sogmm_cfg_.backend.c_str(),
+             gmmapFittingAvailable() ? " (GMMap adapter built)"
+                                     : " (GMMap adapter not built)");
     if (solid_cfg_.enable) {
         ROS_INFO("[registration] SOLiD enabled: dim=%d (range=%d + angle=%d) "
                  "height=%d range=[%.2f, %.2f] fov=[%.1f, %.1f] deg "
@@ -194,6 +212,7 @@ void RegistrationManager::submitKeyframeDescriptor(int frame_idx,
 
 bool RegistrationManager::enqueueFit(int frame_idx, const ros::Time& stamp,
                                       const Eigen::MatrixXf& pts,
+                                      std::optional<OrganizedDepthImage> organized_depth,
                                       double capture_t_sec,
                                       const Matrix4d& capture_pose)
 {
@@ -201,7 +220,8 @@ bool RegistrationManager::enqueueFit(int frame_idx, const ros::Time& stamp,
     ROS_INFO("[registration][DBG] enqueueFit ENTER X(%d) pts=%ld "
              "queue_depth=%zu",
              frame_idx, static_cast<long>(pts.rows()), qsize_before);
-    FitJob job{frame_idx, stamp, pts, capture_t_sec, capture_pose};
+    FitJob job{frame_idx, stamp, pts, organized_depth,
+               capture_t_sec, capture_pose};
 
     if (fit_queue_.tryPush(std::move(job))) {
         ROS_INFO("[registration][DBG] enqueueFit OK X(%d) queue_depth_after=%zu",
@@ -214,7 +234,8 @@ bool RegistrationManager::enqueueFit(int frame_idx, const ros::Time& stamp,
              "dropping oldest and retrying",
              frame_idx, fit_queue_.size());
     fit_queue_.tryPop();
-    FitJob retry{frame_idx, stamp, pts, capture_t_sec, capture_pose};
+    FitJob retry{frame_idx, stamp, pts, organized_depth,
+                 capture_t_sec, capture_pose};
     const bool ok = fit_queue_.tryPush(std::move(retry));
     ROS_WARN("[registration][DBG] enqueueFit retry X(%d) ok=%d "
              "queue_depth_after=%zu",
@@ -251,13 +272,33 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
         const auto t0 = std::chrono::steady_clock::now();
         bool finish_ok = false;
         try {
-            GmmModel model = fitSogmm(job.points, sogmm_cfg_);
+            const std::string backend = lowercase(sogmm_cfg_.backend);
+            GmmModel model;
+            std::string backend_used = "sogmm";
+            if (backend == "gmmap") {
+                if (job.organized_depth.has_value() &&
+                    job.organized_depth->valid() && gmmapFittingAvailable()) {
+                    model = fitGmmap(job.organized_depth.value(), sogmm_cfg_);
+                    backend_used = "gmmap";
+                } else {
+                    ROS_WARN_THROTTLE(
+                        5.0,
+                        "[registration] GMMap backend requested but %s; "
+                        "falling back to SOGMM",
+                        !gmmapFittingAvailable()
+                            ? "GMMap is not built"
+                            : "organized depth is unavailable");
+                    model = fitSogmm(job.points, sogmm_cfg_);
+                }
+            } else {
+                model = fitSogmm(job.points, sogmm_cfg_);
+            }
             const auto t1 = std::chrono::steady_clock::now();
             const double dt_ms =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
-            ROS_INFO("[registration][DBG] fit DONE  X(%d) pts=%ld K=%d "
+            ROS_INFO("[registration][DBG] fit DONE  X(%d) backend=%s pts=%ld K=%d "
                      "elapsed_ms=%.1f",
-                     fid, static_cast<long>(job.points.rows()),
+                     fid, backend_used.c_str(), static_cast<long>(job.points.rows()),
                      model.numComponents(), dt_ms);
             if (model.numComponents() > 0) {
                 finishFit(model, job.frame_idx, job.stamp,
@@ -265,7 +306,7 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
                 finish_ok = true;
             } else {
                 ROS_WARN(
-                    "[registration][DBG] SOGMM fit returned EMPTY model "
+                    "[registration][DBG] GMM fit returned EMPTY model "
                     "for frame %d pts=%ld elapsed_ms=%.1f",
                     fid, static_cast<long>(job.points.rows()),
                     dt_ms);
@@ -450,6 +491,11 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
             std_msgs::String msg;
             msg.data = payload.dump();
             reg_pub_.publish(msg);
+            ROS_INFO("[registration][D2D] dispatched sequential request X(%d)->X(%d) "
+                     "source=%s target=%s init=%s",
+                     prev_idx, frame_idx,
+                     gmm_path.c_str(), prev_path.c_str(),
+                     payload.contains("initial_transform") ? "yes" : "no");
         }
 
         enqueueLoopClosureRequests(frame_idx, stamp, gmm_path, prev_idx);
@@ -493,6 +539,7 @@ void RegistrationManager::enqueueLoopClosureRequests(
     Vector3d curr_pos;
     double t_curr = 0.0;
     std::map<int, Vector3d> position_snapshot;
+    std::map<int, Matrix4d> pose_snapshot;
     std::map<int, double> time_snapshot;
     {
         std::lock_guard<std::mutex> lk(smoother_.graph_lock);
@@ -511,6 +558,7 @@ void RegistrationManager::enqueueLoopClosureRequests(
         for (const auto& [idx, T] : smoother_.pose_by_idx) {
             position_snapshot.emplace(idx, T.block<3, 1>(0, 3));
         }
+        pose_snapshot = smoother_.pose_by_idx;
         time_snapshot = smoother_.key_t_sec;
     }
 
@@ -670,8 +718,24 @@ void RegistrationManager::enqueueLoopClosureRequests(
             payload["solid_rescue"] = true;
         }
 
-        // SOLiD-derived yaw prior for D2D initialization.
-        if (have_q_desc && solid_cfg_.provide_yaw_prior) {
+        bool has_initial_transform = false;
+        auto prev_pose_it = pose_snapshot.find(cand.idx);
+        auto curr_pose_it = pose_snapshot.find(curr_idx);
+        if (prev_pose_it != pose_snapshot.end() &&
+            curr_pose_it != pose_snapshot.end()) {
+            const Matrix4d T_init =
+                prev_pose_it->second.inverse() * curr_pose_it->second;
+            Eigen::Matrix<double, 4, 4, Eigen::RowMajor> T_row(T_init);
+            std::vector<double> flat(16);
+            for (int k = 0; k < 16; ++k) {
+                flat[static_cast<std::size_t>(k)] = T_row.data()[k];
+            }
+            payload["initial_transform"] = std::move(flat);
+            has_initial_transform = true;
+        }
+
+        // SOLiD-derived yaw prior fallback when pose history is unavailable.
+        if (!has_initial_transform && have_q_desc && solid_cfg_.provide_yaw_prior) {
             SolidDescriptor c_desc;
             if (place_index_.get(cand.idx, c_desc)) {
                 const auto est =
@@ -752,11 +816,17 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
 
     const double score = jsonNumber<double>(data, "score", -1e30);
     if (!jsonBool(data, "success", false)) {
-        if (is_loop) {
-            ROS_INFO("[registration] loop D2D failed X(%d)->X(%d) "
-                     "(score=%.4f, no factor staged)",
-                     prev_idx, curr_idx, score);
-        }
+        const std::string reason =
+            data.value("failure_reason", std::string("unknown_worker_failure"));
+        const std::string detail =
+            data.value("failure_detail", std::string());
+        const long elapsed_ms = jsonNumber<long>(data, "elapsed_ms", -1);
+        ROS_INFO("[registration] %s D2D failed X(%d)->X(%d): "
+                 "reason=%s score=%.4f elapsed_ms=%ld%s%s",
+                 is_loop ? "loop" : "sequential",
+                 prev_idx, curr_idx, reason.c_str(), score, elapsed_ms,
+                 detail.empty() ? "" : " detail=",
+                 detail.empty() ? "" : detail.c_str());
         return;
     }
 
@@ -776,16 +846,25 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
             return;
         }
     } else {
-        if (score < registration_score_threshold_) return;
-        if ((curr_idx % registration_factor_every_n_frames_) != 0) return;
+        if (score < registration_score_threshold_) {
+            ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
+                     "score=%.4f < registration_score_threshold %.4f",
+                     prev_idx, curr_idx, score, registration_score_threshold_);
+            return;
+        }
+        if ((curr_idx % registration_factor_every_n_frames_) != 0) {
+            ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
+                     "curr_idx %% factor_every_n_frames = %d %% %d != 0",
+                     prev_idx, curr_idx, curr_idx,
+                     registration_factor_every_n_frames_);
+            return;
+        }
     }
 
     if (prev_idx >= curr_idx) {
-        if (is_loop) {
-            ROS_INFO("[registration] rejected loop result X(%d)->X(%d): "
-                     "prev_idx >= curr_idx",
-                     prev_idx, curr_idx);
-        }
+        ROS_INFO("[registration] rejected %s D2D result X(%d)->X(%d): "
+                 "prev_idx >= curr_idx",
+                 is_loop ? "loop" : "sequential", prev_idx, curr_idx);
         return;
     }
 
@@ -793,11 +872,9 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
     // fails the SE(3) sanity check below).
     auto t_it = data.find("transform");
     if (t_it == data.end() || !t_it->is_array() || t_it->size() != 16) {
-        if (is_loop) {
-            ROS_WARN("[registration] rejected loop result X(%d)->X(%d): "
-                     "missing/invalid transform array",
-                     prev_idx, curr_idx);
-        }
+        ROS_INFO("[registration] rejected %s D2D result X(%d)->X(%d): "
+                 "missing/invalid transform array",
+                 is_loop ? "loop" : "sequential", prev_idx, curr_idx);
         return;
     }
     Matrix4d T;
@@ -837,6 +914,25 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
     item.is_loop = is_loop;
     item.score = score;
     item.stamp_sec = result_stamp_sec;
+    auto init_it = data.find("initial_transform");
+    if (init_it != data.end() && init_it->is_array() && init_it->size() == 16) {
+        Matrix4d T_init;
+        bool ok = true;
+        for (int r = 0; r < 4 && ok; ++r) {
+            for (int c = 0; c < 4; ++c) {
+                const auto& v = (*init_it)[static_cast<std::size_t>(r * 4 + c)];
+                if (!v.is_number()) {
+                    ok = false;
+                    break;
+                }
+                T_init(r, c) = v.get<double>();
+            }
+        }
+        if (ok && isSaneRigidTransform(T_init)) {
+            item.has_initial_transform = true;
+            item.initial_transform = T_init;
+        }
+    }
     if (is_loop) {
         item.solid_rescue = jsonBool(data, "solid_rescue", false);
         auto cos_it = data.find("solid_cos_sim");
@@ -862,6 +958,10 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
     const int sid_curr = jsonNumber<int>(data, "curr_idx", -1);
     const bool success = jsonBool(data, "success", false);
     const double score = jsonNumber<double>(data, "score", -1e30);
+    const std::string failure_reason =
+        data.value("failure_reason", std::string("unknown_worker_failure"));
+    const std::string failure_detail =
+        data.value("failure_detail", std::string());
 
     if (sid_prev < 0 || sid_curr < 0) {
         ROS_WARN_THROTTLE(2.0,
@@ -869,8 +969,12 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
         return;
     }
 
-    ROS_INFO("[registration] submap result S(%d)<->S(%d) success=%s score=%.4f",
-             sid_prev, sid_curr, success ? "true" : "false", score);
+    ROS_INFO("[registration] submap result S(%d)<->S(%d) success=%s score=%.4f%s%s%s%s",
+             sid_prev, sid_curr, success ? "true" : "false", score,
+             success ? "" : " reason=",
+             success ? "" : failure_reason.c_str(),
+             (!success && !failure_detail.empty()) ? " detail=" : "",
+             (!success && !failure_detail.empty()) ? failure_detail.c_str() : "");
 
     const ros::Time stamp_msg = ros::Time(result_stamp_sec);
     if (global_graph_ != nullptr) {
@@ -916,6 +1020,29 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
     }
 
     if (global_graph_ != nullptr) {
+        if (success) {
+            Vector3d p_prev = Vector3d::Zero();
+            Vector3d p_curr = Vector3d::Zero();
+            bool have_positions = false;
+            {
+                std::lock_guard<std::recursive_mutex> lk(global_graph_->lock);
+                const auto prev_pose_it = global_graph_->submap_pose_by_idx.find(sid_prev);
+                const auto curr_pose_it = global_graph_->submap_pose_by_idx.find(sid_curr);
+                if (prev_pose_it != global_graph_->submap_pose_by_idx.end() &&
+                    curr_pose_it != global_graph_->submap_pose_by_idx.end()) {
+                    p_prev = prev_pose_it->second.block<3, 1>(0, 3);
+                    p_curr = curr_pose_it->second.block<3, 1>(0, 3);
+                    have_positions = true;
+                }
+            }
+            if (have_positions) {
+                std::ostringstream oss;
+                oss << "submap D2D S(" << sid_prev << ")->S(" << sid_curr << ")";
+                publishD2DRegistrationMarker("submap", oss.str(), p_prev, p_curr,
+                                             score, stamp_msg,
+                                             0.25f, 0.65f, 1.0f);
+            }
+        }
         global_graph_->handleSubmapRegistrationResult(sid_prev, sid_curr, T, score, stamp_msg);
     }
 }
@@ -941,7 +1068,9 @@ void RegistrationManager::drainResults(const ros::Time& stamp)
                                     r.score, r.force_loop, r.use_super,
                                     r.is_loop, factor_stamp,
                                     r.has_solid_cos_sim, r.solid_cos_sim,
-                                    r.solid_rescue);
+                                    r.solid_rescue,
+                                    r.has_initial_transform,
+                                    r.initial_transform);
             staged_any = true;
         } catch (const std::exception& e) {
             ROS_WARN_THROTTLE(2.0, "[registration] drain error: %s", e.what());
@@ -962,7 +1091,8 @@ void RegistrationManager::stageRegistrationFactor(
     int prev_idx, int curr_idx, const Matrix4d& T_prev_to_curr,
     double score, bool force_loop, bool use_super,
     bool is_loop_candidate, const ros::Time& stamp,
-    bool has_solid_cos_sim, double solid_cos_sim, bool solid_rescue)
+    bool has_solid_cos_sim, double solid_cos_sim, bool solid_rescue,
+    bool has_initial_transform, const Matrix4d& initial_transform)
 {
     int latest_key_snapshot = 0;
     double t_curr_snapshot = 0.0;
@@ -974,10 +1104,18 @@ void RegistrationManager::stageRegistrationFactor(
         std::lock_guard<std::mutex> gk(smoother_.graph_lock);
         latest_key_snapshot = smoother_.latest_key_idx;
         if (prev_idx < 0 || curr_idx > latest_key_snapshot) {
+            ROS_INFO("[registration] rejected %s D2D X(%d)->X(%d): "
+                     "invalid/latest key state (latest X(%d))",
+                     is_loop_candidate ? "loop" : "sequential",
+                     prev_idx, curr_idx, latest_key_snapshot);
             return;
         }
         const auto t_curr_it = smoother_.key_t_sec.find(curr_idx);
         if (t_curr_it == smoother_.key_t_sec.end()) {
+            ROS_INFO("[registration] rejected %s D2D X(%d)->X(%d): "
+                     "missing timestamp for curr key",
+                     is_loop_candidate ? "loop" : "sequential",
+                     prev_idx, curr_idx);
             return;
         }
         t_curr_snapshot = t_curr_it->second;
@@ -1141,9 +1279,54 @@ void RegistrationManager::stageRegistrationFactor(
     } else {
         // Sequential → BetweenFactor
         if (!have_prev_t) {
+            ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
+                     "missing timestamp for prev key",
+                     prev_idx, curr_idx);
             return;
         }
         if ((t_latest_snapshot - t_prev_snapshot) > smoother_.fixed_lag_s * 1.1) {
+            ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
+                     "prev key outside fixed-lag window "
+                     "(latest_t - prev_t = %.2fs, lag = %.2fs)",
+                     prev_idx, curr_idx,
+                     t_latest_snapshot - t_prev_snapshot,
+                     smoother_.fixed_lag_s);
+            return;
+        }
+
+        Matrix4d T_prior_prev_to_curr = initial_transform;
+        if (!has_initial_transform) {
+            Matrix4d T_w_prev = Matrix4d::Identity();
+            Matrix4d T_w_curr = Matrix4d::Identity();
+            {
+                std::lock_guard<std::mutex> gk(smoother_.graph_lock);
+                const auto prev_pose_it = smoother_.pose_by_idx.find(prev_idx);
+                const auto curr_pose_it = smoother_.pose_by_idx.find(curr_idx);
+                if (prev_pose_it == smoother_.pose_by_idx.end() ||
+                    curr_pose_it == smoother_.pose_by_idx.end()) {
+                    ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
+                             "missing pose history for consistency check",
+                             prev_idx, curr_idx);
+                    return;
+                }
+                T_w_prev = prev_pose_it->second;
+                T_w_curr = curr_pose_it->second;
+            }
+            T_prior_prev_to_curr = T_w_prev.inverse() * T_w_curr;
+        }
+
+        const Matrix4d T_err = T_prior_prev_to_curr.inverse() * T_prev_to_curr;
+        const double trans_err = T_err.block<3, 1>(0, 3).norm();
+        const double rot_err_deg = rotationAngleDeg(T_err.block<3, 3>(0, 0));
+        const double trans_limit_m = std::max(0.75, 4.0 * seq_sigma_t_max_);
+        const double rot_limit_deg =
+            std::max(20.0, 4.0 * seq_sigma_r_max_ * 180.0 / M_PI);
+        if (trans_err > trans_limit_m || rot_err_deg > rot_limit_deg) {
+            ROS_WARN("[registration] rejected sequential D2D X(%d)->X(%d): "
+                     "D2D/prior consistency error trans=%.3fm rot=%.2fdeg "
+                     "(limits %.3fm %.2fdeg, score=%.4f)",
+                     prev_idx, curr_idx, trans_err, rot_err_deg,
+                     trans_limit_m, rot_limit_deg, score);
             return;
         }
 
@@ -1158,10 +1341,112 @@ void RegistrationManager::stageRegistrationFactor(
             gtsam::BetweenFactor<gtsam::Pose3>(
                 X(prev_idx), X(curr_idx), rel_pose, noise).clone());
 
+        {
+            Vector3d p_prev = Vector3d::Zero();
+            Vector3d p_curr = Vector3d::Zero();
+            bool have_positions = false;
+            {
+                std::lock_guard<std::mutex> gk(smoother_.graph_lock);
+                const auto prev_pose_it = smoother_.pose_by_idx.find(prev_idx);
+                const auto curr_pose_it = smoother_.pose_by_idx.find(curr_idx);
+                if (prev_pose_it != smoother_.pose_by_idx.end() &&
+                    curr_pose_it != smoother_.pose_by_idx.end()) {
+                    p_prev = prev_pose_it->second.block<3, 1>(0, 3);
+                    p_curr = curr_pose_it->second.block<3, 1>(0, 3);
+                    have_positions = true;
+                }
+            }
+            if (have_positions) {
+                std::ostringstream oss;
+                oss << "seq D2D X(" << prev_idx << ")->X(" << curr_idx << ")";
+                publishD2DRegistrationMarker("sequential", oss.str(), p_prev, p_curr,
+                                             score, stamp,
+                                             0.95f, 0.95f, 0.15f);
+            }
+        }
+
         ROS_INFO("[registration] staged between factor X(%d)->X(%d) "
                  "score=%.4f sigma_t=%.4f sigma_r=%.4f",
                  prev_idx, curr_idx, score, sigma_t, sigma_r);
     }
+}
+
+void RegistrationManager::publishD2DRegistrationMarker(
+    const std::string& kind,
+    const std::string& label,
+    const Vector3d& p_prev,
+    const Vector3d& p_curr,
+    double score,
+    const ros::Time& stamp,
+    float r, float g, float b)
+{
+    if (loop_closure_markers_pub_.getTopic().empty()) {
+        return;
+    }
+
+    const int uid = loop_viz_uid_.fetch_add(2, std::memory_order_relaxed);
+
+    visualization_msgs::Marker line;
+    line.header.frame_id = map_frame_;
+    line.header.stamp = stamp;
+    line.ns = "gmmslam_d2d_" + kind + "_edges";
+    line.id = uid;
+    line.type = visualization_msgs::Marker::LINE_LIST;
+    line.action = visualization_msgs::Marker::ADD;
+    line.pose.orientation.w = 1.0;
+    line.scale.x = (kind == "loop") ? 0.08 : 0.04;
+    line.lifetime = ros::Duration(0.0);
+    line.color.r = r;
+    line.color.g = g;
+    line.color.b = b;
+    line.color.a = 1.0f;
+
+    geometry_msgs::Point a, c;
+    a.x = p_prev.x();
+    a.y = p_prev.y();
+    a.z = p_prev.z();
+    c.x = p_curr.x();
+    c.y = p_curr.y();
+    c.z = p_curr.z();
+    line.points.push_back(a);
+    line.points.push_back(c);
+
+    const bool show_text =
+        kind == "submap" ? d2d_submap_overlap_text_enable_
+                         : d2d_frame_to_frame_text_enable_;
+
+    visualization_msgs::MarkerArray arr;
+    {
+        std::lock_guard<std::mutex> lk(loop_viz_mutex_);
+        loop_closure_marker_history_.markers.push_back(std::move(line));
+        if (show_text) {
+            visualization_msgs::Marker txt;
+            txt.header.frame_id = map_frame_;
+            txt.header.stamp = stamp;
+            txt.ns = "gmmslam_d2d_" + kind + "_labels";
+            txt.id = uid + 1;
+            txt.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+            txt.action = visualization_msgs::Marker::ADD;
+            txt.pose.orientation.w = 1.0;
+            txt.pose.position.x = 0.5 * (p_prev.x() + p_curr.x());
+            txt.pose.position.y = 0.5 * (p_prev.y() + p_curr.y());
+            txt.pose.position.z = 0.5 * (p_prev.z() + p_curr.z()) + 0.35;
+            txt.scale.z = 0.28;
+            txt.lifetime = ros::Duration(0.0);
+            txt.color.r = 1.0f;
+            txt.color.g = 1.0f;
+            txt.color.b = 1.0f;
+            txt.color.a = 1.0f;
+
+            std::ostringstream oss;
+            oss << label << " score=" << score;
+            txt.text = oss.str();
+            loop_closure_marker_history_.markers.push_back(std::move(txt));
+        }
+        arr = loop_closure_marker_history_;
+    }
+
+    loop_closure_markers_pub_.publish(arr);
 }
 
 void RegistrationManager::publishLoopClosureMarkers(
@@ -1191,7 +1476,7 @@ void RegistrationManager::publishLoopClosureMarkers(
         loop_viz_uid_.fetch_add(2, std::memory_order_relaxed);
 
     visualization_msgs::MarkerArray arr;
-    arr.markers.reserve(2);
+    arr.markers.reserve(d2d_loop_closure_text_enable_ ? 2 : 1);
 
     visualization_msgs::Marker line;
     line.header.frame_id = map_frame_;
@@ -1223,38 +1508,40 @@ void RegistrationManager::publishLoopClosureMarkers(
     line.points.push_back(a);
     line.points.push_back(b);
 
-    visualization_msgs::Marker txt;
-    txt.header.frame_id = map_frame_;
-    txt.header.stamp = stamp;
-    txt.ns = "gmmslam_loop_labels";
-    txt.id = uid + 1;
-    txt.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-    txt.action = visualization_msgs::Marker::ADD;
-    txt.pose.orientation.w = 1.0;
-    txt.pose.position.x = 0.5 * (p_prev.x() + p_curr.x());
-    txt.pose.position.y = 0.5 * (p_prev.y() + p_curr.y());
-    txt.pose.position.z = 0.5 * (p_prev.z() + p_curr.z()) + 0.35;
-    txt.scale.z = 0.35;
-    txt.lifetime = ros::Duration(0.0);
-    txt.color.r = 1.0f;
-    txt.color.g = 1.0f;
-    txt.color.b = 1.0f;
-    txt.color.a = 1.0f;
-
-    std::ostringstream oss;
-    oss << "loop X(" << prev_idx << ")-X(" << curr_idx << ") D2D=" << score;
-    if (has_solid_cos) {
-        oss << " SOLiD_cos=" << solid_cos_sim;
-    }
-    if (solid_rescue) {
-        oss << " [rescue]";
-    }
-    txt.text = oss.str();
-
     {
         std::lock_guard<std::mutex> lk(loop_viz_mutex_);
         loop_closure_marker_history_.markers.push_back(std::move(line));
-        loop_closure_marker_history_.markers.push_back(std::move(txt));
+        if (d2d_loop_closure_text_enable_) {
+            visualization_msgs::Marker txt;
+            txt.header.frame_id = map_frame_;
+            txt.header.stamp = stamp;
+            txt.ns = "gmmslam_loop_labels";
+            txt.id = uid + 1;
+            txt.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
+            txt.action = visualization_msgs::Marker::ADD;
+            txt.pose.orientation.w = 1.0;
+            txt.pose.position.x = 0.5 * (p_prev.x() + p_curr.x());
+            txt.pose.position.y = 0.5 * (p_prev.y() + p_curr.y());
+            txt.pose.position.z = 0.5 * (p_prev.z() + p_curr.z()) + 0.35;
+            txt.scale.z = 0.35;
+            txt.lifetime = ros::Duration(0.0);
+            txt.color.r = 1.0f;
+            txt.color.g = 1.0f;
+            txt.color.b = 1.0f;
+            txt.color.a = 1.0f;
+
+            std::ostringstream oss;
+            oss << "loop closure D2D X(" << prev_idx << ")->X(" << curr_idx
+                << ") score=" << score;
+            if (has_solid_cos) {
+                oss << " SOLiD_cos=" << solid_cos_sim;
+            }
+            if (solid_rescue) {
+                oss << " [rescue]";
+            }
+            txt.text = oss.str();
+            loop_closure_marker_history_.markers.push_back(std::move(txt));
+        }
         arr = loop_closure_marker_history_;
     }
 

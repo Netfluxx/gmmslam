@@ -8,6 +8,7 @@ Panels:
         - /Grid1
         - /TF1
         - /DepthCloud1
+        - /GmmMap1/Status1
         - /Odometry1
         - /MarkerArray3
       Splitter Ratio: 0.4514877200126648
@@ -174,25 +175,23 @@ Visualization Manager:
       Name: GmmMap
       Namespaces:
         {}
-      Queue Size: 100
+      Queue Size: 1
       Value: true
     - Class: rviz/MarkerArray
-      Enabled: false
+      Enabled: true
       Marker Topic: /gmmslam_node/gmm_markers
       Name: GmmLatest
       Namespaces:
-        {}
-      Queue Size: 100
-      Value: false
+        gmm_latest: true
+      Queue Size: 1
+      Value: true
     - Class: rviz/MarkerArray
       Enabled: true
       Marker Topic: /gmmslam_node/global_graph_markers
       Name: SubmapGraph
       Namespaces:
-        global_loop_labels: true
-        global_loops: true
         global_submaps: true
-      Queue Size: 100
+      Queue Size: 1
       Value: true
     - Class: rviz/MarkerArray
       Enabled: false
@@ -326,8 +325,7 @@ Visualization Manager:
       Marker Topic: /gmmslam_node/loop_closure_markers
       Name: LoopClosures
       Namespaces:
-        gmmslam_loop_edges: true
-        gmmslam_loop_labels: true
+        {}
       Queue Size: 100
       Value: true
     - Class: rviz/MarkerArray
@@ -381,20 +379,25 @@ Visualization Manager:
   Value: true
   Views:
     Current:
-      Angle: 0
-      Class: rviz/TopDownOrtho
+      Class: rviz/Orbit
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
         Swap Stereo Eyes: false
         Value: false
+      Distance: 12
+      Focal Point:
+        X: 0
+        Y: 0
+        Z: 0
+      Focal Shape Fixed Size: true
+      Focal Shape Size: 0.05000000074505806
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Scale: 30
-      Target Frame: world
-      X: 0
-      Y: 0
+      Pitch: 0.7853981852531433
+      Target Frame: m500_1_base_link
+      Yaw: 0.7853981852531433
     Saved: ~
 Window Geometry:
   DepthImage:

@@ -14,6 +14,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -38,6 +39,7 @@ public:
                         const LoopClosureConfig& lc_cfg,
                         const SolidConfig& solid_cfg,
                         const SogmmConfig& sogmm_cfg,
+                        const VisualizationConfig& vis_cfg,
                         const std::string& gmm_dir,
                         ros::Publisher loop_closure_markers_pub = {},
                         std::string map_frame = {});
@@ -45,6 +47,7 @@ public:
     // Enqueue a GMM fit. Returns true if enqueued, false if dropped.
     bool enqueueFit(int frame_idx, const ros::Time& stamp,
                     const Eigen::MatrixXf& pts,
+                    std::optional<OrganizedDepthImage> organized_depth,
                     double capture_t_sec, const Matrix4d& capture_pose);
 
     // Synchronous: compute SOLiD descriptor from a preprocessed sensor-frame
@@ -94,6 +97,7 @@ private:
         int frame_idx;
         ros::Time stamp;
         Eigen::MatrixXf points;
+        std::optional<OrganizedDepthImage> organized_depth;
         double capture_t_sec;
         Matrix4d capture_pose;
     };
@@ -110,6 +114,8 @@ private:
         bool has_solid_cos_sim = false;
         double solid_cos_sim = 0.0;
         bool solid_rescue = false;
+        bool has_initial_transform = false;
+        Matrix4d initial_transform = Matrix4d::Identity();
     };
 
     struct NoiseResult {
@@ -137,9 +143,19 @@ private:
                                   const ros::Time& stamp,
                                   bool has_solid_cos_sim = false,
                                   double solid_cos_sim = 0.0,
-                                  bool solid_rescue = false);
+                                  bool solid_rescue = false,
+                                  bool has_initial_transform = false,
+                                  const Matrix4d& initial_transform = Matrix4d::Identity());
 
     void handleSubmapResult(const nlohmann::json& data, double result_stamp_sec);
+
+    void publishD2DRegistrationMarker(const std::string& kind,
+                                      const std::string& label,
+                                      const Vector3d& p_prev,
+                                      const Vector3d& p_curr,
+                                      double score,
+                                      const ros::Time& stamp,
+                                      float r, float g, float b);
 
     void publishLoopClosureMarkers(int prev_idx, int curr_idx, double score,
                                    const ros::Time& stamp, bool has_solid_cos,
@@ -174,6 +190,9 @@ private:
     int loop_closure_gmm_keep_keyframes_;
     double loop_closure_consistency_gate_trans_m_;
     double loop_closure_consistency_gate_rot_deg_;
+    bool d2d_frame_to_frame_text_enable_;
+    bool d2d_submap_overlap_text_enable_;
+    bool d2d_loop_closure_text_enable_;
     double score_sigma_low_;
     double score_sigma_high_;
     double seq_sigma_t_min_, seq_sigma_t_max_;

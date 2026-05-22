@@ -49,6 +49,11 @@ GmmModel mergeGmmsAndPrune(
 // that build the pre-pruned model themselves (e.g. tests).
 GmmModel pruneSimilarComponents(const GmmModel& in, const MapConfig& map_cfg);
 
+// Prune duplicates only when they come from different source GMM frames.
+// When a duplicate pair is found, keep the older source frame and drop the
+// duplicate component from the newer measurement.
+GmmModel pruneNewerFrameComponents(const GmmModel& in, const MapConfig& map_cfg);
+
 // Bhattacharyya distance between two 3D Gaussians. Returns
 // std::numeric_limits<double>::infinity() if either covariance is
 // numerically singular.

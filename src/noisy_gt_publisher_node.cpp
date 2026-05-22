@@ -1,4 +1,5 @@
 #include <ros/ros.h>
+#include <ros/console.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <nav_msgs/Path.h>
 
@@ -24,6 +25,15 @@ public:
         // Private ~params (Python launch / manual override), else same keys as
         // config/params.yaml loaded under /gmmslam via rosparam (gt_noise: …).
         ros::NodeHandle nh_gmmslam("/gmmslam");
+        bool debug_prints = true;
+        nh_gmmslam.param("DEBUG_PRINTS", debug_prints, debug_prints);
+        pnh.param("debug_prints", debug_prints, debug_prints);
+        if (!debug_prints) {
+            ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME,
+                                           ros::console::levels::Warn);
+            ros::console::notifyLoggerLevelsChanged();
+        }
+
         if (!pnh.getParam("gt_init_wait_s", gt_init_wait_s_)) {
             nh_gmmslam.param("gt_noise/init_wait_s", gt_init_wait_s_, 3.0);
         }

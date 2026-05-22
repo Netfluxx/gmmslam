@@ -16,6 +16,7 @@
   <arg name="gt_topic" default="/m500_1/mavros/local_position/pose"/>
   <arg name="registration_workers" default="6"/>
   <arg name="suppress_registration_backend_output" default="true"/>
+  <arg name="drop_stale_keyframe_registration_age_s" default="2.0"/>
   <arg name="odometry_input" default="/gmmslam_node/noisy_gt_pose"/>
   <arg name="gmmslam_respawn" default="true"/>
   <arg name="gmmslam_launch_prefix" default=""/>
@@ -56,6 +57,7 @@
     <param name="result_topic" value="/gmmslam_node/registration/result"/>
     <param name="num_workers" value="$(arg registration_workers)"/>
     <param name="suppress_backend_output" value="$(arg suppress_registration_backend_output)"/>
+    <param name="drop_stale_keyframe_age_s" value="$(arg drop_stale_keyframe_registration_age_s)"/>
   </node>
 
   <!-- ========== Noisy ground-truth publisher (feeds optional GT factors) ========== -->

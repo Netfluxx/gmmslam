@@ -2,6 +2,8 @@
 # GMM-SLAM C++ node – full parameter set
 # =============================================================================
 
+DEBUG_PRINTS: true  # false suppresses verbose INFO/DEBUG logs; WARN/ERROR stay visible
+
 # ---------------------------------------------------------------------------
 # ROS interface
 # ---------------------------------------------------------------------------
@@ -21,41 +23,94 @@ ros:
 # Point-cloud pre-processing
 # ---------------------------------------------------------------------------
 preprocess:
-  min_range:       0.1       # [m] discard points closer than this
-  max_range:       25.0      # [m] discard points farther than this
+  min_range:       0.3       # [m] discard near self-observations such as propellers
+  max_range:       50.0      # [m] discard points farther than this
   voxel_leaf_size: 0.0       # [m] optional voxel centroid grid (0 = off); runs before target cap
-  target_points:   2000     # if > 0, random subsample to at most this many points (after range+voxel)
+  target_points:   10000     # if > 0, random subsample to at most this many points (after range+voxel)
   min_points:      100       # frames with fewer points after preprocess are skipped
 
 # ---------------------------------------------------------------------------
 # SOGMM fitting
 # ---------------------------------------------------------------------------
 sogmm:
+  backend:      "gmmap"      # "sogmm" (default) or "gmmap" if built with GMMSLAM_USE_GMMAP
   bandwidth:    0.12         # [m] mean-shift bandwidth
-  max_points:   2000         # downsample to at most this many points
+  max_points:   10000         # downsample to at most this many points
   n_components: 0            # 0 = auto via mean-shift
   compute:      "GPU"        # "GPU" or "CPU"
+
+gmmap:
+  # Parameters following the TUM example.
+  frame:
+    dataset: "tum"
+    occ_x_t: 10
+    noise_thresh: 0.2
+    sparse_t: 5
+    ncheck_t: 16
+    adaptive_thresh_scale: 2.4
+    line_t: 0.3
+    angle_t: 0.5
+    noise_floor: 0.08
+    num_line_t: 24
+    num_pixels_t: 400
+    max_incomplete_clusters: 20
+    free_space_dist_scale: 1.0
+    debug_row_idx: 240
+  map:
+    num_threads: 4
+    measure_memory: false
+    frame_alg_name: "spgf_extended"
+    max_depth: 50.0
+    hell_thresh_squard_oversized_gau: 0.3
+    hell_thresh_squard_free: 0.07
+    hell_thresh_squard_obs_scale: 7.0
+    min_gau_len: 0.05
+    frame_max_scale: 5.0
+    min_num_neighbor_clusters: 6
+    hell_thresh_squard_min: 0.1e-5
+    gau_fusion_bd: 2.0
+    gau_rtree_bd: 2.0
+    depth_scale: 1.0
+    track_color: false
+    track_intensity: false
+    cur_debug_frame: false
+  adapter:
+    # GMMap can drop far/depth-sparse occupied pixels. Supplement distant valid
+    # depth with coarse Gaussian voxels so the fitted model covers sensor range.
+    far_fill_enable: false
+    far_fill_start_m: 6.0
+    far_fill_voxel_m: 0.4
+    far_fill_max_components: 250
+    far_fill_skip_max_depth_margin_m: 0.5  # avoid Webots max-range no-return shell
+    # GMMap expects stable pinhole intrinsics. Estimating them from each point
+    # cloud is fragile and can produce negative focal lengths / off-image centers.
+    estimate_intrinsics: false
+    horizontal_fov_deg: 120.0  # Webots RangeFinder depth_camera FOV ~= 2.0944 rad
+    fx: 0.0    # <=0: derive from incoming cloud width and horizontal_fov_deg
+    fy: 0.0    # <=0: use same focal length as fx
+    cx: -1.0   # <0: derive from incoming cloud width
+    cy: -1.0   # <0: derive from incoming cloud height
 
 # ---------------------------------------------------------------------------
 # Fixed-lag iSAM2 smoother
 # ---------------------------------------------------------------------------
 smoother:
-  fixed_lag_s:       6.0     # [s] smoothing window
+  fixed_lag_s:       7.0     # [s] smoothing window
   smoother_stride:   1       # optimise every N frames
   odom_noise_sigma_t: 0.01   # [m] translation odometry noise
   odom_noise_sigma_r: 0.01  # [rad] rotation odometry noise
   lost_scale:        100.0    # multiplier on odom noise when tracking is lost
   prior_scale:       0.1     # multiplier on odom noise for the origin prior
-  pose_history_keep: 1000    # max keyframes kept in pose history. 1keyframe = 0.3m => 300m here.
+  pose_history_keep: 2500    # max keyframes kept in pose history. 1keyframe = 0.3m.
 
 # ---------------------------------------------------------------------------
 # D2D registration (async worker pool)
 # ---------------------------------------------------------------------------
 registration:
   enable_async:              true
-  request_every_n_frames:    2
-  factor_every_n_frames:     2
-  score_threshold:           0.8
+  request_every_n_frames:    1
+  factor_every_n_frames:     1
+  score_threshold:           0.9
   strong_factor_score_threshold: 1.1
   strong_factor_sigma_t:     0.03
   strong_factor_sigma_r:     0.03
@@ -65,8 +120,8 @@ registration:
   workers:                   6
   compensate_fit_latency:    true
   # Score-to-sigma mapping: low score → high noise, high score → low noise
-  score_sigma_low:           0.05
-  score_sigma_high:          0.8
+  score_sigma_low:           0.3
+  score_sigma_high:          1.0
   # Sequential-frame registration noise bounds
   seq_sigma_t_min:           0.03
   seq_sigma_t_max:           0.20
@@ -84,41 +139,43 @@ registration:
 loop_closure:
   enable:                     true
   search_radius_m:            3.2    # [m] spatial search radius
-  min_keyframe_gap:           7      # skip recent keyframes
-  max_candidates:             6
-  request_every_n_keyframes:  1
-  search_cooldown_keyframes:  1
+  min_keyframe_gap:           100    # skip local matches (~10 submaps at 10 keyframes/submap)
+  max_candidates:             1
+  request_every_n_keyframes:  8
+  search_cooldown_keyframes:  8
   min_separation_m:           0.3    # [m] translation gate (paired with deg in C++)
-  min_separation_deg:         15.0   # [deg] paired with min_separation_m for diversity
-  max_age_s:                  9999.0  # [s] ignore keyframes older than this
-  gmm_keep_keyframes:         105000  # GMMs kept for loop-closure matching
-  detect_score_threshold:     0.8   # accept loop if D2D score > this
+  min_separation_deg:         5.0   # [deg] paired with min_separation_m for diversity
+  max_age_s:                  99999.0  # [s] ignore keyframes older than this
+  gmm_keep_keyframes:         99999  # GMMs kept for loop-closure matching
+  detect_score_threshold:     0.75  # accept loop if D2D score > this
   super_sigma_t:              0.02   # noise for very confident loops
   super_sigma_r:              0.02
+  consistency_gate_trans_m:   3.0    # reject D2D loops far from current pose estimate
+  consistency_gate_rot_deg:   45.0
 
 # ---------------------------------------------------------------------------
 # SOLiD — spatially organized, lightweight global descriptor (Kim et al. 2024)
 # Used as appearance-based gate on the radius loop search
-# index + yaw prior for D2D. Tuned for a 120° horizontal FOV depth camera.
+# index + yaw prior for D2D. Tuned for a 120 deg horizontal FOV depth camera.
 # ---------------------------------------------------------------------------
 solid:
   enable:                     true
   fov_up_deg:                 30.0    # match the depth camera's vertical FOV
   fov_down_deg:              -30.0
   min_distance_m:             0.5
-  max_distance_m:             35.0    # match preprocess.max_range
+  max_distance_m:             50.0    # match preprocess.max_range
   num_angle:                  36      # 10° bins over 360° azimuth
   num_range:                  32      # radial bins
   num_height:                 16      # vertical bins across FOV
   voxel_size_m:               0.0     # extra coarse voxel (<=0 disables)
-  cos_similarity_threshold:   0.5    # minimum range-cosine to pass the gate
+  cos_similarity_threshold:   0.96    # minimum range-cosine to pass the gate
   radius_weight:              0.55    # fused-score weight on radius term
   appearance_weight:          0.45    # fused-score weight on cosine term
   provide_yaw_prior:          true    # attach SOLiD yaw as T_init for D2D
   overlap_min:                0.22    # min non-zero-bin overlap for yaw search
   max_abs_yaw_deg:            100.0   # restrict shift search to |Δyaw| <= this
   yaw_sign:                   1       # flip to -1 if empirical convention wrong
-  rescue_enable:              true
+  rescue_enable:              true    # fallback loop candidate search when the normal radius-based SOLiD seach is not finding anything
   rescue_every_n_kf:          10      # throttle full-index rescue search
   rescue_trigger_silence_kf:  30      # trigger rescue after this many silent kf
   rescue_top_k:               3
@@ -129,33 +186,41 @@ solid:
 # Keyframe triggers
 # ---------------------------------------------------------------------------
 keyframe:
-  translation_thresh_m: 0.5
-  rotation_thresh_deg:  20.0
+  translation_thresh_m: 0.1
+  rotation_thresh_deg:  5.0
   use_time_trigger:     false
-  max_interval_s:       10.0   # [s] force keyframe after this long
+  max_interval_s:       2.0   # [s] force keyframe after this long
 
 # ---------------------------------------------------------------------------
 # Global pose graph (submap level)
 # ---------------------------------------------------------------------------
 global_graph:
   enable:                        true
-  submap_keyframes_per_submap:   10
-  between_sigma_t:               0.08
-  between_sigma_r:               0.08
+  submap_keyframes_per_submap:   32
+  between_sigma_t:               0.1
+  between_sigma_r:               0.1
   prior_sigma_t:                 0.02
   prior_sigma_r:                 0.02
   # Overlap candidate search: smaller radius = fewer (stricter) submap D2D requests.
   overlap_radius_m:              2.0 # only submaps with anchor positions within this distance will be considered fro D2D
-  # Minimum D2D score to accept overlap submap registrations (also ROS param
-  # ~submap_reg_score_threshold). Raise (e.g. 0.55–0.7) to drop marginal fits.
-  reg_score_threshold:           0.8
+  max_overlap_registrations:     3   # cap closest overlap D2D jobs per new submap to avoid queue floods
+  # Minimum D2D score to accept overlap submap registrations. Submap-to-submap
+  # D2D scores are much lower than keyframe loop scores; geometric aux gates
+  # below still reject inconsistent transforms.
+  reg_score_threshold:           0.9
+  # Global loop closures must span many submaps; short-gap matches are local
+  # re-observations and should not deform the long-term graph.
+  min_loop_submap_gap:           8
+  
+  enable_traj_aux_factors:       false # extra sequential fixed-lag trajectory factor, not submap D2D
   traj_sigma_t:                  0.15
   traj_sigma_r:                  0.15
+  # Result D2D must not be too far from the current pose estimate
+  aux_gate_abs_trans_m:          1.0
+  aux_gate_abs_rot_deg:          15.0
   # Overlap submap D2D: relative transform vs anchor geometry (strict).
-  aux_gate_abs_trans_m:          1.2
-  aux_gate_abs_rot_deg:          20.0
-  aux_gate_consistency_trans_m:  1.2
-  aux_gate_consistency_rot_deg:  20.0
+  aux_gate_consistency_trans_m:  0.6
+  aux_gate_consistency_rot_deg:  10.0
   # Sequential submap trajectory aux (prev_anchor -> curr_anchor): spans
   # ~submap_keyframes_per_submap keyframes; keep looser than aux_gate_* so normal
   # turns are not rejected (overlap D2D still uses aux_gate_* only).
@@ -164,18 +229,19 @@ global_graph:
   traj_aux_gate_consistency_trans_m:  2.0
   traj_aux_gate_consistency_rot_deg:  40.0
   # When traj aux factor fails absurd-motion gates, rebuild fixed-lag smoother
-  reanchor_smoother_on_traj_gate_fail: true
-  # Submap GMM merge: wait for more async SOGMM fits before finalizing (cross-keyframe dedup).
-  # Defaults match legacy "finalize as soon as any keyframe GMM exists".
-  submap_finalize_min_ready_keyframes: 12   # require max(1, this, ceil(fraction*N))) ready
-  submap_finalize_min_ready_fraction:  1.0  # (0,1]; e.g. 0.6 => wait for 60% of submap keyframes
-  submap_finalize_max_wait_s:          10.0  # >0: after this wait, finalize with whatever is ready
+  reanchor_smoother_on_traj_gate_fail: false
+  # Submap GMM merge: this code currently splits submaps by odom-frame index
+  # distance, so the submap size above is set to avoid large synchronous
+  # prune/save bursts that stall topic publishing.
+  submap_finalize_min_ready_keyframes: 8
+  submap_finalize_min_ready_fraction:  0.6
+  submap_finalize_max_wait_s:          5.0   # fallback if async fits lag behind
 
   # Submap-level loop-closure noise bounds
-  submap_loop_sigma_t_min:       0.05
-  submap_loop_sigma_t_max:       0.50
-  submap_loop_sigma_r_min:       0.03
-  submap_loop_sigma_r_max:       0.30
+  submap_loop_sigma_t_min:       0.25
+  submap_loop_sigma_t_max:       1.00
+  submap_loop_sigma_r_min:       0.12
+  submap_loop_sigma_r_max:       0.60
 
 # ---------------------------------------------------------------------------
 # when using the Webots simulation, add noise to the ground truth pose
@@ -194,7 +260,7 @@ gt_noise:
 # IMU pre-integration
 # ---------------------------------------------------------------------------
 imu:
-  enable_preintegration: true
+  enable_preintegration: false  # GT/noisy-GT odometry already constrains poses; IMU velocity states can underconstrain fixed-lag
   gravity_mps2:          9.81
   buffer_keep_s:         30.0
   acc_noise_sigma:       0.001
@@ -209,8 +275,13 @@ imu:
 # Visualization
 # ---------------------------------------------------------------------------
 visualization:
-  gmm_marker_sigma:           3.0    # ellipsoid scale factor, number of standard deviations
+  gmm_marker_sigma:           4.0    # ellipsoid scale factor, number of standard deviations
+  global_gmm_markers_enable:  false   # show corrected global/submap GMM ellipsoid markers in RViz
   global_gmm_publish_period_s: 5.0   # [s]
+  d2d_frame_to_frame_text_enable:    false  # show frame-to-frame D2D score labels in RViz
+  d2d_submap_overlap_text_enable:    true  # show submap-overlap D2D score labels in RViz
+  d2d_loop_closure_text_enable:      true  # show loop-closure D2D score labels in RViz
+  output_pose_lpf_cutoff_hz:  3.0    # [Hz] first-order low-pass published on odom_lpf (<=0 disables)
   map_cloud_publish_hz:     0.5     # accumulated raw map PointCloud2 rate
   map_cloud_max_chunks:     3000    # max smoother frames kept (oldest dropped)
 
@@ -224,11 +295,12 @@ visualization:
 # ---------------------------------------------------------------------------
 map:
   prune_enable:           true
-  prune_bhatt_threshold:  3.0    # merge if D_B < this (lower = more conservative)
-  prune_search_radius_m:  0.5    # AABB margin for inflation (m) on each axis
+  prune_frame_to_frame_enable: false  # keep older source frame, drop duplicate components from newer measurements
+  prune_bhatt_threshold:  3.5    # merge if D_B < this (lower = more conservative)
+  prune_search_radius_m:  1.0    # AABB margin for inflation (m) on each axis
   prune_use_rtree:        true   # index components by 3D AABB; else mean-radius prefilter only
   prune_rtree_chi_sq:     9.21   # 3-DOF chi-squared for ellipsoid -> AABB (larger = looser boxes)
-  prune_max_passes:       4      # greedy passes over the component list
+  prune_max_passes:       25      # greedy passes over the component list
   prune_cov_reg:          1.0e-6 # regularization added before any covariance inversion for stability
 
 # ---------------------------------------------------------------------------

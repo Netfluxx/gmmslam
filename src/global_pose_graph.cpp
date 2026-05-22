@@ -189,6 +189,7 @@ GlobalPoseGraph::GlobalPoseGraph(
     , map_cfg_(map_cfg)
     , submap_keyframes_per_submap_(gg_cfg.submap_keyframes_per_submap)
     , overlap_radius_m_(gg_cfg.overlap_radius_m)
+    , max_overlap_registrations_(std::max(0, gg_cfg.max_overlap_registrations))
     , submap_reg_score_threshold_(gg_cfg.reg_score_threshold)
     , min_loop_submap_gap_(std::max(0, gg_cfg.min_loop_submap_gap))
     , enable_traj_aux_factors_(gg_cfg.enable_traj_aux_factors)
@@ -594,6 +595,13 @@ void GlobalPoseGraph::requestOverlapRegistrations(int sid_new,
     const Vector3d pos_new = it_new->second.block<3,1>(0,3);
     const std::string& new_path = it_path_new->second;
 
+    struct OverlapCandidate {
+        double distance;
+        int sid_old;
+        std::string path_old;
+    };
+    std::vector<OverlapCandidate> candidates;
+
     int n_published = 0;
     for (int sid_old : submap_ids) {
         if (sid_old >= sid_new) continue;
@@ -613,14 +621,52 @@ void GlobalPoseGraph::requestOverlapRegistrations(int sid_new,
         const double d = (it_old->second.block<3,1>(0,3) - pos_new).norm();
         if (d > overlap_radius_m_) continue;
 
+        candidates.push_back({d, sid_old, it_path_old->second});
+    }
+
+    std::sort(candidates.begin(), candidates.end(),
+              [](const OverlapCandidate& a, const OverlapCandidate& b) {
+                  if (a.distance == b.distance) {
+                      return a.sid_old > b.sid_old;
+                  }
+                  return a.distance < b.distance;
+              });
+
+    const int n_to_publish = max_overlap_registrations_ > 0
+        ? std::min(max_overlap_registrations_,
+                   static_cast<int>(candidates.size()))
+        : static_cast<int>(candidates.size());
+
+    if (static_cast<int>(candidates.size()) > n_to_publish) {
+        ROS_INFO("[global_graph] S(%d): overlap candidates %zu, publishing closest %d",
+                 sid_new, candidates.size(), n_to_publish);
+    }
+
+    for (int i = 0; i < n_to_publish; ++i) {
+        const auto& cand = candidates[static_cast<std::size_t>(i)];
+        const int sid_old = cand.sid_old;
+        const auto edge = std::make_pair(std::min(sid_old, sid_new),
+                                         std::max(sid_old, sid_new));
+
         nlohmann::json payload;
         payload["prev_idx"]                 = sid_old;
         payload["curr_idx"]                 = sid_new;
         payload["stamp"]                    = stampToSec(stamp);
         payload["source_path"]              = new_path;
-        payload["target_path"]              = it_path_old->second;
+        payload["target_path"]              = cand.path_old;
         payload["is_loop_closure"]          = false;
         payload["is_submap_registration"]   = true;
+
+        const auto it_old_pose = submap_pose_by_idx.find(sid_old);
+        if (it_old_pose != submap_pose_by_idx.end()) {
+            const Matrix4d T_init = it_old_pose->second.inverse() * it_new->second;
+            Eigen::Matrix<double, 4, 4, Eigen::RowMajor> T_row(T_init);
+            std::vector<double> flat(16);
+            for (int k = 0; k < 16; ++k) {
+                flat[static_cast<std::size_t>(k)] = T_row.data()[k];
+            }
+            payload["initial_transform"] = std::move(flat);
+        }
 
         std_msgs::String msg;
         msg.data = payload.dump();
@@ -629,7 +675,7 @@ void GlobalPoseGraph::requestOverlapRegistrations(int sid_new,
         pending_submap_registrations_.insert(edge);
         ++n_published;
         ROS_INFO("[global_graph] requested registration "
-                 "S(%d)<->S(%d) (d=%.2fm)", sid_old, sid_new, d);
+                 "S(%d)<->S(%d) (d=%.2fm)", sid_old, sid_new, cand.distance);
     }
 
     submap_overlap_d2d_remaining_[sid_new] = n_published;
@@ -698,7 +744,7 @@ void GlobalPoseGraph::maybeApplyDeferredInternalSubmapPrune(int sid_new,
         }
     }
 
-    GmmModel pruned = pruneSimilarComponents(input, map_cfg_);
+    GmmModel pruned = pruneNewerFrameComponents(input, map_cfg_);
     if (pruned.components.empty()) {
         ROS_WARN("[global_graph] deferred internal prune S(%d) would remove "
                  "all components; keeping unpruned map", sid_new);
@@ -811,7 +857,7 @@ void GlobalPoseGraph::pruneSubmapPairGmmsAfterLoop(
         std::make_move_iterator(world_b.components.end()));
     normalizeGmmWeights(combined);
 
-    const GmmModel pruned = pruneSimilarComponents(combined, map_cfg_);
+    const GmmModel pruned = pruneNewerFrameComponents(combined, map_cfg_);
     if (pruned.components.empty()) {
         ROS_WARN("[global_graph] cross-submap prune S(%d)<->S(%d): "
                  "prune removed all components; keeping originals",

@@ -109,6 +109,19 @@ void Visualizer::publishPoseOnly(const Matrix4d& T, const ros::Time& stamp) {
     pubs_.odom.publish(odom);
 }
 
+void Visualizer::publishPoseLpf(const Matrix4d& T, const ros::Time& stamp) {
+    if (output_pose_lpf_cutoff_hz_ <= 0.0 || pubs_.odom_lpf.getTopic().empty()) {
+        return;
+    }
+
+    nav_msgs::Odometry odom;
+    odom.header.stamp    = stamp;
+    odom.header.frame_id = odom_frame_;
+    odom.child_frame_id  = base_frame_ + "_lpf";
+    odom.pose.pose       = poseToPoseStamped(T, stamp, odom_frame_).pose;
+    pubs_.odom_lpf.publish(odom);
+}
+
 // =====================================================================
 // Enqueue a frame for the vis thread (drop if full)
 // =====================================================================

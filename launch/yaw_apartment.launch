@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<launch>
+  <!-- Use with auto_pilot/webots_project/worlds/yaw_apartment.wbt. -->
+  <arg name="csv_path" default="/tmp/solid_yaw_apartment.csv"/>
+  <arg name="log_hz" default="10"/>
+
+  <param name="/webots_solid_yaw_supervisor/init_wait_s" value="5.0"/>
+  <param name="/webots_solid_yaw_supervisor/yaw_amplitude_deg" value="120.0"/>
+  <param name="/webots_solid_yaw_supervisor/yaw_rate_deg_s" value="18.0"/>
+
+  <include file="$(find gmmslam)/launch/solid_descriptor_benchmark.launch">
+    <arg name="lidar_topic" value="/m500_1/mpa/depth/points"/>
+    <arg name="pose_topic" value="/m500_1/macortex_bridge/m500_1/pose"/>
+    <arg name="csv_path" value="$(arg csv_path)"/>
+    <arg name="log_hz" value="$(arg log_hz)"/>
+  </include>
+</launch>

@@ -22,13 +22,14 @@ BUILD=0
 NO_CACHE=0
 DOWN=0
 EXEC_CMD=(bash)
+HAS_EXEC_CMD=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --build)    BUILD=1; shift ;;
     --no-cache) BUILD=1; NO_CACHE=1; shift ;;
     --down)     DOWN=1; shift ;;
-    --)         shift; EXEC_CMD=("$@"); break ;;
+    --)         shift; EXEC_CMD=("$@"); HAS_EXEC_CMD=1; break ;;
     -h|--help)  sed -n '2,11p' "$0"; exit 0 ;;
     *)          echo "Unknown option: $1" >&2; exit 1 ;;
   esac
@@ -74,4 +75,14 @@ docker exec "${CONTAINER}" bash -lc '
 ' || true
 
 # --- Drop into the container ---
+if [[ "${HAS_EXEC_CMD}" -eq 1 ]]; then
+  exec docker exec -it "${CONTAINER}" bash -lc '
+    source /opt/ros/${ROS_DISTRO:-noetic}/setup.bash
+    if [[ -f /root/catkin_ws/devel/setup.bash ]]; then
+      source /root/catkin_ws/devel/setup.bash
+    fi
+    exec "$@"
+  ' bash "${EXEC_CMD[@]}"
+fi
+
 exec docker exec -it "${CONTAINER}" "${EXEC_CMD[@]}"
