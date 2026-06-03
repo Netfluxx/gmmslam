@@ -26,6 +26,7 @@ Visualizer::Visualizer(FixedLagBackend& smoother,
                        GlobalPoseGraph* global_graph,
                        const std::string& odom_frame,
                        const std::string& base_frame,
+                       const std::string& map_frame,
                        const VisualizationConfig& vis_cfg,
                        Publishers publishers)
     : smoother_(smoother)
@@ -33,6 +34,7 @@ Visualizer::Visualizer(FixedLagBackend& smoother,
     , global_graph_(global_graph)
     , odom_frame_(odom_frame)
     , base_frame_(base_frame)
+    , map_frame_(map_frame)
     , gmm_marker_sigma_(vis_cfg.gmm_marker_sigma)
     , global_gmm_markers_enable_(vis_cfg.global_gmm_markers_enable)
     , global_gmm_publish_period_s_(vis_cfg.global_gmm_publish_period_s)
@@ -52,14 +54,23 @@ Visualizer::Visualizer(FixedLagBackend& smoother,
 
 Matrix4d Visualizer::filterOutputPose(const Matrix4d& T,
                                       const ros::Time& stamp) {
-    if (output_pose_lpf_cutoff_hz_ <= 0.0 || !T.allFinite()) {
+    // Apply map->odom correction so the LPF (and its output) lives in map frame.
+    Matrix4d T_in = T;
+    if (global_graph_ && global_graph_->enable && !map_frame_.empty()) {
+        const auto corr = global_graph_->getMapOdomCorrection();
+        if (corr.has_value()) {
+            T_in = corr.value() * T;
+        }
+    }
+
+    if (output_pose_lpf_cutoff_hz_ <= 0.0 || !T_in.allFinite()) {
         output_pose_filter_initialized_ = false;
-        return T;
+        return T_in;
     }
 
     if (!output_pose_filter_initialized_ ||
         output_pose_filter_stamp_.isZero()) {
-        output_pose_filtered_ = T;
+        output_pose_filtered_ = T_in;
         output_pose_filter_stamp_ = stamp;
         output_pose_filter_initialized_ = true;
         return output_pose_filtered_;
@@ -67,7 +78,7 @@ Matrix4d Visualizer::filterOutputPose(const Matrix4d& T,
 
     const double dt = (stamp - output_pose_filter_stamp_).toSec();
     if (dt <= 0.0 || !std::isfinite(dt)) {
-        output_pose_filtered_ = T;
+        output_pose_filtered_ = T_in;
         output_pose_filter_stamp_ = stamp;
         return output_pose_filtered_;
     }
@@ -76,10 +87,10 @@ Matrix4d Visualizer::filterOutputPose(const Matrix4d& T,
     const double alpha = std::clamp(dt / (tau + dt), 0.0, 1.0);
 
     const Vector3d p_prev = output_pose_filtered_.block<3, 1>(0, 3);
-    const Vector3d p_curr = T.block<3, 1>(0, 3);
+    const Vector3d p_curr = T_in.block<3, 1>(0, 3);
 
     Eigen::Quaterniond q_prev(output_pose_filtered_.block<3, 3>(0, 0));
-    Eigen::Quaterniond q_curr(T.block<3, 3>(0, 0));
+    Eigen::Quaterniond q_curr(T_in.block<3, 3>(0, 0));
     q_prev.normalize();
     q_curr.normalize();
 
@@ -101,6 +112,16 @@ void Visualizer::publishPoseOnly(const Matrix4d& T, const ros::Time& stamp) {
     const auto ts = poseToTransformStamped(T, stamp, odom_frame_, base_frame_);
     pubs_.tf_broadcaster.sendTransform(ts);
 
+    // Broadcast map->odom whenever a global graph correction is available.
+    if (global_graph_ && global_graph_->enable && !map_frame_.empty()) {
+        const auto corr = global_graph_->getMapOdomCorrection();
+        if (corr.has_value()) {
+            const auto map_odom_ts = poseToTransformStamped(
+                corr.value(), stamp, map_frame_, odom_frame_);
+            pubs_.tf_broadcaster.sendTransform(map_odom_ts);
+        }
+    }
+
     nav_msgs::Odometry odom;
     odom.header.stamp    = stamp;
     odom.header.frame_id = odom_frame_;
@@ -114,11 +135,18 @@ void Visualizer::publishPoseLpf(const Matrix4d& T, const ros::Time& stamp) {
         return;
     }
 
+    // T is in map frame when a global correction has been applied by filterOutputPose.
+    bool has_correction = false;
+    if (global_graph_ && global_graph_->enable && !map_frame_.empty()) {
+        has_correction = global_graph_->getMapOdomCorrection().has_value();
+    }
+    const std::string& frame = has_correction ? map_frame_ : odom_frame_;
+
     nav_msgs::Odometry odom;
     odom.header.stamp    = stamp;
-    odom.header.frame_id = odom_frame_;
+    odom.header.frame_id = frame;
     odom.child_frame_id  = base_frame_ + "_lpf";
-    odom.pose.pose       = poseToPoseStamped(T, stamp, odom_frame_).pose;
+    odom.pose.pose       = poseToPoseStamped(T, stamp, frame).pose;
     pubs_.odom_lpf.publish(odom);
 }
 

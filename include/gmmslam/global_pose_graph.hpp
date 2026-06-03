@@ -60,6 +60,10 @@ public:
     /// consumes to re-anchor the fixed-lag smoother on GT.
     bool consumeSmootherReanchorRequest();
 
+    /// Returns the latest map->odom correction computed after each iSAM2 commit,
+    /// or nullopt if no submap has been committed yet.
+    std::optional<Matrix4d> getMapOdomCorrection() const;
+
     void handleSubmapRegistrationResult(int sid_prev, int sid_curr,
                                         const Matrix4d& T_rel, double score,
                                         const ros::Time& stamp);
@@ -208,6 +212,9 @@ private:
     std::set<std::pair<int,int>> pending_submap_registrations_;
 
     std::vector<std::pair<int, ros::Time>> pending_submap_finalize_;
+
+    Matrix4d map_odom_correction_ = Matrix4d::Identity();
+    bool map_odom_valid_ = false;
 
     bool reanchor_on_traj_fail_ = true;
     int submap_finalize_min_ready_keyframes_ = 1;

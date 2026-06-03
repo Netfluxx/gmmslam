@@ -45,6 +45,7 @@ public:
                GlobalPoseGraph* global_graph,
                const std::string& odom_frame,
                const std::string& base_frame,
+               const std::string& map_frame,
                const VisualizationConfig& vis_cfg,
                Publishers publishers);
 
@@ -98,6 +99,7 @@ private:
 
     std::string odom_frame_;
     std::string base_frame_;
+    std::string map_frame_;
     double gmm_marker_sigma_;
     bool global_gmm_markers_enable_;
     double global_gmm_publish_period_s_;

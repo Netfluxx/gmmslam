@@ -80,7 +80,10 @@ private:
     void logBenchmarkFrame(double stamp_sec, int frame_idx, int odom_idx,
                            bool is_smoother_frame, bool is_keyframe,
                            int point_count, double preprocess_ms,
-                           double callback_ms, const Matrix4d& estimate,
+                           double callback_ms,
+                           const Matrix4d& estimate_lpf,
+                           const Matrix4d& estimate_map,
+                           const Matrix4d& estimate_odom,
                            const std::optional<Matrix4d>& gt_pose);
 
     Config cfg_;
@@ -114,6 +117,7 @@ private:
     std::string benchmark_log_dir_;
     std::ofstream benchmark_frames_csv_;
     std::ofstream benchmark_est_tum_;
+    std::ofstream benchmark_est_map_tum_;
     std::ofstream benchmark_gt_tum_;
 
     geometry_msgs::PoseStamped::ConstPtr latest_gt_pose_raw_;
@@ -165,6 +169,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param<std::string>("sensor_frame", cfg_.ros.sensor_frame, "depth_camera_1");
         pnh.param<std::string>("odom_frame",   cfg_.ros.odom_frame,   "world");
         pnh.param<std::string>("base_frame",   cfg_.ros.base_frame,   "m500_1_base_link");
+        pnh.param<std::string>("map_frame",    cfg_.ros.map_frame,    "map");
         if (!pnh.getParam("odometry_input", cfg_.ros.odometry_input)) {
             if (!pnh.getParam("noisy_gt_topic", cfg_.ros.odometry_input)) {
                 cfg_.ros.odometry_input = "/gmmslam_node/noisy_gt_pose";
@@ -582,6 +587,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         global_graph_.get(),
         cfg_.ros.odom_frame,
         cfg_.ros.base_frame,
+        cfg_.ros.map_frame,
         cfg_.visualization,
         std::move(vis_pubs));
 
@@ -1388,10 +1394,20 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         const double callback_ms =
             std::chrono::duration<double, std::milli>(
                 callback_t1 - callback_t0).count();
+        // Unfiltered map-frame pose: T_map_odom * T_pub, snaps on loop closure.
+        // T_lpf is the same but smoothed by the LPF.
+        Matrix4d T_map = T_pub;
+        if (global_graph_ && global_graph_->enable) {
+            const auto corr = global_graph_->getMapOdomCorrection();
+            if (corr.has_value()) {
+                T_map = corr.value() * T_pub;
+            }
+        }
         logBenchmarkFrame(stampToSec(stamp), frame_count_, smoother_pose_key,
                           is_smoother_frame, keyframe_created,
                           static_cast<int>(pts.rows()), preprocess_ms,
-                          callback_ms, T_pub, currentGtPoseOdomFrame(stamp));
+                          callback_ms, T_lpf, T_map, T_pub,
+                          currentGtPoseOdomFrame(stamp));
 
         logBackpressure(stamp);
         ++frame_count_;
@@ -1411,9 +1427,11 @@ void GMMSLAMNode::initBenchmarkLogs(const std::string& log_dir)
         std::filesystem::create_directories(log_dir);
         benchmark_frames_csv_.open(log_dir + "/frames.csv", std::ios::out);
         benchmark_est_tum_.open(log_dir + "/estimated_trajectory.tum", std::ios::out);
+        benchmark_est_map_tum_.open(log_dir + "/estimated_trajectory_map.tum", std::ios::out);
         benchmark_gt_tum_.open(log_dir + "/groundtruth_trajectory.tum", std::ios::out);
 
-        if (!benchmark_frames_csv_ || !benchmark_est_tum_ || !benchmark_gt_tum_) {
+        if (!benchmark_frames_csv_ || !benchmark_est_tum_ ||
+            !benchmark_est_map_tum_ || !benchmark_gt_tum_) {
             ROS_WARN("[benchmark] failed to open one or more benchmark log files in %s",
                      log_dir.c_str());
             return;
@@ -1423,14 +1441,19 @@ void GMMSLAMNode::initBenchmarkLogs(const std::string& log_dir)
             << "stamp,frame_idx,odom_idx,is_smoother_frame,is_keyframe,"
             << "point_count,preprocess_ms,callback_ms,"
             << "est_x,est_y,est_z,est_qx,est_qy,est_qz,est_qw,"
+            << "map_x,map_y,map_z,map_qx,map_qy,map_qz,map_qw,"
+            << "odom_x,odom_y,odom_z,odom_qx,odom_qy,odom_qz,odom_qw,"
             << "has_gt,gt_x,gt_y,gt_z,gt_qx,gt_qy,gt_qz,gt_qw\n";
         benchmark_frames_csv_ << std::fixed << std::setprecision(9);
         benchmark_est_tum_ << std::fixed << std::setprecision(9);
+        benchmark_est_map_tum_ << std::fixed << std::setprecision(9);
         benchmark_gt_tum_ << std::fixed << std::setprecision(9);
         benchmark_logs_enabled_ = true;
 
         ROS_INFO("[benchmark] writing structured metrics to %s", log_dir.c_str());
-        ROS_INFO("[benchmark] evo trajectories: estimated_trajectory.tum and groundtruth_trajectory.tum");
+        ROS_INFO("[benchmark] evo trajectories: estimated_trajectory.tum (lpf), "
+                 "estimated_trajectory_map.tum (unfiltered map frame), "
+                 "groundtruth_trajectory.tum");
     } catch (const std::exception& e) {
         ROS_WARN("[benchmark] failed to initialize benchmark logs in %s: %s",
                  log_dir.c_str(), e.what());
@@ -1441,7 +1464,10 @@ void GMMSLAMNode::logBenchmarkFrame(
     double stamp_sec, int frame_idx, int odom_idx,
     bool is_smoother_frame, bool is_keyframe,
     int point_count, double preprocess_ms, double callback_ms,
-    const Matrix4d& estimate, const std::optional<Matrix4d>& gt_pose)
+    const Matrix4d& estimate_lpf,
+    const Matrix4d& estimate_map,
+    const Matrix4d& estimate_odom,
+    const std::optional<Matrix4d>& gt_pose)
 {
     if (!benchmark_logs_enabled_) {
         return;
@@ -1458,9 +1484,13 @@ void GMMSLAMNode::logBenchmarkFrame(
             << q.x() << ' ' << q.y() << ' ' << q.z() << ' ' << q.w() << '\n';
     };
 
-    Eigen::Quaterniond q_est(estimate.block<3, 3>(0, 0));
-    q_est.normalize();
-    const auto p_est = estimate.block<3, 1>(0, 3);
+    const auto csv_pose = [](std::ofstream& out, const Matrix4d& T) {
+        Eigen::Quaterniond q(T.block<3, 3>(0, 0));
+        q.normalize();
+        const auto p = T.block<3, 1>(0, 3);
+        out << p(0) << ',' << p(1) << ',' << p(2) << ','
+            << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w();
+    };
 
     benchmark_frames_csv_
         << stamp_sec << ','
@@ -1470,11 +1500,15 @@ void GMMSLAMNode::logBenchmarkFrame(
         << (is_keyframe ? 1 : 0) << ','
         << point_count << ','
         << preprocess_ms << ','
-        << callback_ms << ','
-        << p_est(0) << ',' << p_est(1) << ',' << p_est(2) << ','
-        << q_est.x() << ',' << q_est.y() << ',' << q_est.z() << ',' << q_est.w();
+        << callback_ms << ',';
+    csv_pose(benchmark_frames_csv_, estimate_lpf);
+    benchmark_frames_csv_ << ',';
+    csv_pose(benchmark_frames_csv_, estimate_map);
+    benchmark_frames_csv_ << ',';
+    csv_pose(benchmark_frames_csv_, estimate_odom);
 
-    write_tum_pose(benchmark_est_tum_, stamp_sec, estimate);
+    write_tum_pose(benchmark_est_tum_, stamp_sec, estimate_lpf);
+    write_tum_pose(benchmark_est_map_tum_, stamp_sec, estimate_map);
 
     if (gt_pose.has_value()) {
         Eigen::Quaterniond q_gt(gt_pose->block<3, 3>(0, 0));

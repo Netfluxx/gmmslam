@@ -10,6 +10,9 @@ struct RosConfig {
     std::string sensor_frame = "depth_camera_1";
     std::string odom_frame = "world";
     std::string base_frame = "m500_1_base_link";
+    /// Parent of odom_frame; published as map->odom TF after each global graph commit.
+    /// Empty string disables map->odom publishing.
+    std::string map_frame = "map";
     /// geometry_msgs/PoseStamped odometry-style input (e.g. noisy GT publisher).
     std::string odometry_input = "/gmmslam_node/noisy_gt_pose";
     /// Persist latest odom-frame pose here; on respawn, seed the smoother from it.

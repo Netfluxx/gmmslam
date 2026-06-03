@@ -19,14 +19,14 @@ constexpr float kInitialInflation = 0.3f * 0.3f;
 constexpr float kFineInitialInflation = 0.03f * 0.03f;
 constexpr float kGateRadiusMultiplierSq = 16.0f;
 constexpr double kD2DObjectiveDeltaStop = 1e-5;
-constexpr unsigned long kD2DMaxIterations = 8;
-constexpr double kD2DInitialTrustRadius = 1.0;
+constexpr unsigned long kD2DMaxIterations = 20;
+constexpr double kD2DInitialTrustRadius = 2.0;
 constexpr double kD2DFineObjectiveDeltaStop = 1e-6;
 constexpr unsigned long kD2DFineMaxIterations = 4;
 constexpr double kD2DFineInitialTrustRadius = 0.25;
-constexpr float kFineRefineMinCoarseScore = 0.85f;
-constexpr float kTranslationPriorWeight = 3.0f;
-constexpr float kRotationPriorWeight = 0.0f;
+constexpr float kFineRefineMinCoarseScore = 0.5f;
+constexpr float kTranslationPriorWeight = 0.0f;
+constexpr float kRotationPriorWeight = 2.5f;
 constexpr float kPi32 = 1.0f / (2.0f * static_cast<float>(M_PI) *
                                 std::sqrt(2.0f * static_cast<float>(M_PI)));
 
@@ -934,10 +934,12 @@ float runD2DRegistration(
     if (std::isfinite(coarse_score) &&
         coarse_score >= kFineRefineMinCoarseScore) {
         ColumnVector x_coarse = x;
+        const Eigen::Vector3f t_coarse(x_coarse(0), x_coarse(1), x_coarse(2)); // 0, 1, 2 --> translation tx, ty, tz
+        const Eigen::Vector3f u_coarse(x_coarse(3), x_coarse(4), x_coarse(5)); // 3, 4, 5 --> rotation vector (axis-angle representation) ux, uy, uz
         const float fine_score = dlib::find_max_trust_region(
             dlib::objective_delta_stop_strategy(kD2DFineObjectiveDeltaStop,
                                                 kD2DFineMaxIterations),
-            GmmRegistrationModel(source_gmm, target_gmm, t, u,
+            GmmRegistrationModel(source_gmm, target_gmm, t_coarse, u_coarse,
                                  kFineInitialInflation),
             x,
             kD2DFineInitialTrustRadius);

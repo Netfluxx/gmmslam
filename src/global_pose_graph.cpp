@@ -1482,6 +1482,30 @@ void GlobalPoseGraph::commit(const ros::Time& stamp) {
     path_ = std::move(path);
     path_pub_.publish(path_);
     logMapStats(stamp.toSec(), "global_graph_commit");
+
+    // Compute map->odom correction from the most recent submap with a valid anchor.
+    // T_map_odom = T_map_anchor * T_odom_anchor^-1
+    // where T_map_anchor is the iSAM2-corrected submap pose (the anchor keyframe's
+    // pose in map frame) and T_odom_anchor is the smoother's current odom-frame pose
+    // for that same keyframe.
+    for (int i = static_cast<int>(submap_ids.size()) - 1; i >= 0; --i) {
+        const int sid = submap_ids[i];
+        const auto sit = submap_pose_by_idx.find(sid);
+        if (sit == submap_pose_by_idx.end() || !sit->second.allFinite()) continue;
+        const auto ait = submap_anchor_key.find(sid);
+        if (ait == submap_anchor_key.end()) continue;
+        const auto T_odom_opt = get_pose_(ait->second);
+        if (!T_odom_opt.has_value() || !T_odom_opt->allFinite()) continue;
+        map_odom_correction_ = sit->second * T_odom_opt->inverse();
+        map_odom_valid_ = true;
+        break;
+    }
+}
+
+std::optional<Matrix4d> GlobalPoseGraph::getMapOdomCorrection() const {
+    std::lock_guard<std::recursive_mutex> lk(lock);
+    if (!map_odom_valid_) return std::nullopt;
+    return map_odom_correction_;
 }
 
 } // namespace gmmslam

@@ -29,7 +29,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-
 Row = Dict[str, str]
 
 
@@ -57,7 +56,9 @@ def read_tum(path: Path) -> List[Tuple[float, float, float, float]]:
             if len(parts) < 4:
                 continue
             try:
-                poses.append((float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3])))
+                poses.append(
+                    (float(parts[0]), float(parts[1]), float(parts[2]), float(parts[3]))
+                )
             except ValueError:
                 continue
     return poses
@@ -89,24 +90,36 @@ def read_frame_pruning_console(path: Path) -> List[Row]:
             summary_match = summary_pattern.search(line)
             if not stamp_match or not summary_match:
                 continue
-            before, after, removed, merges, passes, db, rtree, chi_sq, margin, between, prefer = (
-                summary_match.groups()
+            (
+                before,
+                after,
+                removed,
+                merges,
+                passes,
+                db,
+                rtree,
+                chi_sq,
+                margin,
+                between,
+                prefer,
+            ) = summary_match.groups()
+            rows.append(
+                {
+                    "stamp": stamp_match.group(1),
+                    "event": "frame_to_frame_raw",
+                    "before_total": before,
+                    "after_total": after,
+                    "removed_total": removed,
+                    "merges": merges,
+                    "passes": passes,
+                    "bhatt_threshold": db,
+                    "rtree": rtree,
+                    "chi_sq": chi_sq,
+                    "margin_m": margin,
+                    "between_frames": between,
+                    "prefer_older": prefer,
+                }
             )
-            rows.append({
-                "stamp": stamp_match.group(1),
-                "event": "frame_to_frame_raw",
-                "before_total": before,
-                "after_total": after,
-                "removed_total": removed,
-                "merges": merges,
-                "passes": passes,
-                "bhatt_threshold": db,
-                "rtree": rtree,
-                "chi_sq": chi_sq,
-                "margin_m": margin,
-                "between_frames": between,
-                "prefer_older": prefer,
-            })
     return rows
 
 
@@ -138,7 +151,9 @@ def rel_time(values: Sequence[float]) -> List[float]:
     return [v - t0 if math.isfinite(v) else v for v in values]
 
 
-def finite_pairs(xs: Iterable[float], ys: Iterable[float]) -> Tuple[List[float], List[float]]:
+def finite_pairs(
+    xs: Iterable[float], ys: Iterable[float]
+) -> Tuple[List[float], List[float]]:
     out_x, out_y = [], []
     for x, y in zip(xs, ys):
         if math.isfinite(x) and math.isfinite(y):
@@ -222,12 +237,33 @@ def newest_run_dir(root: Path) -> Optional[Path]:
     return max(runs, key=lambda p: p.stat().st_mtime)
 
 
-def loop_closure_segments(frames: List[Row], registration_events: List[Row]) -> List[Tuple[float, float, float, float]]:
+def has_map_columns(frames: List[Row]) -> bool:
+    """True when frames.csv was written by a build that logs map_x/y/z."""
+    return bool(frames) and "map_x" in frames[0]
+
+
+def has_odom_columns(frames: List[Row]) -> bool:
+    """True when frames.csv includes odom_x/y/z (smoother odom-frame pose)."""
+    return bool(frames) and "odom_x" in frames[0]
+
+
+def loop_closure_segments(
+    frames: List[Row], registration_events: List[Row]
+) -> List[Tuple[float, float, float, float]]:
+    """Return (x0,y0,x1,y1) pairs for staged loop closures.
+
+    Prefers map-frame positions when available so the lines match the
+    corrected trajectory shown in the XY plot.
+    """
+    use_map = has_map_columns(frames)
+    x_key = "map_x" if use_map else "est_x"
+    y_key = "map_y" if use_map else "est_y"
+
     poses_by_odom = {}
     for r in frames:
         odom_idx = i(r, "odom_idx", -1)
-        x = f(r, "est_x")
-        y = f(r, "est_y")
+        x = f(r, x_key)
+        y = f(r, y_key)
         if odom_idx >= 0 and math.isfinite(x) and math.isfinite(y):
             poses_by_odom[odom_idx] = (x, y)
 
@@ -255,16 +291,41 @@ def plot_trajectory(
     frames: List[Row],
     registration_events: List[Row],
 ) -> Optional[Path]:
-    est = read_tum(run_dir / "estimated_trajectory.tum")
+    est_lpf = read_tum(run_dir / "estimated_trajectory.tum")
+    est_map = read_tum(run_dir / "estimated_trajectory_map.tum")
     gt = read_tum(run_dir / "groundtruth_trajectory.tum")
-    if not est and not gt:
+    if not est_lpf and not est_map and not gt:
         return None
 
     plt.figure(figsize=(8, 7))
     if gt:
-        plt.plot([p[1] for p in gt], [p[2] for p in gt], label="ground truth", linewidth=2)
-    if est:
-        plt.plot([p[1] for p in est], [p[2] for p in est], label="estimated", linewidth=1.5)
+        plt.plot(
+            [p[1] for p in gt],
+            [p[2] for p in gt],
+            label="ground truth",
+            linewidth=2,
+            zorder=3,
+        )
+    if est_map:
+        plt.plot(
+            [p[1] for p in est_map],
+            [p[2] for p in est_map],
+            label="map frame (raw, shows snaps)",
+            linewidth=1.5,
+            color="tab:orange",
+            zorder=2,
+        )
+    if est_lpf:
+        plt.plot(
+            [p[1] for p in est_lpf],
+            [p[2] for p in est_lpf],
+            label="map frame (LPF smoothed)",
+            linewidth=1.0,
+            color="tab:blue",
+            alpha=0.75,
+            zorder=1,
+        )
+
     segments = loop_closure_segments(frames, registration_events)
     for idx, (x0, y0, x1, y1) in enumerate(segments):
         plt.plot(
@@ -274,6 +335,7 @@ def plot_trajectory(
             linewidth=3.0,
             alpha=0.95,
             label="loop closure" if idx == 0 else None,
+            zorder=4,
         )
     plt.axis("equal")
     plt.xlabel("x position (m)")
@@ -288,25 +350,126 @@ def plot_ate(frames: List[Row], out_dir: Path) -> Optional[Path]:
     rows = [r for r in frames if i(r, "has_gt", 0) == 1]
     if not rows:
         return None
+
     stamps = [f(r, "stamp") for r in rows]
     times = rel_time(stamps)
-    errors = []
-    for r in rows:
-        dx = f(r, "est_x") - f(r, "gt_x")
-        dy = f(r, "est_y") - f(r, "gt_y")
-        dz = f(r, "est_z") - f(r, "gt_z")
-        errors.append(math.sqrt(dx * dx + dy * dy + dz * dz))
 
-    xs, ys = finite_pairs(times, errors)
-    if not xs:
-        return None
     plt.figure(figsize=(10, 4))
-    plt.plot(xs, ys, linewidth=1.2)
+
+    if has_odom_columns(frames):
+        errors_odom = []
+        for r in rows:
+            dx = f(r, "odom_x") - f(r, "gt_x")
+            dy = f(r, "odom_y") - f(r, "gt_y")
+            dz = f(r, "odom_z") - f(r, "gt_z")
+            errors_odom.append(math.sqrt(dx * dx + dy * dy + dz * dz))
+        xs, ys = finite_pairs(times, errors_odom)
+        if xs:
+            plt.plot(xs, ys, linewidth=1.4, label="SLAM output", color="tab:green")
+            plt.legend()
+
     plt.xlabel("time since run start (s)")
     plt.ylabel("position error (m)")
     plt.title("Absolute Trajectory Error Over Time")
     plt.grid(True, alpha=0.3)
     return save_fig(out_dir, "ate_over_time.png")
+
+
+def plot_correction_snaps(
+    frames: List[Row], registration_events: List[Row], out_dir: Path
+) -> Optional[Path]:
+    """Show the map->odom correction snapping over time.
+
+    Top panel: X, Y, Z position of both the raw map-frame and LPF traces.
+    Middle panel: magnitude of the difference (correction delta vs LPF).
+    Bottom panel: marks where loop closures were staged.
+    """
+    if not has_map_columns(frames):
+        return None
+
+    rows = valid_time_rows(frames)
+    if not rows:
+        return None
+
+    stamps = [f(r, "stamp") for r in rows]
+    times = rel_time(stamps)
+
+    map_x = [f(r, "map_x") for r in rows]
+    map_y = [f(r, "map_y") for r in rows]
+
+    gt_rows = [r for r in rows if i(r, "has_gt", 0) == 1]
+    gt_stamps = [f(r, "stamp") for r in gt_rows]
+    gt_times = [t - (stamps[0] if stamps else 0.0) for t in gt_stamps]
+    gt_x = [f(r, "gt_x") for r in gt_rows]
+    gt_y = [f(r, "gt_y") for r in gt_rows]
+
+    # Magnitude of (map - gt): error of the raw map-frame estimate vs ground truth.
+    delta_mag = []
+    for r in rows:
+        mx, my = f(r, "map_x"), f(r, "map_y")
+        gx, gy = f(r, "gt_x"), f(r, "gt_y")
+        if i(r, "has_gt", 0) == 1 and all(math.isfinite(v) for v in (mx, my, gx, gy)):
+            delta_mag.append(math.sqrt((mx - gx) ** 2 + (my - gy) ** 2))
+        else:
+            delta_mag.append(math.nan)
+
+    # Loop closure timestamps
+    loop_times = set()
+    t0 = stamps[0] if stamps else 0.0
+    for r in registration_events:
+        if r.get("kind") == "loop" and r.get("event") == "staged":
+            loop_times.add(f(r, "stamp") - t0)
+
+    fig, axes = plt.subplots(3, 1, figsize=(12, 9), sharex=True)
+
+    for axis_label, map_vals, g_times, g_vals in [
+        ("x", map_x, gt_times, gt_x),
+        ("y", map_y, gt_times, gt_y),
+    ]:
+        xs_m, ys_m = finite_pairs(times, map_vals)
+        xs_g, ys_g = finite_pairs(g_times, g_vals)
+        if xs_m:
+            axes[0].plot(xs_m, ys_m, linewidth=0.9, alpha=0.85, label=f"map {axis_label} (raw)")
+        if xs_g:
+            axes[0].plot(xs_g, ys_g, linewidth=0.9, alpha=0.65, linestyle="--",
+                         label=f"gt {axis_label}")
+
+    for lt in loop_times:
+        axes[0].axvline(lt, color="red", linewidth=0.8, alpha=0.5)
+    axes[0].set_ylabel("position (m)")
+    axes[0].set_title("Map-frame position: raw (snapping) vs ground truth")
+    axes[0].legend(ncol=4, fontsize=7)
+    axes[0].grid(True, alpha=0.3)
+
+    if has_odom_columns(rows):
+        odom_delta = []
+        for r in rows:
+            ox, oy = f(r, "odom_x"), f(r, "odom_y")
+            gx, gy = f(r, "gt_x"), f(r, "gt_y")
+            if i(r, "has_gt", 0) == 1 and all(math.isfinite(v) for v in (ox, oy, gx, gy)):
+                odom_delta.append(math.sqrt((ox - gx) ** 2 + (oy - gy) ** 2))
+            else:
+                odom_delta.append(math.nan)
+        xs_o, ys_o = finite_pairs(times, odom_delta)
+        if xs_o:
+            axes[1].plot(xs_o, ys_o, linewidth=1.3, color="tab:green",
+                         label="output − gt")
+    for lt in loop_times:
+        axes[1].axvline(lt, color="red", linewidth=0.8, alpha=0.5)
+    axes[1].set_ylabel("error (m)")
+    axes[1].set_title("ATE: output vs ground truth")
+    axes[1].legend(fontsize=7)
+    axes[1].grid(True, alpha=0.3)
+
+    if loop_times:
+        axes[2].vlines(sorted(loop_times), 0, 1, color="red", linewidth=1.5, alpha=0.85)
+    axes[2].set_ylim(0, 1.2)
+    axes[2].set_yticks([])
+    axes[2].set_xlabel("time since run start (s)")
+    axes[2].set_title("Loop Closure Events")
+    axes[2].grid(True, axis="x", alpha=0.3)
+
+    return save_fig(out_dir, "correction_snaps.png")
 
 
 def plot_frame_timing(frames: List[Row], out_dir: Path) -> Optional[Path]:
@@ -351,7 +514,9 @@ def plot_gmm_fits(rows: List[Row], out_dir: Path) -> Optional[Path]:
     ax2 = ax1.twinx()
     xs, ys = finite_pairs(times, components)
     if xs:
-        ax2.plot(xs, ys, label="components", color="tab:orange", linewidth=1.0, alpha=0.8)
+        ax2.plot(
+            xs, ys, label="components", color="tab:orange", linewidth=1.0, alpha=0.8
+        )
     ax2.set_ylabel("components per keyframe", color="tab:orange")
     ax2.tick_params(axis="y", labelcolor="tab:orange")
     plt.title("GMMap/GMM Fitting Time and Component Count")
@@ -364,11 +529,14 @@ def plot_d2d(rows: List[Row], out_dir: Path) -> List[Path]:
     paths = []
     kinds = sorted({r.get("kind", "unknown") or "unknown" for r in rows})
 
+    # Compute a single t0 across all kinds so they share the same time axis.
+    all_finite = [f(r, "stamp") for r in rows if math.isfinite(f(r, "stamp"))]
+    t0 = min(all_finite) if all_finite else 0.0
+
     plt.figure(figsize=(10, 4))
     for kind in kinds:
         subset = [r for r in rows if (r.get("kind", "unknown") or "unknown") == kind]
-        stamps = [f(r, "stamp") for r in subset]
-        times = rel_time(stamps)
+        times = [f(r, "stamp") - t0 for r in subset]
         elapsed = [f(r, "elapsed_ms") for r in subset]
         xs, ys = finite_pairs(times, elapsed)
         if xs:
@@ -401,12 +569,159 @@ def plot_d2d(rows: List[Row], out_dir: Path) -> List[Path]:
     return paths
 
 
-def plot_isam_timings(smoother: List[Row], global_graph: List[Row], out_dir: Path) -> Optional[Path]:
+def plot_loop_closure_quality(
+    registration_events: List[Row], global_graph_opt: List[Row], out_dir: Path
+) -> Optional[Path]:
+    """Four-panel plot diagnosing global graph stability.
+
+    Panel 1 – Loop closure score over time.  Grey = failed at worker,
+               orange = accepted, red outline = forwarded to global graph.
+               Horizontal dashed line at the detect threshold (inferred from data).
+    Panel 2 – Initial rotation deviation (init_r_deg) for every loop attempt.
+               Values above 20° are highlighted; these are high-risk registrations.
+    Panel 3 – Translation moved by D2D (delta_t_m) for accepted loops.
+               Near-zero delta means the optimizer barely moved → likely stuck
+               at the initial estimate (suspicious when init_r is large).
+    Panel 4 – Global graph iSAM2 estimate_ms over time.  Spikes correlate with
+               large corrections after inconsistent loop constraints are added.
+    """
+    loop_rows = [r for r in registration_events if r.get("kind") == "loop"]
+    if not loop_rows:
+        return None
+
+    all_stamps = [f(r, "stamp") for r in loop_rows if math.isfinite(f(r, "stamp"))]
+    if not all_stamps:
+        return None
+    t0 = min(all_stamps)
+
+    failed   = [r for r in loop_rows if r.get("event") == "worker_failed"]
+    accepted = [r for r in loop_rows if r.get("event") == "accepted"]
+    staged   = [r for r in loop_rows if r.get("event") == "staged"]
+
+    # Infer detect threshold as the minimum score among accepted loops.
+    accepted_scores = [f(r, "score") for r in accepted if math.isfinite(f(r, "score")) and f(r, "score") > 0]
+    detect_thresh = min(accepted_scores) if accepted_scores else None
+
+    fig, axes = plt.subplots(4, 1, figsize=(12, 12), sharex=True)
+
+    # ── Panel 1: score over time ──────────────────────────────────────────────
+    def _plot_score(rows: List[Row], ax, color, marker, label, zorder=2, edgecolor=None):
+        xs = [f(r, "stamp") - t0 for r in rows]
+        ys = [f(r, "score") for r in rows]
+        xs, ys = finite_pairs(xs, ys)
+        if xs:
+            kw = dict(s=20, color=color, alpha=0.7, label=label, zorder=zorder, marker=marker)
+            if edgecolor:
+                kw["edgecolors"] = edgecolor
+                kw["linewidths"] = 0.8
+            ax.scatter(xs, ys, **kw)
+
+    _plot_score(failed,   axes[0], "lightgrey", "x", "worker_failed", zorder=1)
+    _plot_score(accepted, axes[0], "tab:orange", "o", "accepted")
+    _plot_score(staged,   axes[0], "tab:orange", "o", "staged (global graph)",
+                zorder=3, edgecolor="red")
+
+    if detect_thresh is not None:
+        axes[0].axhline(detect_thresh, color="red", linestyle="--", linewidth=1.0,
+                        label=f"detect threshold ≈ {detect_thresh:.2f}")
+    axes[0].set_ylabel("D2D score")
+    axes[0].set_title("Loop Closure Score Over Time")
+    axes[0].legend(fontsize=7, ncol=4)
+    axes[0].grid(True, alpha=0.3)
+
+    # ── Panel 2: initial rotation deviation ──────────────────────────────────
+    HIGH_ROT = 20.0
+    for rows_sub, color, label in [
+        (failed,   "lightgrey", "worker_failed"),
+        (accepted, "tab:blue",  "accepted"),
+    ]:
+        xs_lo, ys_lo, xs_hi, ys_hi = [], [], [], []
+        for r in rows_sub:
+            t = f(r, "stamp") - t0
+            ir = f(r, "init_r_deg")
+            if not math.isfinite(t) or not math.isfinite(ir):
+                continue
+            if ir > HIGH_ROT:
+                xs_hi.append(t); ys_hi.append(ir)
+            else:
+                xs_lo.append(t); ys_lo.append(ir)
+        if xs_lo:
+            axes[1].scatter(xs_lo, ys_lo, s=14, color=color, alpha=0.6,
+                            label=label)
+        if xs_hi:
+            axes[1].scatter(xs_hi, ys_hi, s=40, color="red", alpha=0.9,
+                            marker="^", label=f"{label} init_r>{HIGH_ROT:.0f}°",
+                            zorder=3)
+
+    axes[1].axhline(HIGH_ROT, color="red", linestyle="--", linewidth=0.9, alpha=0.7)
+    axes[1].set_ylabel("init_r_deg")
+    axes[1].set_title(f"Initial Rotation Deviation (red ▲ = >{HIGH_ROT:.0f}° — high false-positive risk)")
+    axes[1].legend(fontsize=7, ncol=4)
+    axes[1].grid(True, alpha=0.3)
+
+    # ── Panel 3: how much D2D moved the translation (accepted only) ──────────
+    xs_d, ys_d, colors_d = [], [], []
+    for r in accepted:
+        t = f(r, "stamp") - t0
+        dt = f(r, "delta_t_m")
+        ir = f(r, "init_r_deg")
+        if not math.isfinite(t) or not math.isfinite(dt):
+            continue
+        xs_d.append(t)
+        ys_d.append(dt)
+        colors_d.append("red" if (math.isfinite(ir) and ir > HIGH_ROT) else "tab:green")
+    if xs_d:
+        axes[2].scatter(xs_d, ys_d, s=20, c=colors_d, alpha=0.8, zorder=2)
+        axes[2].scatter([], [], s=20, color="red",       label=f"init_r>{HIGH_ROT:.0f}°")
+        axes[2].scatter([], [], s=20, color="tab:green", label=f"init_r≤{HIGH_ROT:.0f}°")
+    axes[2].axhline(0.0, color="black", linewidth=0.6, alpha=0.4)
+    axes[2].set_ylabel("delta_t_m")
+    axes[2].set_title("Translation Moved by D2D (near-zero with high init_r → stuck in local minimum)")
+    axes[2].legend(fontsize=7)
+    axes[2].grid(True, alpha=0.3)
+
+    # ── Panel 4: global graph iSAM2 estimate_ms (instability proxy) ──────────
+    gg = valid_time_rows(global_graph_opt)
+    if gg:
+        gg_t0 = min(f(r, "stamp") for r in gg if math.isfinite(f(r, "stamp")))
+        gg_times  = [f(r, "stamp") - gg_t0 for r in gg]
+        gg_est_ms = [f(r, "estimate_ms") for r in gg]
+        xs_g, ys_g = finite_pairs(gg_times, gg_est_ms)
+        if xs_g:
+            # Align to the same t0 as loop closure panel using the offset
+            offset = gg_t0 - t0
+            xs_g = [x + offset for x in xs_g]
+            axes[3].plot(xs_g, ys_g, linewidth=0.9, color="tab:purple",
+                         label="iSAM2 estimate_ms")
+            # Mark commits that follow a loop closure (within 0.5 s)
+            staged_stamps = {f(r, "stamp") for r in staged if math.isfinite(f(r, "stamp"))}
+            spike_xs, spike_ys = [], []
+            for t_g, ms in zip(xs_g, ys_g):
+                abs_t = t_g - offset + gg_t0
+                if any(abs(abs_t - ls) < 0.5 for ls in staged_stamps):
+                    spike_xs.append(t_g); spike_ys.append(ms)
+            if spike_xs:
+                axes[3].scatter(spike_xs, spike_ys, s=30, color="red", zorder=3,
+                                label="commit after loop closure")
+        axes[3].legend(fontsize=7)
+    axes[3].set_xlabel("time since first loop closure attempt (s)")
+    axes[3].set_ylabel("estimate_ms")
+    axes[3].set_title("Global Graph iSAM2 Estimate Time (spikes = large corrections / instability)")
+    axes[3].grid(True, alpha=0.3)
+
+    return save_fig(out_dir, "loop_closure_quality.png")
+
+
+def plot_isam_timings(
+    smoother: List[Row], global_graph: List[Row], out_dir: Path
+) -> Optional[Path]:
     smoother = valid_time_rows(smoother)
     global_graph = valid_time_rows(global_graph)
     if not smoother and not global_graph:
         return None
-    all_stamps = [f(r, "stamp") for r in smoother] + [f(r, "stamp") for r in global_graph]
+    all_stamps = [f(r, "stamp") for r in smoother] + [
+        f(r, "stamp") for r in global_graph
+    ]
     t0 = min(all_stamps)
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 6), sharex=True)
@@ -436,9 +751,6 @@ def plot_isam_timings(smoother: List[Row], global_graph: List[Row], out_dir: Pat
 
 
 def plot_global_map(rows: List[Row], out_dir: Path) -> Optional[Path]:
-    # Use CSV/log order, not ROS stamp order. Async loop/submap D2D callbacks can
-    # log old stamps after newer map updates; sorting by stamp makes the map size
-    # appear to travel backward in causal time.
     rows = [r for r in rows if math.isfinite(f(r, "stamp")) and f(r, "stamp") >= 0.0]
     if not rows:
         return None
@@ -479,7 +791,9 @@ def plot_global_map(rows: List[Row], out_dir: Path) -> Optional[Path]:
         if subset:
             xs_event = [x for x, _ in subset]
             ys_event = [d for _, d in subset]
-            axes[1].scatter(xs_event, ys_event, s=18, alpha=0.8, color=color, label=event)
+            axes[1].scatter(
+                xs_event, ys_event, s=18, alpha=0.8, color=color, label=event
+            )
     axes[1].axhline(0.0, color="black", linewidth=0.8, alpha=0.5)
     axes[1].set_ylabel("delta Gaussians")
     axes[1].set_title("Map Size Change per Event (Pruning Effect)")
@@ -488,7 +802,9 @@ def plot_global_map(rows: List[Row], out_dir: Path) -> Optional[Path]:
 
     xs, ys = finite_pairs(times, finalized)
     if xs:
-        axes[2].step(xs, ys, where="post", label="finalized submaps", color="tab:orange")
+        axes[2].step(
+            xs, ys, where="post", label="finalized submaps", color="tab:orange"
+        )
     xs, ys = finite_pairs(times, optimized)
     if xs:
         axes[2].step(xs, ys, where="post", label="optimized submaps", color="tab:green")
@@ -499,10 +815,14 @@ def plot_global_map(rows: List[Row], out_dir: Path) -> Optional[Path]:
 
     xs, ys = finite_pairs(times, pending_overlap)
     if xs:
-        axes[3].step(xs, ys, where="post", label="pending overlap regs", color="tab:purple")
+        axes[3].step(
+            xs, ys, where="post", label="pending overlap regs", color="tab:purple"
+        )
     xs, ys = finite_pairs(times, pending_finalize)
     if xs:
-        axes[3].step(xs, ys, where="post", label="pending finalizations", color="tab:brown")
+        axes[3].step(
+            xs, ys, where="post", label="pending finalizations", color="tab:brown"
+        )
     axes[3].set_xlabel("global-map log event index (causal order)")
     axes[3].set_ylabel("pending count")
     axes[3].set_title("Global Map Backlog")
@@ -511,7 +831,9 @@ def plot_global_map(rows: List[Row], out_dir: Path) -> Optional[Path]:
     return save_fig(out_dir, "global_map_gaussians.png")
 
 
-def plot_pruning_stats(rows: List[Row], frame_rows: List[Row], out_dir: Path) -> Optional[Path]:
+def plot_pruning_stats(
+    rows: List[Row], frame_rows: List[Row], out_dir: Path
+) -> Optional[Path]:
     rows = valid_time_rows(rows)
     frame_rows = valid_time_rows(frame_rows)
     if not rows and not frame_rows:
@@ -556,11 +878,13 @@ def plot_pruning_stats(rows: List[Row], frame_rows: List[Row], out_dir: Path) ->
         xs_removed, ys_removed = finite_pairs(xs, removed)
         xs_merges, ys_merges = finite_pairs(xs, merges)
         if xs_removed:
-            axes[2].scatter(xs_removed, ys_removed, s=14, alpha=0.75,
-                            label="removed components")
+            axes[2].scatter(
+                xs_removed, ys_removed, s=14, alpha=0.75, label="removed components"
+            )
         if xs_merges:
-            axes[2].plot(xs_merges, ys_merges, linewidth=0.9, alpha=0.7,
-                         label="merge count")
+            axes[2].plot(
+                xs_merges, ys_merges, linewidth=0.9, alpha=0.7, label="merge count"
+            )
         axes[2].legend()
     axes[2].set_xlabel("time since first pruning event (s)")
     axes[2].set_ylabel("components")
@@ -572,7 +896,9 @@ def plot_pruning_stats(rows: List[Row], frame_rows: List[Row], out_dir: Path) ->
 def plot_processes(rows: List[Row], out_dir: Path) -> Optional[Path]:
     if not rows:
         return None
-    by_time: Dict[float, Dict[str, float]] = defaultdict(lambda: {"cpu": 0.0, "rss": 0.0})
+    by_time: Dict[float, Dict[str, float]] = defaultdict(
+        lambda: {"cpu": 0.0, "rss": 0.0}
+    )
     for r in rows:
         t = f(r, "elapsed_s")
         if not math.isfinite(t):
@@ -603,7 +929,6 @@ def plot_processes(rows: List[Row], out_dir: Path) -> Optional[Path]:
 def plot_gpu(rows: List[Row], out_dir: Path) -> Optional[Path]:
     if not rows:
         return None
-    # gpu.csv timestamps are absolute strings; use row index as sampled time.
     samples = list(range(len(rows)))
     util = [f(r, "gpu_util_percent") for r in rows]
     mem = [f(r, "mem_used_mib") for r in rows]
@@ -638,13 +963,17 @@ def write_summary(
     lines = ["GMM-SLAM benchmark graph summary", ""]
     if frames:
         lines.append(f"Frames: {len(frames)}")
-        lines.append(f"Callback latency ms: {describe([f(r, 'callback_ms') for r in frames])}")
+        lines.append(
+            f"Callback latency ms: {describe([f(r, 'callback_ms') for r in frames])}"
+        )
     if gmm:
         lines.append(f"GMM fits: {len(gmm)}")
-        lines.append(f"GMM fit elapsed ms: {describe([f(r, 'elapsed_ms') for r in gmm])}")
+        lines.append(
+            f"GMM fit elapsed ms: {describe([f(r, 'elapsed_ms') for r in gmm])}"
+        )
     if d2d:
         lines.append(f"D2D results: {len(d2d)}")
-        for kind in sorted({r.get('kind', 'unknown') for r in d2d}):
+        for kind in sorted({r.get("kind", "unknown") for r in d2d}):
             subset = [r for r in d2d if r.get("kind", "unknown") == kind]
             ok = sum(i(r, "success", 0) for r in subset)
             lines.append(
@@ -657,10 +986,14 @@ def write_summary(
         lines.append(f"Loop closure trajectory segments plotted: {len(loop_edges)}")
     if smoother:
         lines.append(f"Fixed-lag smoother solves: {len(smoother)}")
-        lines.append(f"Fixed-lag total ms: {describe([f(r, 'total_ms') for r in smoother])}")
+        lines.append(
+            f"Fixed-lag total ms: {describe([f(r, 'total_ms') for r in smoother])}"
+        )
     if global_graph:
         lines.append(f"Global graph commits: {len(global_graph)}")
-        lines.append(f"Global graph total ms: {describe([f(r, 'total_ms') for r in global_graph])}")
+        lines.append(
+            f"Global graph total ms: {describe([f(r, 'total_ms') for r in global_graph])}"
+        )
     if global_map:
         last = global_map[-1]
         lines.append(
@@ -673,7 +1006,9 @@ def write_summary(
         applied = [r for r in pruning if i(r, "success", 0) == 1]
         removed = [f(r, "removed_total") for r in applied]
         elapsed = [f(r, "elapsed_ms") for r in pruning]
-        lines.append(f"Gaussian pruning events: {len(pruning)} (applied={len(applied)})")
+        lines.append(
+            f"Gaussian pruning events: {len(pruning)} (applied={len(applied)})"
+        )
         lines.append(f"Gaussian pruning removed components: {describe(removed)}")
         lines.append(f"Gaussian pruning elapsed ms: {describe(elapsed)}")
     if frame_pruning:
@@ -694,14 +1029,18 @@ def write_summary(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("run_dir", type=Path, nargs="?", help="Benchmark run directory")
-    parser.add_argument("--out-dir", type=Path, default=None, help="Output directory for graphs")
+    parser.add_argument(
+        "--out-dir", type=Path, default=None, help="Output directory for graphs"
+    )
     args = parser.parse_args()
 
     root = workspace_root()
     if args.run_dir is None:
         run_dir = newest_run_dir(root)
         if run_dir is None:
-            raise SystemExit(f"no gmmslam_cpp_* runs found under {root / 'gmmslam' / 'logs'}")
+            raise SystemExit(
+                f"no gmmslam_cpp_* runs found under {root / 'gmmslam' / 'logs'}"
+            )
     else:
         run_dir = resolve_input_path(args.run_dir, root)
     if not run_dir.exists():
@@ -729,6 +1068,8 @@ def main() -> int:
     for path in [
         plot_trajectory(run_dir, out_dir, frames, registration_events),
         plot_ate(frames, out_dir),
+        plot_correction_snaps(frames, registration_events, out_dir),
+        plot_loop_closure_quality(registration_events, global_graph, out_dir),
         plot_frame_timing(frames, out_dir),
         plot_gmm_fits(gmm, out_dir),
         plot_isam_timings(smoother, global_graph, out_dir),
@@ -740,9 +1081,20 @@ def main() -> int:
         if path is not None:
             generated.append(path)
     generated.extend(plot_d2d(d2d, out_dir))
-    generated.append(write_summary(
-        out_dir, frames, gmm, d2d, registration_events,
-        smoother, global_graph, global_map, pruning, frame_pruning))
+    generated.append(
+        write_summary(
+            out_dir,
+            frames,
+            gmm,
+            d2d,
+            registration_events,
+            smoother,
+            global_graph,
+            global_map,
+            pruning,
+            frame_pruning,
+        )
+    )
 
     print(f"Wrote {len(generated)} files to {out_dir}")
     for path in generated:

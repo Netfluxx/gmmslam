@@ -8,6 +8,7 @@
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/inference/Symbol.h>
 #include <gtsam/slam/BetweenFactor.h>
+#include <gtsam/slam/PriorFactor.h>
 
 #include <nlohmann/json.hpp>
 
@@ -1507,23 +1508,74 @@ void RegistrationManager::stageRegistrationFactor(
                                  std::numeric_limits<double>::quiet_NaN(),
                                  sigma_t, sigma_r);
         } else {
-            // Never turn a loop closure into an absolute prior on the live
-            // fixed-lag state. Late loops belong in the global pose graph; an
-            // absolute prior here can violently snap the local smoother.
-            ROS_INFO("[registration] loop X(%d)->X(%d) not staged in fixed-lag "
-                     "smoother because prev is outside lag; forwarding to global graph only "
-                     "score=%.4f",
-                     prev_idx, curr_idx, score);
-            logRegistrationEvent(stamp.toSec(), "staged", "loop",
-                                 prev_idx, curr_idx, score, -1,
-                                 "forwarded_global_graph_only",
-                                 std::numeric_limits<double>::quiet_NaN(),
-                                 std::numeric_limits<double>::quiet_NaN(),
-                                 std::numeric_limits<double>::quiet_NaN(),
-                                 std::numeric_limits<double>::quiet_NaN(),
-                                 std::numeric_limits<double>::quiet_NaN(),
-                                 std::numeric_limits<double>::quiet_NaN(),
-                                 sigma_t, sigma_r);
+            // prev is outside the lag window but curr is still alive.
+            // Compose the D2D result with the stored prev pose to get an
+            // absolute pose prior for curr in the odom frame, pulling the
+            // smoother toward the loop-corrected position.
+            Matrix4d T_w_prev_lc = Matrix4d::Identity();
+            bool have_prev_pose_lc = false;
+            {
+                std::lock_guard<std::mutex> gk(smoother_.graph_lock);
+                const auto prev_it = smoother_.pose_by_idx.find(prev_idx);
+                if (prev_it != smoother_.pose_by_idx.end()) {
+                    T_w_prev_lc = prev_it->second;
+                    have_prev_pose_lc = true;
+                }
+            }
+
+            if (have_prev_pose_lc) {
+                const Matrix4d T_w_curr_pred = T_w_prev_lc * T_prev_to_curr;
+                if (isSaneRigidTransform(T_w_curr_pred)) {
+                    const gtsam::Pose3 prior_pose =
+                        FixedLagBackend::pose3FromMatrix(T_w_curr_pred);
+                    smoother_.stageFactor(
+                        gtsam::PriorFactor<gtsam::Pose3>(
+                            X(curr_idx), prior_pose, noise).clone());
+                    ROS_INFO("[registration] staged loop prior X(%d) from LC "
+                             "X(%d)->X(%d) score=%.4f sigma_t=%.4f sigma_r=%.4f "
+                             "(prev outside lag window)",
+                             curr_idx, prev_idx, curr_idx, score, sigma_t, sigma_r);
+                    logRegistrationEvent(stamp.toSec(), "staged", "loop",
+                                         prev_idx, curr_idx, score, -1,
+                                         "prior_factor_from_loop",
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         sigma_t, sigma_r);
+                } else {
+                    ROS_WARN("[registration] loop X(%d)->X(%d): composed T_w_curr_pred "
+                             "is not valid SE(3); forwarding to global graph only",
+                             prev_idx, curr_idx);
+                    logRegistrationEvent(stamp.toSec(), "staged", "loop",
+                                         prev_idx, curr_idx, score, -1,
+                                         "forwarded_global_graph_only",
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         std::numeric_limits<double>::quiet_NaN(),
+                                         sigma_t, sigma_r);
+                }
+            } else {
+                ROS_INFO("[registration] loop X(%d)->X(%d) not staged: prev outside lag "
+                         "and not in pose history; forwarding to global graph only "
+                         "score=%.4f",
+                         prev_idx, curr_idx, score);
+                logRegistrationEvent(stamp.toSec(), "staged", "loop",
+                                     prev_idx, curr_idx, score, -1,
+                                     "forwarded_global_graph_only",
+                                     std::numeric_limits<double>::quiet_NaN(),
+                                     std::numeric_limits<double>::quiet_NaN(),
+                                     std::numeric_limits<double>::quiet_NaN(),
+                                     std::numeric_limits<double>::quiet_NaN(),
+                                     std::numeric_limits<double>::quiet_NaN(),
+                                     std::numeric_limits<double>::quiet_NaN(),
+                                     sigma_t, sigma_r);
+            }
         }
 
         if (is_loop_candidate) {
