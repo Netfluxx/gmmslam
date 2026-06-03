@@ -38,7 +38,14 @@ class NoisyGTPublisherNode:
         self.gt_init_wait_s = float(rospy.get_param("~gt_init_wait_s", 3.0))
         self.gt_noise_sigma_t = float(rospy.get_param("~gt_noise_sigma_t", 0.0))
         self.gt_noise_sigma_r = float(rospy.get_param("~gt_noise_sigma_r", 0.0))
+        self.gt_initial_yaw_offset_deg = float(
+            rospy.get_param("~gt_initial_yaw_offset_deg", 0.0)
+        )
         self.gt_noise_seed = int(rospy.get_param("~gt_noise_seed", -1))
+        self._T_initial_yaw_offset = np.eye(4, dtype=np.float64)
+        self._T_initial_yaw_offset[:3, :3] = Rotation.from_euler(
+            "z", self.gt_initial_yaw_offset_deg, degrees=True
+        ).as_matrix()
 
         self._rng = (
             np.random.default_rng(self.gt_noise_seed)
@@ -56,7 +63,8 @@ class NoisyGTPublisherNode:
         rospy.Subscriber(self.gt_topic, PoseStamped, self._gt_callback, queue_size=1)
 
         rospy.loginfo(
-            f"[noisy_gt_pub] ready | gt={self.gt_topic} | pose={self.pose_topic} | path={self.path_topic}"
+            f"[noisy_gt_pub] ready | gt={self.gt_topic} | pose={self.pose_topic} | "
+            f"path={self.path_topic} | yaw_offset={self.gt_initial_yaw_offset_deg:.2f} deg"
         )
 
     @staticmethod
@@ -121,11 +129,12 @@ class NoisyGTPublisherNode:
         # Fresh absolute Gaussian noise each frame (no accumulation).
         rot_noise_vec = self._rng.normal(0.0, self.gt_noise_sigma_r, size=3)
         trans_noise = self._rng.normal(0.0, self.gt_noise_sigma_t, size=3)
+        T_biased_abs = T_gt_odom @ self._T_initial_yaw_offset
         T_noisy_abs = np.eye(4, dtype=np.float64)
         T_noisy_abs[:3, :3] = (
-            Rotation.from_rotvec(rot_noise_vec).as_matrix() @ T_gt_odom[:3, :3]
+            Rotation.from_rotvec(rot_noise_vec).as_matrix() @ T_biased_abs[:3, :3]
         )
-        T_noisy_abs[:3, 3] = T_gt_odom[:3, 3] + trans_noise
+        T_noisy_abs[:3, 3] = T_biased_abs[:3, 3] + trans_noise
 
         ps = pose_to_pose_stamped(T_noisy_abs, msg.header.stamp, self.odom_frame)
         self._noisy_path.header.stamp = msg.header.stamp

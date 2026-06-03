@@ -14,12 +14,13 @@
   <arg name="odom_frame" default="world"/>
   <arg name="base_frame" default="m500_1_base_link"/>
   <arg name="gt_topic" default="/m500_1/mavros/local_position/pose"/>
-  <arg name="registration_workers" default="6"/>
+  <arg name="registration_workers" default="1"/>
   <arg name="suppress_registration_backend_output" default="true"/>
   <arg name="drop_stale_keyframe_registration_age_s" default="2.0"/>
   <arg name="odometry_input" default="/gmmslam_node/noisy_gt_pose"/>
   <arg name="gmmslam_respawn" default="true"/>
   <arg name="gmmslam_launch_prefix" default=""/>
+  <arg name="benchmark_log_dir" default=""/>
 
   <!-- ========== Load YAML onto the parameter server under /gmmslam ========== -->
   <rosparam command="load" file="$(arg config_file)" ns="gmmslam"/>
@@ -47,6 +48,7 @@
     <param name="sensor_frame" value="$(arg sensor_frame)"/>
     <param name="gt_topic" value="$(arg gt_topic)"/>
     <param name="odometry_input" value="$(arg odometry_input)"/>
+    <param name="benchmark_log_dir" value="$(arg benchmark_log_dir)"/>
   </node>
 
   <!-- ========== D2D registration worker pool ========== -->

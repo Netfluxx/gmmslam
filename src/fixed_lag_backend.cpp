@@ -11,6 +11,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <filesystem>
+#include <iomanip>
 #include <limits>
 
 namespace gmmslam {
@@ -44,7 +46,8 @@ static ConstantBias zeroBias() {
 FixedLagBackend::FixedLagBackend(const SmootherConfig& smoother_cfg,
                                  const GtNoiseConfig& gt_cfg,
                                  const LoopClosureConfig& loop_cfg,
-                                 const ImuConfig& imu_cfg)
+                                 const ImuConfig& imu_cfg,
+                                 const std::string& benchmark_log_dir)
     : fixed_lag_s(smoother_cfg.fixed_lag_s),
       pose_history_keep_(smoother_cfg.pose_history_keep),
       enable_imu_(imu_cfg.enable_preintegration)
@@ -108,9 +111,62 @@ FixedLagBackend::FixedLagBackend(const SmootherConfig& smoother_cfg,
 
     pose_by_idx[0] = Matrix4d::Identity();
     pose_uncertainty_by_idx[0] = 0.0;
+    initBenchmarkLogs(benchmark_log_dir);
 
     ROS_INFO("[smoother] initialized: IncrementalFixedLagSmoother (lag=%.2f s, imu=%s)",
              fixed_lag_s, enable_imu_ ? "on" : "off");
+}
+
+void FixedLagBackend::initBenchmarkLogs(const std::string& log_dir)
+{
+    if (log_dir.empty()) {
+        return;
+    }
+
+    try {
+        std::filesystem::create_directories(log_dir);
+        benchmark_smoother_csv_.open(log_dir + "/smoother_optimization.csv",
+                                     std::ios::out);
+        if (!benchmark_smoother_csv_) {
+            ROS_WARN("[benchmark] failed to open smoother_optimization.csv in %s",
+                     log_dir.c_str());
+            return;
+        }
+
+        benchmark_smoother_csv_ << std::fixed << std::setprecision(9);
+        benchmark_smoother_csv_
+            << "stamp,curr_idx,factors,values,update_ms,estimate_ms,total_ms,"
+            << "success,note\n";
+        benchmark_logs_enabled_ = true;
+    } catch (const std::exception& e) {
+        ROS_WARN("[benchmark] failed to initialize smoother timing log in %s: %s",
+                 log_dir.c_str(), e.what());
+    }
+}
+
+void FixedLagBackend::logOptimizationTiming(
+    double stamp_sec, int curr_idx,
+    std::size_t factors, std::size_t values,
+    double update_ms, double estimate_ms, double total_ms,
+    bool success, const std::string& note)
+{
+    if (!benchmark_logs_enabled_) {
+        return;
+    }
+
+    std::string safe_note = note;
+    std::replace(safe_note.begin(), safe_note.end(), ',', ';');
+    std::replace(safe_note.begin(), safe_note.end(), '\n', ' ');
+    benchmark_smoother_csv_
+        << stamp_sec << ','
+        << curr_idx << ','
+        << factors << ','
+        << values << ','
+        << update_ms << ','
+        << estimate_ms << ','
+        << total_ms << ','
+        << (success ? 1 : 0) << ','
+        << safe_note << '\n';
 }
 
 // -----------------------------------------------------------------------
@@ -364,7 +420,8 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
                                const ros::Time& stamp,
                                const Matrix4d& predicted_pose,
                                const Matrix4d* gt_rel_mat,
-                               const std::vector<std::tuple<double, Vector3d, Vector3d>>* imu_measurements) {
+                               const std::vector<std::tuple<double, Vector3d, Vector3d>>* imu_measurements,
+                               bool add_external_odometry_factor) {
     if (!initialize(predicted_pose, stamp)) return false;
 
     if (prev_idx < 0) {
@@ -395,12 +452,13 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
     std::unique_lock<std::mutex> new_data_lk(new_data_lock_);
 
     // ---- Pose factor ----
-    if (prev_exists && factor_prev_idx == prev_idx && gt_rel_mat != nullptr) {
+    if (add_external_odometry_factor &&
+        prev_exists && factor_prev_idx == prev_idx && gt_rel_mat != nullptr) {
         new_factors_.push_back(
             gtsam::BetweenFactor<Pose3>(key_prev, key_curr,
                                         pose3FromMatrix(*gt_rel_mat),
                                         gt_factor_noise_));
-    } else if (prev_exists) {
+    } else if (add_external_odometry_factor && prev_exists) {
         new_factors_.push_back(
             gtsam::BetweenFactor<Pose3>(key_prev, key_curr,
                                         pose3FromMatrix(fallback_rel),
@@ -412,6 +470,10 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
                 "[smoother] missing predecessor X(%d); linking X(%d)->X(%d) instead",
                 prev_idx, factor_prev_idx, curr_idx);
         }
+    } else if (prev_exists) {
+        ROS_INFO_THROTTLE(5.0,
+            "[smoother] external odometry factor disabled; X(%d) waits for D2D/other factors",
+            curr_idx);
     } else {
         new_factors_.addPrior(key_curr, pose3FromMatrix(predicted_pose), prior_noise_);
         ROS_WARN_THROTTLE(2.0,
@@ -635,8 +697,43 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
                 continue;
             }
 
+            const std::size_t n_factors = batch.factors.size();
+            const std::size_t n_values = batch.values.size();
+            const double batch_stamp = [&] {
+                const gtsam::Key key_curr_for_time = X(curr_idx);
+                const auto it = batch.timestamps.find(key_curr_for_time);
+                if (it != batch.timestamps.end()) {
+                    return it->second;
+                }
+                std::lock_guard<std::mutex> lk(graph_lock);
+                const auto kt = key_t_sec.find(curr_idx);
+                return (kt != key_t_sec.end()) ? kt->second : -1.0;
+            }();
+            const auto solve_t0 = std::chrono::steady_clock::now();
+            gtsam::Values estimate;
+            double update_ms = 0.0;
+            double estimate_ms = 0.0;
+
+            const auto update_t0 = std::chrono::steady_clock::now();
             fixed_lag_->update(batch.factors, batch.values, batch.timestamps);
-            const gtsam::Values estimate = fixed_lag_->calculateEstimate();
+            const auto update_t1 = std::chrono::steady_clock::now();
+            update_ms = std::chrono::duration<double, std::milli>(
+                update_t1 - update_t0).count();
+
+            const auto estimate_t0 = std::chrono::steady_clock::now();
+            estimate = fixed_lag_->calculateEstimate();
+            const auto estimate_t1 = std::chrono::steady_clock::now();
+            estimate_ms = std::chrono::duration<double, std::milli>(
+                estimate_t1 - estimate_t0).count();
+            const double total_ms = std::chrono::duration<double, std::milli>(
+                estimate_t1 - solve_t0).count();
+            ROS_INFO("[timing][smoother] X(%d) factors=%zu values=%zu "
+                     "update_ms=%.3f estimate_ms=%.3f total_ms=%.3f",
+                     curr_idx, n_factors, n_values,
+                     update_ms, estimate_ms, total_ms);
+            logOptimizationTiming(batch_stamp, curr_idx, n_factors, n_values,
+                                  update_ms, estimate_ms, total_ms, true,
+                                  "fixed_lag_update");
 
             const gtsam::Key key_curr = X(curr_idx);
             bool has_curr = estimate.exists(key_curr);

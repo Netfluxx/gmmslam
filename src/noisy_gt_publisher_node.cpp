@@ -43,10 +43,21 @@ public:
         if (!pnh.getParam("gt_noise_sigma_r", gt_noise_sigma_r_)) {
             nh_gmmslam.param("gt_noise/sigma_r", gt_noise_sigma_r_, 0.01);
         }
+        if (!pnh.getParam("gt_initial_yaw_offset_deg",
+                          initial_yaw_offset_deg_)) {
+            nh_gmmslam.param("gt_noise/initial_yaw_offset_deg",
+                             initial_yaw_offset_deg_, 0.0);
+        }
         int seed = -1;
         if (!pnh.getParam("gt_noise_seed", seed)) {
             nh_gmmslam.param("gt_noise/seed", seed, -1);
         }
+
+        const double yaw_offset_rad =
+            initial_yaw_offset_deg_ * M_PI / 180.0;
+        T_initial_yaw_offset_.block<3, 3>(0, 0) =
+            Eigen::AngleAxisd(yaw_offset_rad, Eigen::Vector3d::UnitZ())
+                .toRotationMatrix();
 
         if (seed >= 0) {
             rng_.seed(static_cast<uint64_t>(seed));
@@ -60,9 +71,11 @@ public:
                                &NoisyGTPublisherNode::gtCallback, this);
 
         ROS_INFO("[noisy_gt_pub] ready | gt=%s | pose=%s | path=%s | "
-                 "sigma_t=%.4f m sigma_r=%.4f rad init_wait=%.2f s seed=%d",
+                 "sigma_t=%.4f m sigma_r=%.4f rad yaw_offset=%.2f deg "
+                 "init_wait=%.2f s seed=%d",
                  gt_topic.c_str(), pose_topic.c_str(), path_topic.c_str(),
-                 gt_noise_sigma_t_, gt_noise_sigma_r_, gt_init_wait_s_, seed);
+                 gt_noise_sigma_t_, gt_noise_sigma_r_,
+                 initial_yaw_offset_deg_, gt_init_wait_s_, seed);
     }
 
 private:
@@ -151,9 +164,9 @@ private:
                 Eigen::AngleAxisd(angle, rot_noise.normalized()).toRotationMatrix();
         }
 
-        Eigen::Matrix4d T_noisy = Eigen::Matrix4d::Identity();
-        T_noisy.block<3, 3>(0, 0) = R_noise * T_odom.block<3, 3>(0, 0);
-        T_noisy.block<3, 1>(0, 3) = T_odom.block<3, 1>(0, 3) + trans_noise;
+        Eigen::Matrix4d T_noisy = T_odom * T_initial_yaw_offset_;
+        T_noisy.block<3, 3>(0, 0) = R_noise * T_noisy.block<3, 3>(0, 0);
+        T_noisy.block<3, 1>(0, 3) += trans_noise;
 
         const auto ps = matrixToPoseStamped(T_noisy, msg->header.stamp);
         noisy_path_.header.stamp = msg->header.stamp;
@@ -169,6 +182,8 @@ private:
     double gt_init_wait_s_ = 3.0;
     double gt_noise_sigma_t_ = 0.01;
     double gt_noise_sigma_r_ = 0.01;
+    double initial_yaw_offset_deg_ = 0.0;
+    Eigen::Matrix4d T_initial_yaw_offset_ = Eigen::Matrix4d::Identity();
     std::mt19937_64 rng_{std::random_device{}()};
     std::normal_distribution<double> normal_dist_{0.0, 1.0};
 

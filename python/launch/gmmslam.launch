@@ -6,19 +6,20 @@
   <arg name="odom_frame"       default="world"/>
   <arg name="base_frame"       default="m500_1_base_link"/>
   <arg name="enable_async_registration" default="true"/>
-  <arg name="registration_request_every_n_frames" default="3"/>
+  <arg name="registration_request_every_n_frames" default="1"/>
   <arg name="registration_factor_every_n_frames"  default="3"/>
-  <arg name="registration_score_threshold" default="0.3"/>
+  <arg name="registration_score_threshold" default="0.85"/>
+  <arg name="registration_max_sequential_odom_gap" default="12"/>
   <arg name="strong_factor_score_threshold" default="2.0"/>
   <arg name="strong_factor_sigma_t" default="0.01"/>
   <arg name="strong_factor_sigma_r" default="0.01"/>
   <!-- Loop closure detection -->
-  <arg name="enable_loop_closure_detection" default="true"/>
+  <arg name="enable_loop_closure_detection" default="false"/>
   <arg name="loop_closure_search_radius_m" default="2.5"/>
   <arg name="loop_closure_min_keyframe_gap" default="10"/>
-  <arg name="loop_closure_max_candidates" default="5"/>
-  <arg name="loop_closure_request_every_n_keyframes" default="2"/>
-  <arg name="loop_closure_search_cooldown_keyframes" default="2"/>
+  <arg name="loop_closure_max_candidates" default="1"/>
+  <arg name="loop_closure_request_every_n_keyframes" default="12"/>
+  <arg name="loop_closure_search_cooldown_keyframes" default="12"/>
   <arg name="loop_closure_min_separation_m" default="0.8"/>
   <arg name="loop_closure_min_separation_deg" default="20.0"/>
   <arg name="loop_closure_max_age_s" default="720.0"/>
@@ -31,10 +32,10 @@
   <arg name="score_sigma_low" default="0.6"/>
   <!-- score sigma high => D2D reg. score value corresponding to low noise -->
   <arg name="score_sigma_high" default="1.7"/>
-  <arg name="seq_sigma_t_min" default="0.02"/>
-  <arg name="seq_sigma_t_max" default="0.20"/>
-  <arg name="seq_sigma_r_min" default="0.01"/>
-  <arg name="seq_sigma_r_max" default="0.15"/>
+  <arg name="seq_sigma_t_min" default="0.08"/>
+  <arg name="seq_sigma_t_max" default="0.25"/>
+  <arg name="seq_sigma_r_min" default="0.08"/>
+  <arg name="seq_sigma_r_max" default="0.25"/>
   <arg name="loop_sigma_t_min" default="0.03"/>
   <arg name="loop_sigma_t_max" default="0.40"/>
   <arg name="loop_sigma_r_min" default="0.02"/>
@@ -45,11 +46,11 @@
   <arg name="submap_loop_sigma_r_max" default="0.30"/>
   <arg name="submap_reanchor_smoother_on_traj_gate_fail" default="true"/>
   <arg name="solve_after_registration_factor" default="false"/>
-  <arg name="registration_workers" default="6"/>
+  <arg name="registration_workers" default="1"/>
   <arg name="suppress_registration_backend_output" default="true"/>
   <!-- Keyframe parameters -->
   <arg name="keyframe_translation_thresh_m" default="0.3"/>
-  <arg name="keyframe_rotation_thresh_deg" default="7.0"/>
+  <arg name="keyframe_rotation_thresh_deg" default="10.0"/>
   <arg name="keyframe_use_time_trigger" default="false"/>
   <arg name="compensate_fit_latency_in_map" default="true"/>
   <!-- Submap parameters -->
@@ -67,6 +68,7 @@
   <arg name="gt_init_wait_s" default="3.0"/>
   <arg name="gt_noise_sigma_t" default="0.01"/>
   <arg name="gt_noise_sigma_r" default="0.01"/>
+  <arg name="gt_initial_yaw_offset_deg" default="0.0"/>
   <!-- GT factor noise: should be >= sqrt(2)*gt_noise_sigma to match
        the actual measurement noise from differencing noisy absolute poses.
        Auto-derived from gt_noise_sigma if omitted in the node code. -->
@@ -137,6 +139,7 @@
     <param name="registration_request_every_n_frames" value="$(arg registration_request_every_n_frames)"/>
     <param name="registration_factor_every_n_frames"  value="$(arg registration_factor_every_n_frames)"/>
     <param name="registration_score_threshold" value="$(arg registration_score_threshold)"/>
+    <param name="registration_max_sequential_odom_gap" value="$(arg registration_max_sequential_odom_gap)"/>
     <param name="strong_factor_score_threshold" value="$(arg strong_factor_score_threshold)"/>
     <param name="strong_factor_sigma_t" value="$(arg strong_factor_sigma_t)"/>
     <param name="strong_factor_sigma_r" value="$(arg strong_factor_sigma_r)"/>
@@ -196,6 +199,7 @@
     <param name="gt_init_wait_s" value="$(arg gt_init_wait_s)"/>
     <param name="gt_noise_sigma_t" value="$(arg gt_noise_sigma_t)"/>
     <param name="gt_noise_sigma_r" value="$(arg gt_noise_sigma_r)"/>
+    <param name="gt_initial_yaw_offset_deg" value="$(arg gt_initial_yaw_offset_deg)"/>
     <param name="gt_factor_sigma_t" value="$(arg gt_factor_sigma_t)"/>
     <param name="gt_factor_sigma_r" value="$(arg gt_factor_sigma_r)"/>
     <param name="gt_noise_seed" value="$(arg gt_noise_seed)"/>
@@ -254,6 +258,7 @@
     <param name="gt_init_wait_s" value="$(arg gt_init_wait_s)"/>
     <param name="gt_noise_sigma_t" value="$(arg gt_noise_sigma_t)"/>
     <param name="gt_noise_sigma_r" value="$(arg gt_noise_sigma_r)"/>
+    <param name="gt_initial_yaw_offset_deg" value="$(arg gt_initial_yaw_offset_deg)"/>
     <param name="gt_noise_seed" value="$(arg gt_noise_seed)"/>
     <param name="pose_topic" value="$(arg odometry_input)"/>
     <param name="path_topic" value="/gmmslam_node/noisy_gt_path"/>

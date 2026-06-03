@@ -75,6 +75,7 @@ struct SogmmConfig {
     double gmmap_far_fill_voxel_m = 1.0;
     int gmmap_far_fill_max_components = 300;
     double gmmap_far_fill_skip_max_depth_margin_m = 0.5;
+    int gmmap_max_components = 120;
     bool gmmap_estimate_intrinsics = false;
     double gmmap_horizontal_fov_deg = 120.0;
     double gmmap_fx = 0.0;
@@ -86,6 +87,7 @@ struct SogmmConfig {
 struct SmootherConfig {
     double fixed_lag_s = 4.0;
     int smoother_stride = 3;
+    bool enable_external_odometry_factor = true;
     double odom_noise_sigma_t = 0.03;
     double odom_noise_sigma_r = 0.03;
     double lost_scale = 10.0;
@@ -95,23 +97,24 @@ struct SmootherConfig {
 
 struct RegistrationConfig {
     bool enable_async = true;
-    int request_every_n_frames = 3;
+    int request_every_n_frames = 1;
     int factor_every_n_frames = 3;
-    double score_threshold = 0.3;
+    double score_threshold = 0.85;
     double strong_factor_score_threshold = 2.0;
     double strong_factor_sigma_t = 0.01;
     double strong_factor_sigma_r = 0.01;
     int queue_size = 8;
     int result_queue_size = 64;
     int enqueue_cooldown_frames = 8;
-    int workers = 6;
+    int max_sequential_odom_gap = 10;
+    int workers = 1;
     bool compensate_fit_latency = true;
     double score_sigma_low = 0.6;
     double score_sigma_high = 1.7;
-    double seq_sigma_t_min = 0.02;
-    double seq_sigma_t_max = 0.20;
-    double seq_sigma_r_min = 0.01;
-    double seq_sigma_r_max = 0.15;
+    double seq_sigma_t_min = 0.08;
+    double seq_sigma_t_max = 0.25;
+    double seq_sigma_r_min = 0.08;
+    double seq_sigma_r_max = 0.25;
     double loop_sigma_t_min = 0.03;
     double loop_sigma_t_max = 0.40;
     double loop_sigma_r_min = 0.02;
@@ -193,6 +196,7 @@ struct GlobalGraphConfig {
     double between_sigma_r = 0.08;
     double prior_sigma_t = 0.02;
     double prior_sigma_r = 0.02;
+    bool enable_overlap_d2d = true;
     double overlap_radius_m = 3.0;
     int max_overlap_registrations = 3;
     double reg_score_threshold = 0.5;
@@ -238,6 +242,7 @@ struct GtNoiseConfig {
     double init_wait_s = 3.0;
     double sigma_t = 0.01;
     double sigma_r = 0.01;
+    double initial_yaw_offset_deg = 0.0;
     double factor_sigma_t = 0.015;
     double factor_sigma_r = 0.015;
     int seed = -1;

@@ -146,6 +146,8 @@ void loadGmmap(const YAML::Node& root, SogmmConfig& c) {
         c.gmmap_far_fill_skip_max_depth_margin_m =
             readOr(adapter, "far_fill_skip_max_depth_margin_m",
                    c.gmmap_far_fill_skip_max_depth_margin_m);
+        c.gmmap_max_components =
+            readOr(adapter, "max_components", c.gmmap_max_components);
         c.gmmap_estimate_intrinsics =
             readOr(adapter, "estimate_intrinsics",
                    c.gmmap_estimate_intrinsics);
@@ -164,6 +166,9 @@ void loadSmoother(const YAML::Node& root, SmootherConfig& c) {
     const auto& n = root["smoother"];
     c.fixed_lag_s = readOr(n, "fixed_lag_s", c.fixed_lag_s);
     c.smoother_stride = readOr(n, "smoother_stride", c.smoother_stride);
+    c.enable_external_odometry_factor =
+        readOr(n, "enable_external_odometry_factor",
+               c.enable_external_odometry_factor);
     c.odom_noise_sigma_t = readOr(n, "odom_noise_sigma_t", c.odom_noise_sigma_t);
     c.odom_noise_sigma_r = readOr(n, "odom_noise_sigma_r", c.odom_noise_sigma_r);
     c.lost_scale = readOr(n, "lost_scale", c.lost_scale);
@@ -184,6 +189,8 @@ void loadRegistration(const YAML::Node& root, RegistrationConfig& c) {
     c.queue_size = readOr(n, "queue_size", c.queue_size);
     c.result_queue_size = readOr(n, "result_queue_size", c.result_queue_size);
     c.enqueue_cooldown_frames = readOr(n, "enqueue_cooldown_frames", c.enqueue_cooldown_frames);
+    c.max_sequential_odom_gap =
+        readOr(n, "max_sequential_odom_gap", c.max_sequential_odom_gap);
     c.workers = readOr(n, "workers", c.workers);
     c.compensate_fit_latency = readOr(n, "compensate_fit_latency", c.compensate_fit_latency);
     c.score_sigma_low = readOr(n, "score_sigma_low", c.score_sigma_low);
@@ -268,6 +275,8 @@ void loadGlobalGraph(const YAML::Node& root, GlobalGraphConfig& c) {
     c.between_sigma_r = readOr(n, "between_sigma_r", c.between_sigma_r);
     c.prior_sigma_t = readOr(n, "prior_sigma_t", c.prior_sigma_t);
     c.prior_sigma_r = readOr(n, "prior_sigma_r", c.prior_sigma_r);
+    c.enable_overlap_d2d =
+        readOr(n, "enable_overlap_d2d", c.enable_overlap_d2d);
     c.overlap_radius_m = readOr(n, "overlap_radius_m", c.overlap_radius_m);
     c.max_overlap_registrations =
         readOr(n, "max_overlap_registrations", c.max_overlap_registrations);
@@ -308,6 +317,8 @@ void loadGtNoise(const YAML::Node& root, GtNoiseConfig& c) {
     c.init_wait_s = readOr(n, "init_wait_s", c.init_wait_s);
     c.sigma_t = readOr(n, "sigma_t", c.sigma_t);
     c.sigma_r = readOr(n, "sigma_r", c.sigma_r);
+    c.initial_yaw_offset_deg =
+        readOr(n, "initial_yaw_offset_deg", c.initial_yaw_offset_deg);
     c.factor_sigma_t = readOr(n, "factor_sigma_t", c.factor_sigma_t);
     c.factor_sigma_r = readOr(n, "factor_sigma_r", c.factor_sigma_r);
     c.seed = readOr(n, "seed", c.seed);

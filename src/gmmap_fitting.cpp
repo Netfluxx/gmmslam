@@ -171,6 +171,27 @@ void normalizeWeights(GmmModel& model) {
     }
 }
 
+int capComponentsByWeight(GmmModel& model, int max_components) {
+    if (max_components <= 0 ||
+        static_cast<int>(model.components.size()) <= max_components) {
+        return 0;
+    }
+
+    auto keep_end = model.components.begin() + max_components;
+    std::nth_element(
+        model.components.begin(), keep_end, model.components.end(),
+        [](const GmmComponent& a, const GmmComponent& b) {
+            return a.weight > b.weight;
+        });
+    model.components.erase(keep_end, model.components.end());
+    std::sort(
+        model.components.begin(), model.components.end(),
+        [](const GmmComponent& a, const GmmComponent& b) {
+            return a.weight > b.weight;
+        });
+    return max_components;
+}
+
 class ScopedCoutSilencer {
 public:
     explicit ScopedCoutSilencer(bool enabled)
@@ -348,18 +369,22 @@ GmmModel fitGmmap(const OrganizedDepthImage& depth,
         appendFarDepthComponents(depth, config, native_max_component_range, result);
     max_component_range =
         std::max(max_component_range, far_fill.max_range);
+    const int raw_components = result.numComponents();
+    const int component_cap =
+        capComponentsByWeight(result, config.gmmap_max_components);
     normalizeWeights(result);
 
     const auto t1 = std::chrono::steady_clock::now();
     const double dt_ms =
         std::chrono::duration<double, std::milli>(t1 - t0).count();
-    ROS_INFO("[gmmap] fit depth=%dx%d valid=%d max_depth=%.2f K=%d "
-             "native_max_range=%.2f far_fill=%d max_gmm_range=%.2f %.1f ms "
+    ROS_INFO("[gmmap] fit depth=%dx%d valid=%d max_depth=%.2f K=%d raw_K=%d "
+             "cap=%d native_max_range=%.2f far_fill=%d max_gmm_range=%.2f %.1f ms "
              "fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
              static_cast<int>(depth.depth.cols()),
              static_cast<int>(depth.depth.rows()), depth.valid_points,
              static_cast<double>(depth.depth.maxCoeff()),
-             result.numComponents(), native_max_component_range,
+             result.numComponents(), raw_components, component_cap,
+             native_max_component_range,
              far_fill.added_components, max_component_range,
              dt_ms, depth.fx, depth.fy, depth.cx, depth.cy);
 

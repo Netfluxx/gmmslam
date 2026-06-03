@@ -8,6 +8,9 @@ namespace gmmslam {
 struct RegistrationResult {
     Eigen::Matrix4f transform = Eigen::Matrix4f::Identity();
     float score = -std::numeric_limits<float>::infinity();
+    float coarse_score = -std::numeric_limits<float>::infinity();
+    int n_source = 0;
+    int n_target = 0;
     bool success = false;
 };
 

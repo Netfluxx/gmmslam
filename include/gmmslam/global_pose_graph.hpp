@@ -10,6 +10,7 @@
 #include <gtsam/nonlinear/ISAM2.h>
 
 #include <atomic>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
@@ -43,7 +44,8 @@ public:
                     GetPoseFn get_pose_fn,
                     GetGmmFn get_gmm_fn = nullptr,
                     GetPoseUncertaintyFn get_pose_uncertainty_fn = nullptr,
-                    GetSubmapTrajDeltaFn get_traj_delta_fn = nullptr);
+                    GetSubmapTrajDeltaFn get_traj_delta_fn = nullptr,
+                    std::string benchmark_log_dir = {});
 
     bool shouldCreateSubmap(int key_idx) const;
 
@@ -111,6 +113,28 @@ private:
                                 double sigma_r_min, double sigma_r_max) const;
     bool passesAuxGate(const std::string& name, const Matrix4d& T_aux,
                        const Matrix4d* T_ref, bool use_traj_aux_limits) const;
+    void initBenchmarkLogs(const std::string& log_dir);
+    void logOptimizationTiming(double stamp_sec,
+                               std::size_t factors,
+                               std::size_t values,
+                               double update_ms,
+                               double estimate_ms,
+                               double total_ms,
+                               bool success,
+                               const std::string& note);
+    void logMapStats(double stamp_sec, const std::string& event);
+    void logPruningStats(double stamp_sec,
+                         const std::string& event,
+                         int sid_a,
+                         int sid_b,
+                         int before_a,
+                         int before_b,
+                         int after_a,
+                         int after_b,
+                         int dropped_keys,
+                         double elapsed_ms,
+                         bool success,
+                         const std::string& note);
 
     void enqueueSubmapFinalization(int sid, const ros::Time& stamp);
     /// Returns true if submap is finalized (or already had a merged GMM), false if
@@ -134,6 +158,7 @@ private:
     std::string gmm_dir_;
     MapConfig map_cfg_;
     int submap_keyframes_per_submap_;
+    bool enable_overlap_d2d_;
     double overlap_radius_m_;
     int max_overlap_registrations_;
     double submap_reg_score_threshold_;
@@ -168,6 +193,10 @@ private:
     std::unique_ptr<gtsam::ISAM2> isam_;
     gtsam::NonlinearFactorGraph new_factors_;
     gtsam::Values new_values_;
+    std::ofstream benchmark_global_graph_csv_;
+    std::ofstream benchmark_global_map_stats_csv_;
+    std::ofstream benchmark_global_pruning_csv_;
+    bool benchmark_logs_enabled_ = false;
 
     // Submap lifecycle state
     int last_submap_idx_ = -1;

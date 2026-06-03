@@ -15,11 +15,13 @@
 #include <gtsam_unstable/nonlinear/IncrementalFixedLagSmoother.h>
 
 #include <atomic>
+#include <fstream>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <set>
+#include <string>
 #include <thread>
 
 namespace gmmslam {
@@ -29,7 +31,8 @@ public:
     FixedLagBackend(const SmootherConfig& smoother_cfg,
                     const GtNoiseConfig& gt_cfg,
                     const LoopClosureConfig& loop_cfg,
-                    const ImuConfig& imu_cfg);
+                    const ImuConfig& imu_cfg,
+                    const std::string& benchmark_log_dir = {});
 
     bool initialize(const Matrix4d& pose, const ros::Time& stamp);
     bool initialized() const { return initialized_; }
@@ -37,7 +40,8 @@ public:
     bool addFrame(int prev_idx, int curr_idx, const ros::Time& stamp,
                   const Matrix4d& predicted_pose,
                   const Matrix4d* gt_rel_mat = nullptr,
-                  const std::vector<std::tuple<double, Vector3d, Vector3d>>* imu_measurements = nullptr);
+                  const std::vector<std::tuple<double, Vector3d, Vector3d>>* imu_measurements = nullptr,
+                  bool add_external_odometry_factor = true);
 
     void stageFactor(const gtsam::NonlinearFactor::shared_ptr& factor);
     bool flushStagedFactors();
@@ -85,6 +89,12 @@ private:
         const gtsam::Values& new_values,
         double t_latest,
         bool require_active_keys) const;
+    void initBenchmarkLogs(const std::string& log_dir);
+    void logOptimizationTiming(double stamp_sec, int curr_idx,
+                               std::size_t factors, std::size_t values,
+                               double update_ms, double estimate_ms,
+                               double total_ms, bool success,
+                               const std::string& note);
 
     int pose_history_keep_;
     bool enable_imu_;
@@ -112,6 +122,8 @@ private:
     bool initialized_ = false;
     std::set<int> inserted_pose_keys_;
     std::set<gtsam::Key> active_gtsam_keys_;
+    std::ofstream benchmark_smoother_csv_;
+    bool benchmark_logs_enabled_ = false;
 
     // Solve queue
     ThreadSafeQueue<SolveBatch> solve_queue_{16};

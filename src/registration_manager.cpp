@@ -7,7 +7,6 @@
 
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/inference/Symbol.h>
-#include <gtsam/slam/PriorFactor.h>
 #include <gtsam/slam/BetweenFactor.h>
 
 #include <nlohmann/json.hpp>
@@ -19,6 +18,7 @@
 #include <Eigen/Geometry>
 #include <filesystem>
 #include <functional>
+#include <iomanip>
 #include <limits>
 #include <thread>
 #include <vector>
@@ -94,7 +94,8 @@ RegistrationManager::RegistrationManager(
     const VisualizationConfig& vis_cfg,
     const std::string& gmm_dir,
     ros::Publisher loop_closure_markers_pub,
-    std::string map_frame)
+    std::string map_frame,
+    std::string benchmark_log_dir)
     : smoother_(smoother),
       global_graph_(global_graph),
       reg_pub_(std::move(reg_request_pub)),
@@ -119,6 +120,7 @@ RegistrationManager::RegistrationManager(
       loop_closure_gmm_keep_keyframes_(lc_cfg.gmm_keep_keyframes),
       loop_closure_consistency_gate_trans_m_(lc_cfg.consistency_gate_trans_m),
       loop_closure_consistency_gate_rot_deg_(lc_cfg.consistency_gate_rot_deg),
+      max_sequential_odom_gap_(reg_cfg.max_sequential_odom_gap),
       d2d_frame_to_frame_text_enable_(vis_cfg.d2d_frame_to_frame_text_enable),
       d2d_submap_overlap_text_enable_(vis_cfg.d2d_submap_overlap_text_enable),
       d2d_loop_closure_text_enable_(vis_cfg.d2d_loop_closure_text_enable),
@@ -138,6 +140,7 @@ RegistrationManager::RegistrationManager(
       result_queue_(static_cast<std::size_t>(reg_cfg.result_queue_size))
 {
     std::filesystem::create_directories(gmm_dir_);
+    initBenchmarkLogs(benchmark_log_dir);
     ROS_INFO("[registration] GMM fitting backend requested: %s%s",
              sogmm_cfg_.backend.c_str(),
              gmmapFittingAvailable() ? " (GMMap adapter built)"
@@ -156,6 +159,161 @@ RegistrationManager::RegistrationManager(
     } else {
         ROS_INFO("[registration] SOLiD disabled — loop search is radius-only");
     }
+}
+
+void RegistrationManager::initBenchmarkLogs(const std::string& log_dir)
+{
+    if (log_dir.empty()) {
+        return;
+    }
+
+    try {
+        std::filesystem::create_directories(log_dir);
+        benchmark_gmm_fits_csv_.open(log_dir + "/gmm_fits.csv",
+                                     std::ios::out);
+        benchmark_d2d_timings_csv_.open(log_dir + "/d2d_timings.csv",
+                                        std::ios::out);
+        benchmark_registration_csv_.open(log_dir + "/registration_events.csv",
+                                         std::ios::out);
+        if (!benchmark_gmm_fits_csv_ || !benchmark_d2d_timings_csv_ ||
+            !benchmark_registration_csv_) {
+            ROS_WARN("[benchmark] failed to open one or more registration benchmark CSVs in %s",
+                     log_dir.c_str());
+            return;
+        }
+
+        benchmark_gmm_fits_csv_ << std::fixed << std::setprecision(9);
+        benchmark_gmm_fits_csv_
+            << "stamp,frame_idx,backend,point_count,component_count,"
+            << "queue_depth_after_pop,elapsed_ms,success,note\n";
+        benchmark_d2d_timings_csv_ << std::fixed << std::setprecision(9);
+        benchmark_d2d_timings_csv_
+            << "stamp,kind,prev_idx,curr_idx,success,score,elapsed_ms,reason\n";
+        benchmark_registration_csv_ << std::fixed << std::setprecision(9);
+        benchmark_registration_csv_
+            << "stamp,event,kind,prev_idx,curr_idx,score,elapsed_ms,reason,"
+            << "init_t_m,init_r_deg,delta_t_m,delta_r_deg,"
+            << "trans_err_m,rot_err_deg,sigma_t,sigma_r,"
+            << "n_source,n_target,coarse_score\n";
+        benchmark_logs_enabled_ = true;
+    } catch (const std::exception& e) {
+        ROS_WARN("[benchmark] failed to initialize registration log in %s: %s",
+                 log_dir.c_str(), e.what());
+    }
+}
+
+void RegistrationManager::logGmmFitTiming(
+    double stamp_sec,
+    int frame_idx,
+    const std::string& backend,
+    int point_count,
+    int component_count,
+    std::size_t queue_depth_after_pop,
+    double elapsed_ms,
+    bool success,
+    const std::string& note)
+{
+    if (!benchmark_logs_enabled_) {
+        return;
+    }
+
+    std::string safe_note = note;
+    std::replace(safe_note.begin(), safe_note.end(), ',', ';');
+    std::replace(safe_note.begin(), safe_note.end(), '\n', ' ');
+    std::lock_guard<std::mutex> lk(benchmark_log_mutex_);
+    benchmark_gmm_fits_csv_
+        << stamp_sec << ','
+        << frame_idx << ','
+        << backend << ','
+        << point_count << ','
+        << component_count << ','
+        << queue_depth_after_pop << ','
+        << elapsed_ms << ','
+        << (success ? 1 : 0) << ','
+        << safe_note << '\n';
+}
+
+void RegistrationManager::logD2DTiming(
+    double stamp_sec,
+    const std::string& kind,
+    int prev_idx,
+    int curr_idx,
+    bool success,
+    double score,
+    long elapsed_ms,
+    const std::string& reason)
+{
+    if (!benchmark_logs_enabled_) {
+        return;
+    }
+
+    std::string safe_reason = reason;
+    std::replace(safe_reason.begin(), safe_reason.end(), ',', ';');
+    std::replace(safe_reason.begin(), safe_reason.end(), '\n', ' ');
+    std::lock_guard<std::mutex> lk(benchmark_log_mutex_);
+    benchmark_d2d_timings_csv_
+        << stamp_sec << ','
+        << kind << ','
+        << prev_idx << ','
+        << curr_idx << ','
+        << (success ? 1 : 0) << ','
+        << score << ','
+        << elapsed_ms << ','
+        << safe_reason << '\n';
+}
+
+void RegistrationManager::logRegistrationEvent(
+    double stamp_sec,
+    const std::string& event,
+    const std::string& kind,
+    int prev_idx,
+    int curr_idx,
+    double score,
+    long elapsed_ms,
+    const std::string& reason,
+    double init_t_m,
+    double init_r_deg,
+    double delta_t_m,
+    double delta_r_deg,
+    double trans_err_m,
+    double rot_err_deg,
+    double sigma_t,
+    double sigma_r,
+    int n_source,
+    int n_target,
+    double coarse_score)
+{
+    if (!benchmark_logs_enabled_) {
+        return;
+    }
+
+    auto csv_safe = [](std::string value) {
+        std::replace(value.begin(), value.end(), ',', ';');
+        std::replace(value.begin(), value.end(), '\n', ' ');
+        return value;
+    };
+
+    std::lock_guard<std::mutex> lk(benchmark_log_mutex_);
+    benchmark_registration_csv_
+        << stamp_sec << ','
+        << csv_safe(event) << ','
+        << csv_safe(kind) << ','
+        << prev_idx << ','
+        << curr_idx << ','
+        << score << ','
+        << elapsed_ms << ','
+        << csv_safe(reason) << ','
+        << init_t_m << ','
+        << init_r_deg << ','
+        << delta_t_m << ','
+        << delta_r_deg << ','
+        << trans_err_m << ','
+        << rot_err_deg << ','
+        << sigma_t << ','
+        << sigma_r << ','
+        << n_source << ','
+        << n_target << ','
+        << coarse_score << '\n';
 }
 
 // ---------------------------------------------------------------------------
@@ -300,7 +458,15 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
                      "elapsed_ms=%.1f",
                      fid, backend_used.c_str(), static_cast<long>(job.points.rows()),
                      model.numComponents(), dt_ms);
+            ROS_INFO("[timing][gmm_fit] X(%d) backend=%s pts=%ld K=%d "
+                     "elapsed_ms=%.3f",
+                     fid, backend_used.c_str(), static_cast<long>(job.points.rows()),
+                     model.numComponents(), dt_ms);
             if (model.numComponents() > 0) {
+                logGmmFitTiming(job.stamp.toSec(), fid, backend_used,
+                                static_cast<int>(job.points.rows()),
+                                model.numComponents(), qsize_after_pop,
+                                dt_ms, true, "fit_ok");
                 finishFit(model, job.frame_idx, job.stamp,
                           job.capture_t_sec, job.capture_pose);
                 finish_ok = true;
@@ -310,6 +476,10 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
                     "for frame %d pts=%ld elapsed_ms=%.1f",
                     fid, static_cast<long>(job.points.rows()),
                     dt_ms);
+                logGmmFitTiming(job.stamp.toSec(), fid, backend_used,
+                                static_cast<int>(job.points.rows()),
+                                0, qsize_after_pop, dt_ms, false,
+                                "empty_model");
             }
         } catch (const std::exception& e) {
             const auto t1 = std::chrono::steady_clock::now();
@@ -320,6 +490,10 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
                 "what=%s",
                 fid, static_cast<long>(job.points.rows()), dt_ms,
                 e.what());
+            logGmmFitTiming(job.stamp.toSec(), fid, "unknown",
+                            static_cast<int>(job.points.rows()), 0,
+                            qsize_after_pop, dt_ms, false,
+                            std::string("exception:") + e.what());
         }
         if (!finish_ok) {
             std::lock_guard<std::mutex> lk(lock);
@@ -452,50 +626,53 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
     if (prev_idx >= 0 && !prev_path.empty()) {
         if (!skip_sequential_d2d) {
             const int odom_gap = frame_idx - prev_idx;
-            if (odom_gap > 25) {
-                ROS_WARN_THROTTLE(
-                    5.0,
-                    "[registration] sequential D2D long hop X(%d)->X(%d) "
-                    "(odom_gap=%d): async backlog or sparse `request_every_n_frames`; "
-                    "attaching smoother relative pose as D2D init",
-                    prev_idx, frame_idx, odom_gap);
+            if (max_sequential_odom_gap_ > 0 &&
+                odom_gap > max_sequential_odom_gap_) {
+                ROS_WARN("[registration] skip sequential D2D long hop "
+                         "X(%d)->X(%d) (odom_gap=%d > max_sequential_odom_gap=%d): "
+                         "not a frame-to-frame constraint",
+                         prev_idx, frame_idx, odom_gap,
+                         max_sequential_odom_gap_);
+                skip_sequential_d2d = true;
             }
 
-            nlohmann::json payload;
-            payload["prev_idx"]         = prev_idx;
-            payload["curr_idx"]         = frame_idx;
-            payload["stamp"]            = stamp.toSec();
-            payload["source_path"]      = gmm_path;
-            payload["target_path"]      = prev_path;
-            payload["is_loop_closure"]  = false;
+            if (!skip_sequential_d2d) {
+                nlohmann::json payload;
+                payload["prev_idx"]         = prev_idx;
+                payload["curr_idx"]         = frame_idx;
+                payload["stamp"]            = stamp.toSec();
+                payload["source_path"]      = gmm_path;
+                payload["target_path"]      = prev_path;
+                payload["is_loop_closure"]  = false;
 
-            // GMMs are in per-frame sensor coordinates; D2D matches source(curr)
-            // into target(prev). inv(T_prev)*T_curr is the same convention as the
-            // BetweenFactor relative staged from the D2D result (see stageRegistrationFactor).
-            {
-                std::lock_guard<std::mutex> lk(smoother_.graph_lock);
-                auto itp = smoother_.pose_by_idx.find(prev_idx);
-                auto itc = smoother_.pose_by_idx.find(frame_idx);
-                if (itp != smoother_.pose_by_idx.end() &&
-                    itc != smoother_.pose_by_idx.end()) {
-                    const Matrix4d T_init = itp->second.inverse() * itc->second;
-                    Eigen::Matrix<double, 4, 4, Eigen::RowMajor> T_row(T_init);
-                    std::vector<double> flat(16);
-                    for (int k = 0; k < 16; ++k) {
-                        flat[static_cast<std::size_t>(k)] = T_row.data()[k];
+                // GMMs are in per-frame sensor coordinates; D2D matches source(curr)
+                // into target(prev). inv(T_prev)*T_curr is the same convention as the
+                // BetweenFactor relative staged from the D2D result (see stageRegistrationFactor).
+                {
+                    std::lock_guard<std::mutex> lk(smoother_.graph_lock);
+                    auto itp = smoother_.pose_by_idx.find(prev_idx);
+                    auto itc = smoother_.pose_by_idx.find(frame_idx);
+                    if (itp != smoother_.pose_by_idx.end() &&
+                        itc != smoother_.pose_by_idx.end()) {
+                        const Matrix4d T_init = itp->second.inverse() * itc->second;
+                        Eigen::Matrix<double, 4, 4, Eigen::RowMajor> T_row(T_init);
+                        std::vector<double> flat(16);
+                        for (int k = 0; k < 16; ++k) {
+                            flat[static_cast<std::size_t>(k)] = T_row.data()[k];
+                        }
+                        payload["initial_transform"] = std::move(flat);
                     }
-                    payload["initial_transform"] = std::move(flat);
                 }
-            }
 
-            std_msgs::String msg;
-            msg.data = payload.dump();
-            reg_pub_.publish(msg);
-            ROS_INFO("[registration][D2D] dispatched sequential request X(%d)->X(%d) "
-                     "source=%s target=%s init=%s",
-                     prev_idx, frame_idx,
-                     gmm_path.c_str(), prev_path.c_str(),
-                     payload.contains("initial_transform") ? "yes" : "no");
+                std_msgs::String msg;
+                msg.data = payload.dump();
+                reg_pub_.publish(msg);
+                ROS_INFO("[registration][D2D] dispatched sequential request X(%d)->X(%d) "
+                         "source=%s target=%s init=%s",
+                         prev_idx, frame_idx,
+                         gmm_path.c_str(), prev_path.c_str(),
+                         payload.contains("initial_transform") ? "yes" : "no");
+            }
         }
 
         enqueueLoopClosureRequests(frame_idx, stamp, gmm_path, prev_idx);
@@ -616,6 +793,9 @@ void RegistrationManager::enqueueLoopClosureRequests(
         double distance;
         double cos_sim;
         std::string path;
+        bool   has_yaw = false;
+        double yaw_rad = 0.0;
+        double yaw_overlap = 0.0;
     };
     std::vector<Ranked> selected;
 
@@ -636,18 +816,27 @@ void RegistrationManager::enqueueLoopClosureRequests(
         SolidDescriptor c_desc;
         if (!place_index_.get(cand.idx, c_desc)) continue;
         const double cs = place_index_.rangeCosine(q_desc, c_desc);
+        Ranked ranked{cand.idx, cand.distance, cs, cand.path};
+        if (solid_cfg_.provide_yaw_prior) {
+            const auto yaw = place_index_.yawEstimate(q_desc, c_desc);
+            if (yaw.valid) {
+                ranked.has_yaw = true;
+                ranked.yaw_rad = yaw.yaw_rad;
+                ranked.yaw_overlap = yaw.overlap;
+            }
+        }
         ++scored;
         if (cs < solid_cfg_.cos_similarity_threshold) {
             ++dropped_by_gate;
             if (cs > best_rejected.cos_sim) {
-                best_rejected = Ranked{cand.idx, cand.distance, cs, cand.path};
+                best_rejected = ranked;
             }
             continue;
         }
         if (cs > best.cos_sim) {
-            best = Ranked{cand.idx, cand.distance, cs, cand.path};
+            best = ranked;
         }
-        accepted.push_back(Ranked{cand.idx, cand.distance, cs, cand.path});
+        accepted.push_back(ranked);
     }
 
     if (accepted.empty()) {
@@ -717,42 +906,26 @@ void RegistrationManager::enqueueLoopClosureRequests(
         if (cand.distance < 0.0) {
             payload["solid_rescue"] = true;
         }
-
-        bool has_initial_transform = false;
-        auto prev_pose_it = pose_snapshot.find(cand.idx);
-        auto curr_pose_it = pose_snapshot.find(curr_idx);
-        if (prev_pose_it != pose_snapshot.end() &&
-            curr_pose_it != pose_snapshot.end()) {
-            const Matrix4d T_init =
-                prev_pose_it->second.inverse() * curr_pose_it->second;
-            Eigen::Matrix<double, 4, 4, Eigen::RowMajor> T_row(T_init);
-            std::vector<double> flat(16);
-            for (int k = 0; k < 16; ++k) {
-                flat[static_cast<std::size_t>(k)] = T_row.data()[k];
-            }
-            payload["initial_transform"] = std::move(flat);
-            has_initial_transform = true;
+        if (cand.has_yaw) {
+            payload["solid_yaw_prior_rad"] = cand.yaw_rad;
+            payload["solid_yaw_overlap"] = cand.yaw_overlap;
         }
 
-        // SOLiD-derived yaw prior fallback when pose history is unavailable.
-        if (!has_initial_transform && have_q_desc && solid_cfg_.provide_yaw_prior) {
-            SolidDescriptor c_desc;
-            if (place_index_.get(cand.idx, c_desc)) {
-                const auto est =
-                    place_index_.yawEstimate(q_desc, c_desc);
-                if (est.valid) {
-                    const double c = std::cos(est.yaw_rad);
-                    const double s = std::sin(est.yaw_rad);
-                    std::vector<double> T_init = {
-                        c, -s, 0.0, 0.0,
-                        s,  c, 0.0, 0.0,
-                        0.0, 0.0, 1.0, 0.0,
-                        0.0, 0.0, 0.0, 1.0,
-                    };
-                    payload["initial_transform"] = T_init;
-                    payload["solid_yaw_deg"] = est.yaw_rad * 180.0 / M_PI;
-                    payload["solid_yaw_overlap"] = est.overlap;
+        // Seed loop D2D from the latest smoother relative pose. Starting from
+        // identity makes false positives too easy to accept as zero-motion loops.
+        {
+            std::lock_guard<std::mutex> lk(smoother_.graph_lock);
+            auto itp = smoother_.pose_by_idx.find(cand.idx);
+            auto itc = smoother_.pose_by_idx.find(curr_idx);
+            if (itp != smoother_.pose_by_idx.end() &&
+                itc != smoother_.pose_by_idx.end()) {
+                const Matrix4d T_init = itp->second.inverse() * itc->second;
+                Eigen::Matrix<double, 4, 4, Eigen::RowMajor> T_row(T_init);
+                std::vector<double> flat(16);
+                for (int k = 0; k < 16; ++k) {
+                    flat[static_cast<std::size_t>(k)] = T_row.data()[k];
                 }
+                payload["initial_transform"] = std::move(flat);
             }
         }
 
@@ -761,8 +934,10 @@ void RegistrationManager::enqueueLoopClosureRequests(
         reg_pub_.publish(msg);
 
         ROS_INFO("[registration] dispatched loop D2D X(%d)->X(%d): "
-                 "dist=%.2fm solid_cos=%.3f",
-                 cand.idx, curr_idx, cand.distance, cand.cos_sim);
+                 "dist=%.2fm solid_cos=%.3f init=%s solid_yaw=%s",
+                 cand.idx, curr_idx, cand.distance, cand.cos_sim,
+                 payload.contains("initial_transform") ? "latest_pose" : "none",
+                 cand.has_yaw ? "yes" : "no");
 
         {
             std::lock_guard<std::mutex> lk(lock);
@@ -815,20 +990,50 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
     }
 
     const double score = jsonNumber<double>(data, "score", -1e30);
+    const std::string kind = is_loop ? "loop" : "sequential";
+    const long elapsed_ms = jsonNumber<long>(data, "elapsed_ms", -1);
+    const double init_t_m = jsonNumber<double>(data, "init_t_m",
+        std::numeric_limits<double>::quiet_NaN());
+    const double init_r_deg = jsonNumber<double>(data, "init_r_deg",
+        std::numeric_limits<double>::quiet_NaN());
+    const double delta_t_m = jsonNumber<double>(data, "delta_t_m",
+        std::numeric_limits<double>::quiet_NaN());
+    const double delta_r_deg = jsonNumber<double>(data, "delta_r_deg",
+        std::numeric_limits<double>::quiet_NaN());
+    const int n_source = jsonNumber<int>(data, "n_source", -1);
+    const int n_target = jsonNumber<int>(data, "n_target", -1);
+    const double coarse_score = jsonNumber<double>(data, "coarse_score",
+        std::numeric_limits<double>::quiet_NaN());
+    auto log_result_event = [&](const std::string& event,
+                                const std::string& reason,
+                                double trans_err_m = std::numeric_limits<double>::quiet_NaN(),
+                                double rot_err_deg = std::numeric_limits<double>::quiet_NaN(),
+                                double sigma_t = std::numeric_limits<double>::quiet_NaN(),
+                                double sigma_r = std::numeric_limits<double>::quiet_NaN()) {
+        logRegistrationEvent(result_stamp_sec, event, kind, prev_idx, curr_idx,
+                             score, elapsed_ms, reason, init_t_m, init_r_deg,
+                             delta_t_m, delta_r_deg, trans_err_m, rot_err_deg,
+                             sigma_t, sigma_r, n_source, n_target, coarse_score);
+    };
     if (!jsonBool(data, "success", false)) {
         const std::string reason =
             data.value("failure_reason", std::string("unknown_worker_failure"));
         const std::string detail =
             data.value("failure_detail", std::string());
-        const long elapsed_ms = jsonNumber<long>(data, "elapsed_ms", -1);
         ROS_INFO("[registration] %s D2D failed X(%d)->X(%d): "
                  "reason=%s score=%.4f elapsed_ms=%ld%s%s",
-                 is_loop ? "loop" : "sequential",
+                 kind.c_str(),
                  prev_idx, curr_idx, reason.c_str(), score, elapsed_ms,
                  detail.empty() ? "" : " detail=",
                  detail.empty() ? "" : detail.c_str());
+        logD2DTiming(result_stamp_sec, kind, prev_idx, curr_idx, false,
+                     score, elapsed_ms,
+                     detail.empty() ? reason : reason + ":" + detail);
+        log_result_event("worker_failed", detail.empty() ? reason : reason + ":" + detail);
         return;
     }
+    logD2DTiming(result_stamp_sec, kind, prev_idx, curr_idx, true,
+                 score, elapsed_ms, "worker_success");
 
     if (is_loop) {
         if ((curr_idx - prev_idx) < loop_closure_min_keyframe_gap_) {
@@ -836,6 +1041,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
                      "gap %d < min_keyframe_gap %d",
                      prev_idx, curr_idx, curr_idx - prev_idx,
                      loop_closure_min_keyframe_gap_);
+            log_result_event("rejected", "loop_min_keyframe_gap");
             return;
         }
         if (score < loop_closure_detect_score_threshold_) {
@@ -843,6 +1049,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
                      "score=%.4f < detect_score_threshold %.4f",
                      prev_idx, curr_idx, score,
                      loop_closure_detect_score_threshold_);
+            log_result_event("rejected", "loop_detect_score_threshold");
             return;
         }
     } else {
@@ -850,6 +1057,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
             ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
                      "score=%.4f < registration_score_threshold %.4f",
                      prev_idx, curr_idx, score, registration_score_threshold_);
+            log_result_event("rejected", "registration_score_threshold");
             return;
         }
         if ((curr_idx % registration_factor_every_n_frames_) != 0) {
@@ -857,6 +1065,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
                      "curr_idx %% factor_every_n_frames = %d %% %d != 0",
                      prev_idx, curr_idx, curr_idx,
                      registration_factor_every_n_frames_);
+            log_result_event("rejected", "factor_every_n_frames");
             return;
         }
     }
@@ -864,7 +1073,8 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
     if (prev_idx >= curr_idx) {
         ROS_INFO("[registration] rejected %s D2D result X(%d)->X(%d): "
                  "prev_idx >= curr_idx",
-                 is_loop ? "loop" : "sequential", prev_idx, curr_idx);
+                 kind.c_str(), prev_idx, curr_idx);
+        log_result_event("rejected", "prev_idx_ge_curr_idx");
         return;
     }
 
@@ -874,7 +1084,8 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
     if (t_it == data.end() || !t_it->is_array() || t_it->size() != 16) {
         ROS_INFO("[registration] rejected %s D2D result X(%d)->X(%d): "
                  "missing/invalid transform array",
-                 is_loop ? "loop" : "sequential", prev_idx, curr_idx);
+                 kind.c_str(), prev_idx, curr_idx);
+        log_result_event("rejected", "missing_invalid_transform");
         return;
     }
     Matrix4d T;
@@ -891,10 +1102,11 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
         ROS_WARN_THROTTLE(2.0,
             "[registration] rejected D2D result X(%d)->X(%d): invalid SE(3) transform",
             prev_idx, curr_idx);
+        log_result_event("rejected", "invalid_se3_transform");
         return;
     }
 
-    const bool force_loop = is_loop || (score >= loop_closure_score_threshold_);
+    const bool force_loop = is_loop;
     const bool use_super = is_loop && (score >= loop_closure_detect_score_threshold_);
 
     if (is_loop) {
@@ -902,6 +1114,28 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
                  prev_idx, curr_idx, score, use_super ? "true" : "false");
         if (curr_idx > last_loop_accepted_idx_) {
             last_loop_accepted_idx_ = curr_idx;
+        }
+    } else {
+        Vector3d p_prev = Vector3d::Zero();
+        Vector3d p_curr = Vector3d::Zero();
+        bool have_positions = false;
+        {
+            std::lock_guard<std::mutex> gk(smoother_.graph_lock);
+            const auto prev_pose_it = smoother_.pose_by_idx.find(prev_idx);
+            const auto curr_pose_it = smoother_.pose_by_idx.find(curr_idx);
+            if (prev_pose_it != smoother_.pose_by_idx.end() &&
+                curr_pose_it != smoother_.pose_by_idx.end()) {
+                p_prev = prev_pose_it->second.block<3, 1>(0, 3);
+                p_curr = curr_pose_it->second.block<3, 1>(0, 3);
+                have_positions = true;
+            }
+        }
+        if (have_positions) {
+            std::ostringstream oss;
+            oss << "seq D2D X(" << prev_idx << ")->X(" << curr_idx << ")";
+            publishD2DRegistrationMarker("sequential", oss.str(), p_prev, p_curr,
+                                         score, ros::Time(result_stamp_sec),
+                                         0.95f, 0.95f, 0.15f);
         }
     }
 
@@ -914,6 +1148,8 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
     item.is_loop = is_loop;
     item.score = score;
     item.stamp_sec = result_stamp_sec;
+    item.delta_t_m = delta_t_m;
+    item.delta_r_deg = delta_r_deg;
     auto init_it = data.find("initial_transform");
     if (init_it != data.end() && init_it->is_array() && init_it->size() == 16) {
         Matrix4d T_init;
@@ -944,6 +1180,9 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
 
     if (!result_queue_.tryPush(std::move(item))) {
         ++dropped_result_msgs;
+        log_result_event("dropped", "result_queue_full");
+    } else {
+        log_result_event("accepted", "queued_for_factor_staging");
     }
 }
 
@@ -958,6 +1197,7 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
     const int sid_curr = jsonNumber<int>(data, "curr_idx", -1);
     const bool success = jsonBool(data, "success", false);
     const double score = jsonNumber<double>(data, "score", -1e30);
+    const long elapsed_ms = jsonNumber<long>(data, "elapsed_ms", -1);
     const std::string failure_reason =
         data.value("failure_reason", std::string("unknown_worker_failure"));
     const std::string failure_detail =
@@ -975,6 +1215,19 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
              success ? "" : failure_reason.c_str(),
              (!success && !failure_detail.empty()) ? " detail=" : "",
              (!success && !failure_detail.empty()) ? failure_detail.c_str() : "");
+    logRegistrationEvent(result_stamp_sec,
+                         success ? "accepted" : "worker_failed",
+                         "submap", sid_prev, sid_curr, score, elapsed_ms,
+                         success ? "submap_result"
+                                 : (failure_detail.empty()
+                                    ? failure_reason
+                                    : failure_reason + ":" + failure_detail));
+    logD2DTiming(result_stamp_sec, "submap", sid_prev, sid_curr, success,
+                 score, elapsed_ms,
+                 success ? "worker_success"
+                         : (failure_detail.empty()
+                            ? failure_reason
+                            : failure_reason + ":" + failure_detail));
 
     const ros::Time stamp_msg = ros::Time(result_stamp_sec);
     if (global_graph_ != nullptr) {
@@ -1070,7 +1323,9 @@ void RegistrationManager::drainResults(const ros::Time& stamp)
                                     r.has_solid_cos_sim, r.solid_cos_sim,
                                     r.solid_rescue,
                                     r.has_initial_transform,
-                                    r.initial_transform);
+                                    r.initial_transform,
+                                    r.delta_t_m,
+                                    r.delta_r_deg);
             staged_any = true;
         } catch (const std::exception& e) {
             ROS_WARN_THROTTLE(2.0, "[registration] drain error: %s", e.what());
@@ -1092,7 +1347,8 @@ void RegistrationManager::stageRegistrationFactor(
     double score, bool force_loop, bool use_super,
     bool is_loop_candidate, const ros::Time& stamp,
     bool has_solid_cos_sim, double solid_cos_sim, bool solid_rescue,
-    bool has_initial_transform, const Matrix4d& initial_transform)
+    bool has_initial_transform, const Matrix4d& initial_transform,
+    double delta_t_m, double delta_r_deg)
 {
     int latest_key_snapshot = 0;
     double t_curr_snapshot = 0.0;
@@ -1204,6 +1460,14 @@ void RegistrationManager::stageRegistrationFactor(
                      prev_idx, curr_idx, trans_err, rot_err_deg,
                      loop_closure_consistency_gate_trans_m_,
                      loop_closure_consistency_gate_rot_deg_);
+            logRegistrationEvent(stamp.toSec(), "rejected", "loop",
+                                 prev_idx, curr_idx, score, -1,
+                                 "loop_pose_consistency_gate",
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 trans_err, rot_err_deg);
             return;
         }
     }
@@ -1232,29 +1496,34 @@ void RegistrationManager::stageRegistrationFactor(
             ROS_INFO("[registration] staged loop between X(%d)->X(%d) "
                      "score=%.4f sigma_t=%.4f sigma_r=%.4f",
                      prev_idx, curr_idx, score, sigma_t, sigma_r);
+            logRegistrationEvent(stamp.toSec(), "staged", "loop",
+                                 prev_idx, curr_idx, score, -1,
+                                 "between_factor",
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 sigma_t, sigma_r);
         } else {
-            // prev_idx marginalized — fall back to absolute prior on curr
-            Matrix4d T_w_prev;
-            {
-                std::lock_guard<std::mutex> lk(smoother_.graph_lock);
-                auto it = smoother_.pose_by_idx.find(prev_idx);
-                if (it == smoother_.pose_by_idx.end()) {
-                    ROS_WARN("[registration] no stored pose for X(%d), "
-                             "cannot stage loop factor on X(%d)", prev_idx, curr_idx);
-                    return;
-                }
-                T_w_prev = it->second;
-            }
-            const Matrix4d T_w_curr_from_loop = T_w_prev * T_prev_to_curr;
-            smoother_.stageFactor(
-                gtsam::PriorFactor<gtsam::Pose3>(
-                    X(curr_idx),
-                    FixedLagBackend::pose3FromMatrix(T_w_curr_from_loop),
-                    noise).clone());
-
-            ROS_INFO("[registration] staged loop prior on X(%d) "
-                     "(prev X(%d) outside lag) score=%.4f sigma_t=%.4f sigma_r=%.4f",
-                     curr_idx, prev_idx, score, sigma_t, sigma_r);
+            // Never turn a loop closure into an absolute prior on the live
+            // fixed-lag state. Late loops belong in the global pose graph; an
+            // absolute prior here can violently snap the local smoother.
+            ROS_INFO("[registration] loop X(%d)->X(%d) not staged in fixed-lag "
+                     "smoother because prev is outside lag; forwarding to global graph only "
+                     "score=%.4f",
+                     prev_idx, curr_idx, score);
+            logRegistrationEvent(stamp.toSec(), "staged", "loop",
+                                 prev_idx, curr_idx, score, -1,
+                                 "forwarded_global_graph_only",
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 sigma_t, sigma_r);
         }
 
         if (is_loop_candidate) {
@@ -1318,7 +1587,7 @@ void RegistrationManager::stageRegistrationFactor(
         const Matrix4d T_err = T_prior_prev_to_curr.inverse() * T_prev_to_curr;
         const double trans_err = T_err.block<3, 1>(0, 3).norm();
         const double rot_err_deg = rotationAngleDeg(T_err.block<3, 3>(0, 0));
-        const double trans_limit_m = std::max(0.75, 4.0 * seq_sigma_t_max_);
+        const double trans_limit_m = std::max(0.30, 2.0 * seq_sigma_t_max_);
         const double rot_limit_deg =
             std::max(20.0, 4.0 * seq_sigma_r_max_ * 180.0 / M_PI);
         if (trans_err > trans_limit_m || rot_err_deg > rot_limit_deg) {
@@ -1327,6 +1596,14 @@ void RegistrationManager::stageRegistrationFactor(
                      "(limits %.3fm %.2fdeg, score=%.4f)",
                      prev_idx, curr_idx, trans_err, rot_err_deg,
                      trans_limit_m, rot_limit_deg, score);
+            logRegistrationEvent(stamp.toSec(), "rejected", "sequential",
+                                 prev_idx, curr_idx, score, -1,
+                                 "sequential_prior_consistency_gate",
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 std::numeric_limits<double>::quiet_NaN(),
+                                 trans_err, rot_err_deg);
             return;
         }
 
@@ -1341,33 +1618,19 @@ void RegistrationManager::stageRegistrationFactor(
             gtsam::BetweenFactor<gtsam::Pose3>(
                 X(prev_idx), X(curr_idx), rel_pose, noise).clone());
 
-        {
-            Vector3d p_prev = Vector3d::Zero();
-            Vector3d p_curr = Vector3d::Zero();
-            bool have_positions = false;
-            {
-                std::lock_guard<std::mutex> gk(smoother_.graph_lock);
-                const auto prev_pose_it = smoother_.pose_by_idx.find(prev_idx);
-                const auto curr_pose_it = smoother_.pose_by_idx.find(curr_idx);
-                if (prev_pose_it != smoother_.pose_by_idx.end() &&
-                    curr_pose_it != smoother_.pose_by_idx.end()) {
-                    p_prev = prev_pose_it->second.block<3, 1>(0, 3);
-                    p_curr = curr_pose_it->second.block<3, 1>(0, 3);
-                    have_positions = true;
-                }
-            }
-            if (have_positions) {
-                std::ostringstream oss;
-                oss << "seq D2D X(" << prev_idx << ")->X(" << curr_idx << ")";
-                publishD2DRegistrationMarker("sequential", oss.str(), p_prev, p_curr,
-                                             score, stamp,
-                                             0.95f, 0.95f, 0.15f);
-            }
-        }
-
         ROS_INFO("[registration] staged between factor X(%d)->X(%d) "
                  "score=%.4f sigma_t=%.4f sigma_r=%.4f",
                  prev_idx, curr_idx, score, sigma_t, sigma_r);
+        logRegistrationEvent(stamp.toSec(), "staged", "sequential",
+                             prev_idx, curr_idx, score, -1,
+                             "between_factor",
+                             std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN(),
+                             std::numeric_limits<double>::quiet_NaN(),
+                             sigma_t, sigma_r);
     }
 }
 
@@ -1433,9 +1696,15 @@ void RegistrationManager::publishD2DRegistrationMarker(
             txt.pose.position.z = 0.5 * (p_prev.z() + p_curr.z()) + 0.35;
             txt.scale.z = 0.28;
             txt.lifetime = ros::Duration(0.0);
-            txt.color.r = 1.0f;
-            txt.color.g = 1.0f;
-            txt.color.b = 1.0f;
+            if (kind == "submap") {
+                txt.color.r = 1.0f;
+                txt.color.g = 0.45f;
+                txt.color.b = 0.0f;
+            } else {
+                txt.color.r = 1.0f;
+                txt.color.g = 1.0f;
+                txt.color.b = 1.0f;
+            }
             txt.color.a = 1.0f;
 
             std::ostringstream oss;
@@ -1526,8 +1795,8 @@ void RegistrationManager::publishLoopClosureMarkers(
             txt.scale.z = 0.35;
             txt.lifetime = ros::Duration(0.0);
             txt.color.r = 1.0f;
-            txt.color.g = 1.0f;
-            txt.color.b = 1.0f;
+            txt.color.g = 0.0f;
+            txt.color.b = 0.0f;
             txt.color.a = 1.0f;
 
             std::ostringstream oss;

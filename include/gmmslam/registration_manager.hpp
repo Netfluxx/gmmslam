@@ -10,7 +10,9 @@
 #include <nlohmann/json.hpp>
 
 #include <atomic>
+#include <fstream>
 #include <functional>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -42,7 +44,8 @@ public:
                         const VisualizationConfig& vis_cfg,
                         const std::string& gmm_dir,
                         ros::Publisher loop_closure_markers_pub = {},
-                        std::string map_frame = {});
+                        std::string map_frame = {},
+                        std::string benchmark_log_dir = {});
 
     // Enqueue a GMM fit. Returns true if enqueued, false if dropped.
     bool enqueueFit(int frame_idx, const ros::Time& stamp,
@@ -116,6 +119,8 @@ private:
         bool solid_rescue = false;
         bool has_initial_transform = false;
         Matrix4d initial_transform = Matrix4d::Identity();
+        double delta_t_m = std::numeric_limits<double>::quiet_NaN();
+        double delta_r_deg = std::numeric_limits<double>::quiet_NaN();
     };
 
     struct NoiseResult {
@@ -145,9 +150,48 @@ private:
                                   double solid_cos_sim = 0.0,
                                   bool solid_rescue = false,
                                   bool has_initial_transform = false,
-                                  const Matrix4d& initial_transform = Matrix4d::Identity());
+                                  const Matrix4d& initial_transform = Matrix4d::Identity(),
+                                  double delta_t_m = std::numeric_limits<double>::quiet_NaN(),
+                                  double delta_r_deg = std::numeric_limits<double>::quiet_NaN());
 
     void handleSubmapResult(const nlohmann::json& data, double result_stamp_sec);
+    void initBenchmarkLogs(const std::string& log_dir);
+    void logGmmFitTiming(double stamp_sec,
+                         int frame_idx,
+                         const std::string& backend,
+                         int point_count,
+                         int component_count,
+                         std::size_t queue_depth_after_pop,
+                         double elapsed_ms,
+                         bool success,
+                         const std::string& note);
+    void logD2DTiming(double stamp_sec,
+                      const std::string& kind,
+                      int prev_idx,
+                      int curr_idx,
+                      bool success,
+                      double score,
+                      long elapsed_ms,
+                      const std::string& reason);
+    void logRegistrationEvent(double stamp_sec,
+                              const std::string& event,
+                              const std::string& kind,
+                              int prev_idx,
+                              int curr_idx,
+                              double score,
+                              long elapsed_ms,
+                              const std::string& reason,
+                              double init_t_m = std::numeric_limits<double>::quiet_NaN(),
+                              double init_r_deg = std::numeric_limits<double>::quiet_NaN(),
+                              double delta_t_m = std::numeric_limits<double>::quiet_NaN(),
+                              double delta_r_deg = std::numeric_limits<double>::quiet_NaN(),
+                              double trans_err_m = std::numeric_limits<double>::quiet_NaN(),
+                              double rot_err_deg = std::numeric_limits<double>::quiet_NaN(),
+                              double sigma_t = std::numeric_limits<double>::quiet_NaN(),
+                              double sigma_r = std::numeric_limits<double>::quiet_NaN(),
+                              int n_source = -1,
+                              int n_target = -1,
+                              double coarse_score = std::numeric_limits<double>::quiet_NaN());
 
     void publishD2DRegistrationMarker(const std::string& kind,
                                       const std::string& label,
@@ -167,6 +211,11 @@ private:
     ros::Publisher reg_pub_;
     ros::Publisher loop_closure_markers_pub_;
     std::string map_frame_;
+    std::mutex benchmark_log_mutex_;
+    std::ofstream benchmark_gmm_fits_csv_;
+    std::ofstream benchmark_d2d_timings_csv_;
+    std::ofstream benchmark_registration_csv_;
+    bool benchmark_logs_enabled_ = false;
     std::mutex loop_viz_mutex_;
     visualization_msgs::MarkerArray loop_closure_marker_history_;
 
@@ -190,6 +239,7 @@ private:
     int loop_closure_gmm_keep_keyframes_;
     double loop_closure_consistency_gate_trans_m_;
     double loop_closure_consistency_gate_rot_deg_;
+    int max_sequential_odom_gap_;
     bool d2d_frame_to_frame_text_enable_;
     bool d2d_submap_overlap_text_enable_;
     bool d2d_loop_closure_text_enable_;

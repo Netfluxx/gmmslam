@@ -11,8 +11,10 @@
 #include <std_msgs/String.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <iomanip>
 
 using gtsam::symbol_shorthand::X;
 
@@ -182,12 +184,14 @@ GlobalPoseGraph::GlobalPoseGraph(
         GetPoseFn get_pose_fn,
         GetGmmFn get_gmm_fn,
         GetPoseUncertaintyFn get_pose_uncertainty_fn,
-        GetSubmapTrajDeltaFn get_traj_delta_fn)
+        GetSubmapTrajDeltaFn get_traj_delta_fn,
+        std::string benchmark_log_dir)
     : enable(gg_cfg.enable)
     , odom_frame_(odom_frame)
     , gmm_dir_(gmm_dir)
     , map_cfg_(map_cfg)
     , submap_keyframes_per_submap_(gg_cfg.submap_keyframes_per_submap)
+    , enable_overlap_d2d_(gg_cfg.enable_overlap_d2d)
     , overlap_radius_m_(gg_cfg.overlap_radius_m)
     , max_overlap_registrations_(std::max(0, gg_cfg.max_overlap_registrations))
     , submap_reg_score_threshold_(gg_cfg.reg_score_threshold)
@@ -225,6 +229,7 @@ GlobalPoseGraph::GlobalPoseGraph(
     , reg_request_pub_(std::move(reg_request_pub))
 {
     std::filesystem::create_directories(gmm_dir_);
+    initBenchmarkLogs(benchmark_log_dir);
 
     // GTSAM noise ordering: 3 rotation + 3 translation
     auto makeSigmas = [](double sigma_r, double sigma_t) {
@@ -245,6 +250,151 @@ GlobalPoseGraph::GlobalPoseGraph(
     isam_ = std::make_unique<gtsam::ISAM2>(gtsam::ISAM2Params());
 
     path_.header.frame_id = odom_frame_;
+}
+
+void GlobalPoseGraph::initBenchmarkLogs(const std::string& log_dir)
+{
+    if (log_dir.empty()) {
+        return;
+    }
+
+    try {
+        std::filesystem::create_directories(log_dir);
+        benchmark_global_graph_csv_.open(log_dir + "/global_graph_optimization.csv",
+                                         std::ios::out);
+        benchmark_global_map_stats_csv_.open(log_dir + "/global_map_stats.csv",
+                                             std::ios::out);
+        benchmark_global_pruning_csv_.open(log_dir + "/global_pruning_stats.csv",
+                                           std::ios::out);
+        if (!benchmark_global_graph_csv_ || !benchmark_global_map_stats_csv_ ||
+            !benchmark_global_pruning_csv_) {
+            ROS_WARN("[benchmark] failed to open one or more global graph CSVs in %s",
+                     log_dir.c_str());
+            return;
+        }
+
+        benchmark_global_graph_csv_ << std::fixed << std::setprecision(9);
+        benchmark_global_graph_csv_
+            << "stamp,factors,values,update_ms,estimate_ms,total_ms,success,note\n";
+        benchmark_global_map_stats_csv_ << std::fixed << std::setprecision(9);
+        benchmark_global_map_stats_csv_
+            << "stamp,event,optimized_submaps,finalized_submaps,total_gaussians,"
+            << "pending_overlap_registrations,pending_submap_finalizations\n";
+        benchmark_global_pruning_csv_ << std::fixed << std::setprecision(9);
+        benchmark_global_pruning_csv_
+            << "stamp,event,sid_a,sid_b,before_a,before_b,before_total,"
+            << "after_a,after_b,after_total,removed_total,dropped_keys,"
+            << "elapsed_ms,success,note,bhatt_threshold,search_radius_m,"
+            << "max_passes,use_rtree\n";
+        benchmark_logs_enabled_ = true;
+    } catch (const std::exception& e) {
+        ROS_WARN("[benchmark] failed to initialize global graph timing log in %s: %s",
+                 log_dir.c_str(), e.what());
+    }
+}
+
+void GlobalPoseGraph::logOptimizationTiming(
+    double stamp_sec,
+    std::size_t factors,
+    std::size_t values,
+    double update_ms,
+    double estimate_ms,
+    double total_ms,
+    bool success,
+    const std::string& note)
+{
+    if (!benchmark_logs_enabled_) {
+        return;
+    }
+
+    std::string safe_note = note;
+    std::replace(safe_note.begin(), safe_note.end(), ',', ';');
+    std::replace(safe_note.begin(), safe_note.end(), '\n', ' ');
+    benchmark_global_graph_csv_
+        << stamp_sec << ','
+        << factors << ','
+        << values << ','
+        << update_ms << ','
+        << estimate_ms << ','
+        << total_ms << ','
+        << (success ? 1 : 0) << ','
+        << safe_note << '\n';
+}
+
+void GlobalPoseGraph::logMapStats(double stamp_sec, const std::string& event)
+{
+    if (!benchmark_logs_enabled_) {
+        return;
+    }
+
+    std::string safe_event = event;
+    std::replace(safe_event.begin(), safe_event.end(), ',', ';');
+    std::replace(safe_event.begin(), safe_event.end(), '\n', ' ');
+
+    std::size_t total_gaussians = 0;
+    for (const auto& [sid, gmm] : submap_gmm) {
+        (void)sid;
+        total_gaussians += gmm.components.size();
+    }
+
+    benchmark_global_map_stats_csv_
+        << stamp_sec << ','
+        << safe_event << ','
+        << submap_ids.size() << ','
+        << submap_gmm.size() << ','
+        << total_gaussians << ','
+        << pending_submap_registrations_.size() << ','
+        << pending_submap_finalize_.size() << '\n';
+}
+
+void GlobalPoseGraph::logPruningStats(
+    double stamp_sec,
+    const std::string& event,
+    int sid_a,
+    int sid_b,
+    int before_a,
+    int before_b,
+    int after_a,
+    int after_b,
+    int dropped_keys,
+    double elapsed_ms,
+    bool success,
+    const std::string& note)
+{
+    if (!benchmark_logs_enabled_) {
+        return;
+    }
+
+    std::string safe_event = event;
+    std::string safe_note = note;
+    std::replace(safe_event.begin(), safe_event.end(), ',', ';');
+    std::replace(safe_event.begin(), safe_event.end(), '\n', ' ');
+    std::replace(safe_note.begin(), safe_note.end(), ',', ';');
+    std::replace(safe_note.begin(), safe_note.end(), '\n', ' ');
+
+    const int before_total = before_a + std::max(0, before_b);
+    const int after_total = after_a + std::max(0, after_b);
+    const int removed_total = before_total - after_total;
+    benchmark_global_pruning_csv_
+        << stamp_sec << ','
+        << safe_event << ','
+        << sid_a << ','
+        << sid_b << ','
+        << before_a << ','
+        << before_b << ','
+        << before_total << ','
+        << after_a << ','
+        << after_b << ','
+        << after_total << ','
+        << removed_total << ','
+        << dropped_keys << ','
+        << elapsed_ms << ','
+        << (success ? 1 : 0) << ','
+        << safe_note << ','
+        << map_cfg_.prune_bhatt_threshold << ','
+        << map_cfg_.prune_search_radius_m << ','
+        << map_cfg_.prune_max_passes << ','
+        << (map_cfg_.prune_use_rtree ? 1 : 0) << '\n';
 }
 
 bool GlobalPoseGraph::consumeSmootherReanchorRequest() {
@@ -570,6 +720,10 @@ bool GlobalPoseGraph::tryFinalizeSubmap(int sid, const ros::Time& stamp,
              sid, raw_n,
              map_cfg_.prune_bhatt_threshold,
              gmms_with_poses.size(), key_indices.size());
+    {
+        std::lock_guard<std::recursive_mutex> lk(lock);
+        logMapStats(stamp.toSec(), "submap_finalized");
+    }
 
     {
         std::lock_guard<std::recursive_mutex> lk(lock);
@@ -586,6 +740,16 @@ bool GlobalPoseGraph::tryFinalizeSubmap(int sid, const ros::Time& stamp,
 void GlobalPoseGraph::requestOverlapRegistrations(int sid_new,
                                                    const ros::Time& stamp) {
     if (!reg_request_pub_) return;
+
+    if (!enable_overlap_d2d_) {
+        submap_overlap_d2d_remaining_[sid_new] = 0;
+        if (map_cfg_.prune_enable) {
+            submap_needs_internal_prune_after_overlap_wave_.insert(sid_new);
+        }
+        ROS_INFO("[global_graph] S(%d): submap overlap D2D disabled; "
+                 "skipping overlap registrations", sid_new);
+        return;
+    }
 
     const auto it_new = submap_pose_by_idx.find(sid_new);
     const auto it_path_new = submap_gmm_path.find(sid_new);
@@ -711,7 +875,7 @@ void GlobalPoseGraph::acknowledgeSubmapOverlapAttempt(int sid_prev, int sid_curr
 }
 
 void GlobalPoseGraph::maybeApplyDeferredInternalSubmapPrune(int sid_new,
-                                                            const ros::Time& /*stamp*/) {
+                                                            const ros::Time& stamp) {
     if (!enable) return;
 
     GmmModel input;
@@ -744,12 +908,20 @@ void GlobalPoseGraph::maybeApplyDeferredInternalSubmapPrune(int sid_new,
         }
     }
 
+    const auto prune_t0 = std::chrono::steady_clock::now();
     GmmModel pruned = pruneNewerFrameComponents(input, map_cfg_);
+    const auto prune_t1 = std::chrono::steady_clock::now();
+    const double prune_ms =
+        std::chrono::duration<double, std::milli>(prune_t1 - prune_t0).count();
     if (pruned.components.empty()) {
         ROS_WARN("[global_graph] deferred internal prune S(%d) would remove "
                  "all components; keeping unpruned map", sid_new);
+        logPruningStats(stamp.toSec(), "internal_submap_prune", sid_new, -1,
+                        before_n, 0, before_n, 0, 0, prune_ms, false,
+                        "would_remove_all_components");
         return;
     }
+    const int after_n = pruned.numComponents();
 
     GmmModel to_save;
     {
@@ -764,6 +936,9 @@ void GlobalPoseGraph::maybeApplyDeferredInternalSubmapPrune(int sid_new,
                 "[global_graph] deferred internal prune S(%d): submap changed "
                 "during prune (%d -> %d comp); skipping apply",
                 sid_new, before_n, it->second.numComponents());
+            logPruningStats(stamp.toSec(), "internal_submap_prune", sid_new, -1,
+                            before_n, 0, it->second.numComponents(), 0,
+                            0, prune_ms, false, "submap_changed_during_prune");
             return;
         }
         it->second = std::move(pruned);
@@ -773,6 +948,10 @@ void GlobalPoseGraph::maybeApplyDeferredInternalSubmapPrune(int sid_new,
         ROS_INFO("[global_graph] deferred internal prune S(%d): %d -> %d components "
                  "(after overlap D2D wave)",
                  sid_new, before_n, it->second.numComponents());
+        logPruningStats(stamp.toSec(), "internal_submap_prune", sid_new, -1,
+                        before_n, 0, after_n, 0, 0, prune_ms, true,
+                        "applied");
+        logMapStats(stamp.toSec(), "internal_submap_prune");
     }
 
     if (!path.empty()) {
@@ -857,11 +1036,18 @@ void GlobalPoseGraph::pruneSubmapPairGmmsAfterLoop(
         std::make_move_iterator(world_b.components.end()));
     normalizeGmmWeights(combined);
 
+    const auto prune_t0 = std::chrono::steady_clock::now();
     const GmmModel pruned = pruneNewerFrameComponents(combined, map_cfg_);
+    const auto prune_t1 = std::chrono::steady_clock::now();
+    const double prune_ms =
+        std::chrono::duration<double, std::milli>(prune_t1 - prune_t0).count();
     if (pruned.components.empty()) {
         ROS_WARN("[global_graph] cross-submap prune S(%d)<->S(%d): "
                  "prune removed all components; keeping originals",
                  s_lo, s_hi);
+        logPruningStats(stamp.toSec(), "cross_submap_prune", sid_a, sid_b,
+                        snap_na, snap_nb, snap_na, snap_nb, 0,
+                        prune_ms, false, "would_remove_all_components");
         return;
     }
 
@@ -897,6 +1083,9 @@ void GlobalPoseGraph::pruneSubmapPairGmmsAfterLoop(
                  static_cast<int>(new_a.components.size()),
                  static_cast<int>(new_b.components.size()),
                  dropped_keys);
+        logPruningStats(stamp.toSec(), "cross_submap_prune", sid_a, sid_b,
+                        snap_na, snap_nb, snap_na, snap_nb, dropped_keys,
+                        prune_ms, false, "split_would_empty_submap");
         return;
     }
 
@@ -918,6 +1107,12 @@ void GlobalPoseGraph::pruneSubmapPairGmmsAfterLoop(
                 "[global_graph] cross-submap prune S(%d)<->S(%d): "
                 "submap GMM changed during prune; skipping apply",
                 s_lo, s_hi);
+            logPruningStats(stamp.toSec(), "cross_submap_prune", sid_a, sid_b,
+                            snap_na, snap_nb,
+                            submap_gmm.at(sid_a).numComponents(),
+                            submap_gmm.at(sid_b).numComponents(),
+                            dropped_keys, prune_ms, false,
+                            "submap_changed_during_prune");
             return;
         }
         submap_gmm[sid_a] = std::move(new_a);
@@ -926,6 +1121,10 @@ void GlobalPoseGraph::pruneSubmapPairGmmsAfterLoop(
         submap_gmm_components[sid_b] = precomputeGmmLocalData(submap_gmm[sid_b]);
         to_save_a = submap_gmm[sid_a];
         to_save_b = submap_gmm[sid_b];
+        logPruningStats(stamp.toSec(), "cross_submap_prune", sid_a, sid_b,
+                        na_before, nb_before, na_after, nb_after,
+                        dropped_keys, prune_ms, true, "applied");
+        logMapStats(stamp.toSec(), "cross_submap_prune");
     }
 
     ROS_INFO("[global_graph] cross-submap prune after loop S(%d)<->S(%d): "
@@ -1176,8 +1375,8 @@ void GlobalPoseGraph::addLoopFactor(
         const double use_score = (score < 0.0) ? submap_reg_score_threshold_ : score;
         const auto [noise, sigma_t, sigma_r] = noiseFromScore(
             use_score,
-            submap_loop_sigma_t_min_, submap_loop_sigma_t_max_,
-            submap_loop_sigma_r_min_, submap_loop_sigma_r_max_);
+            loop_sigma_t_min_, loop_sigma_t_max_,
+            loop_sigma_r_min_, loop_sigma_r_max_);
 
         new_factors_.emplace_shared<gtsam::BetweenFactor<gtsam::Pose3>>(
             X(sid_prev), X(sid_curr), toPose3(T_rel_sub), noise);
@@ -1203,23 +1402,60 @@ void GlobalPoseGraph::commit(const ros::Time& stamp) {
     if (!enable) return;
 
     std::lock_guard<std::recursive_mutex> lk(lock);
+    const std::size_t n_factors = new_factors_.size();
+    const std::size_t n_values = new_values_.size();
+    if (n_factors == 0 && n_values == 0) {
+        return;
+    }
+    const auto total_t0 = std::chrono::steady_clock::now();
+    double update_ms = 0.0;
+    double estimate_ms = 0.0;
     try {
+        const auto update_t0 = std::chrono::steady_clock::now();
         isam_->update(new_factors_, new_values_);
+        const auto update_t1 = std::chrono::steady_clock::now();
+        update_ms = std::chrono::duration<double, std::milli>(
+            update_t1 - update_t0).count();
         new_factors_.resize(0);
         new_values_.clear();
     } catch (const std::exception& e) {
+        const auto fail_t = std::chrono::steady_clock::now();
+        const double total_ms = std::chrono::duration<double, std::milli>(
+            fail_t - total_t0).count();
+        logOptimizationTiming(stamp.toSec(), n_factors, n_values,
+                              update_ms, estimate_ms, total_ms, false,
+                              std::string("update_failed:") + e.what());
         ROS_WARN_THROTTLE(2.0, "[global_graph] update failed: %s", e.what());
         return;
     }
 
     gtsam::Values est;
     try {
+        const auto estimate_t0 = std::chrono::steady_clock::now();
         est = isam_->calculateEstimate();
+        const auto estimate_t1 = std::chrono::steady_clock::now();
+        estimate_ms = std::chrono::duration<double, std::milli>(
+            estimate_t1 - estimate_t0).count();
     } catch (const std::exception& e) {
+        const auto fail_t = std::chrono::steady_clock::now();
+        const double total_ms = std::chrono::duration<double, std::milli>(
+            fail_t - total_t0).count();
+        logOptimizationTiming(stamp.toSec(), n_factors, n_values,
+                              update_ms, estimate_ms, total_ms, false,
+                              std::string("estimate_failed:") + e.what());
         ROS_WARN_THROTTLE(2.0, "[global_graph] calculateEstimate failed: %s",
                           e.what());
         return;
     }
+    const auto total_t1 = std::chrono::steady_clock::now();
+    const double total_ms = std::chrono::duration<double, std::milli>(
+        total_t1 - total_t0).count();
+    ROS_INFO("[timing][global_graph] factors=%zu values=%zu "
+             "update_ms=%.3f estimate_ms=%.3f total_ms=%.3f",
+             n_factors, n_values, update_ms, estimate_ms, total_ms);
+    logOptimizationTiming(stamp.toSec(), n_factors, n_values,
+                          update_ms, estimate_ms, total_ms, true,
+                          "isam2_update");
 
     nav_msgs::Path path;
     path.header.stamp = stamp;
@@ -1245,6 +1481,7 @@ void GlobalPoseGraph::commit(const ros::Time& stamp) {
 
     path_ = std::move(path);
     path_pub_.publish(path_);
+    logMapStats(stamp.toSec(), "global_graph_commit");
 }
 
 } // namespace gmmslam

@@ -21,6 +21,7 @@
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <deque>
 #include <filesystem>
@@ -75,6 +76,12 @@ private:
     void maybeReanchorSmootherFromGt(const ros::Time& stamp, double t_cloud);
     std::optional<Matrix4d> loadRestartPose() const;
     void saveRestartPose(const Matrix4d& pose, double t_sec, int key_idx);
+    void initBenchmarkLogs(const std::string& log_dir);
+    void logBenchmarkFrame(double stamp_sec, int frame_idx, int odom_idx,
+                           bool is_smoother_frame, bool is_keyframe,
+                           int point_count, double preprocess_ms,
+                           double callback_ms, const Matrix4d& estimate,
+                           const std::optional<Matrix4d>& gt_pose);
 
     Config cfg_;
 
@@ -103,6 +110,11 @@ private:
     bool has_last_keyframe_ = false;
     std::optional<Matrix4d> restart_pose_;
     double last_restart_state_write_t_ = -1.0;
+    bool benchmark_logs_enabled_ = false;
+    std::string benchmark_log_dir_;
+    std::ofstream benchmark_frames_csv_;
+    std::ofstream benchmark_est_tum_;
+    std::ofstream benchmark_gt_tum_;
 
     geometry_msgs::PoseStamped::ConstPtr latest_gt_pose_raw_;
     std::optional<Matrix4d> gt_origin_inv_;
@@ -229,6 +241,8 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
 
         pnh.param("fixed_lag_s",         cfg_.smoother.fixed_lag_s,         4.0);
         pnh.param("smoother_stride",     cfg_.smoother.smoother_stride,     3);
+        pnh.param("enable_external_odometry_factor",
+                  cfg_.smoother.enable_external_odometry_factor, true);
         pnh.param("odom_noise_sigma_t",  cfg_.smoother.odom_noise_sigma_t,  0.03);
         pnh.param("odom_noise_sigma_r",  cfg_.smoother.odom_noise_sigma_r,  0.03);
         pnh.param("lost_scale",          cfg_.smoother.lost_scale,          10.0);
@@ -237,11 +251,13 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
 
         pnh.param("enable_async_registration",  cfg_.registration.enable_async, true);
         pnh.param("registration_request_every_n_frames",
-                  cfg_.registration.request_every_n_frames, 3);
+                  cfg_.registration.request_every_n_frames,
+                  cfg_.registration.request_every_n_frames);
         pnh.param("registration_factor_every_n_frames",
                   cfg_.registration.factor_every_n_frames, 3);
         pnh.param("registration_score_threshold",
-                  cfg_.registration.score_threshold, 0.3);
+                  cfg_.registration.score_threshold,
+                  cfg_.registration.score_threshold);
         pnh.param("strong_factor_score_threshold",
                   cfg_.registration.strong_factor_score_threshold, 2.0);
         pnh.param("strong_factor_sigma_t",
@@ -254,28 +270,47 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
                   cfg_.registration.result_queue_size, 64);
         pnh.param("registration_enqueue_cooldown_frames",
                   cfg_.registration.enqueue_cooldown_frames, 8);
-        pnh.param("registration_workers",  cfg_.registration.workers, 6);
+        pnh.param("registration_max_sequential_odom_gap",
+                  cfg_.registration.max_sequential_odom_gap,
+                  cfg_.registration.max_sequential_odom_gap);
+        pnh.param("registration_workers",
+                  cfg_.registration.workers,
+                  cfg_.registration.workers);
         pnh.param("compensate_fit_latency_in_map",
                   cfg_.registration.compensate_fit_latency, true);
         pnh.param("score_sigma_low",  cfg_.registration.score_sigma_low,  0.6);
         pnh.param("score_sigma_high", cfg_.registration.score_sigma_high, 1.7);
-        pnh.param("seq_sigma_t_min",  cfg_.registration.seq_sigma_t_min,  0.02);
-        pnh.param("seq_sigma_t_max",  cfg_.registration.seq_sigma_t_max,  0.20);
-        pnh.param("seq_sigma_r_min",  cfg_.registration.seq_sigma_r_min,  0.01);
-        pnh.param("seq_sigma_r_max",  cfg_.registration.seq_sigma_r_max,  0.15);
+        pnh.param("seq_sigma_t_min",
+                  cfg_.registration.seq_sigma_t_min,
+                  cfg_.registration.seq_sigma_t_min);
+        pnh.param("seq_sigma_t_max",
+                  cfg_.registration.seq_sigma_t_max,
+                  cfg_.registration.seq_sigma_t_max);
+        pnh.param("seq_sigma_r_min",
+                  cfg_.registration.seq_sigma_r_min,
+                  cfg_.registration.seq_sigma_r_min);
+        pnh.param("seq_sigma_r_max",
+                  cfg_.registration.seq_sigma_r_max,
+                  cfg_.registration.seq_sigma_r_max);
         pnh.param("loop_sigma_t_min", cfg_.registration.loop_sigma_t_min, 0.03);
         pnh.param("loop_sigma_t_max", cfg_.registration.loop_sigma_t_max, 0.40);
         pnh.param("loop_sigma_r_min", cfg_.registration.loop_sigma_r_min, 0.02);
         pnh.param("loop_sigma_r_max", cfg_.registration.loop_sigma_r_max, 0.25);
 
-        pnh.param("enable_loop_closure_detection",  cfg_.loop_closure.enable, true);
+        pnh.param("enable_loop_closure_detection",
+                  cfg_.loop_closure.enable,
+                  cfg_.loop_closure.enable);
         pnh.param("loop_closure_search_radius_m",   cfg_.loop_closure.search_radius_m, 2.5);
         pnh.param("loop_closure_min_keyframe_gap",   cfg_.loop_closure.min_keyframe_gap, 10);
-        pnh.param("loop_closure_max_candidates",     cfg_.loop_closure.max_candidates, 5);
+        pnh.param("loop_closure_max_candidates",
+                  cfg_.loop_closure.max_candidates,
+                  cfg_.loop_closure.max_candidates);
         pnh.param("loop_closure_request_every_n_keyframes",
-                  cfg_.loop_closure.request_every_n_keyframes, 2);
+                  cfg_.loop_closure.request_every_n_keyframes,
+                  cfg_.loop_closure.request_every_n_keyframes);
         pnh.param("loop_closure_search_cooldown_keyframes",
-                  cfg_.loop_closure.search_cooldown_keyframes, 2);
+                  cfg_.loop_closure.search_cooldown_keyframes,
+                  cfg_.loop_closure.search_cooldown_keyframes);
         pnh.param("loop_closure_min_separation_m",
                   cfg_.loop_closure.min_separation_m, 0.8);
         pnh.param("loop_closure_min_separation_deg",
@@ -318,9 +353,11 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("solid_keep_descriptors",   cfg_.solid.keep_descriptors, 0);
 
         pnh.param("keyframe_translation_thresh_m",
-                  cfg_.keyframe.translation_thresh_m, 0.3);
+                  cfg_.keyframe.translation_thresh_m,
+                  cfg_.keyframe.translation_thresh_m);
         pnh.param("keyframe_rotation_thresh_deg",
-                  cfg_.keyframe.rotation_thresh_deg, 7.0);
+                  cfg_.keyframe.rotation_thresh_deg,
+                  cfg_.keyframe.rotation_thresh_deg);
         pnh.param("keyframe_use_time_trigger",
                   cfg_.keyframe.use_time_trigger, false);
         pnh.param("keyframe_max_interval_s",
@@ -332,6 +369,9 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("submap_between_sigma_r",         cfg_.global_graph.between_sigma_r, 0.08);
         pnh.param("submap_prior_sigma_t",           cfg_.global_graph.prior_sigma_t, 0.02);
         pnh.param("submap_prior_sigma_r",           cfg_.global_graph.prior_sigma_r, 0.02);
+        pnh.param("submap_enable_overlap_d2d",
+                  cfg_.global_graph.enable_overlap_d2d,
+                  cfg_.global_graph.enable_overlap_d2d);
         pnh.param("submap_overlap_radius_m",        cfg_.global_graph.overlap_radius_m, 3.0);
         pnh.param("submap_reg_score_threshold",     cfg_.global_graph.reg_score_threshold, 0.5);
         pnh.param("submap_min_loop_submap_gap",     cfg_.global_graph.min_loop_submap_gap, 5);
@@ -369,6 +409,8 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("gt_init_wait_s",    cfg_.gt_noise.init_wait_s, 3.0);
         pnh.param("gt_noise_sigma_t",  cfg_.gt_noise.sigma_t, 0.03);
         pnh.param("gt_noise_sigma_r",  cfg_.gt_noise.sigma_r, 0.03);
+        pnh.param("gt_initial_yaw_offset_deg",
+                  cfg_.gt_noise.initial_yaw_offset_deg, 0.0);
         pnh.param("gt_factor_sigma_t", cfg_.gt_noise.factor_sigma_t, 0.045);
         pnh.param("gt_factor_sigma_r", cfg_.gt_noise.factor_sigma_r, 0.045);
         pnh.param("gt_noise_seed",     cfg_.gt_noise.seed, -1);
@@ -422,6 +464,8 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param<std::string>("restart_state_path", cfg_.ros.restart_state_path,
                                cfg_.ros.restart_state_path);
     }
+    pnh.param<std::string>("benchmark_log_dir", benchmark_log_dir_, "");
+    initBenchmarkLogs(benchmark_log_dir_);
 
     restart_pose_ = loadRestartPose();
 
@@ -466,7 +510,8 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
 
     // --- Subsystems ---
     smoother_ = std::make_unique<FixedLagBackend>(
-        cfg_.smoother, cfg_.gt_noise, cfg_.loop_closure, cfg_.imu);
+        cfg_.smoother, cfg_.gt_noise, cfg_.loop_closure, cfg_.imu,
+        benchmark_log_dir_);
 
     global_graph_ = std::make_unique<GlobalPoseGraph>(
         cfg_.global_graph,
@@ -493,7 +538,8 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         /*get_traj_delta_fn=*/[this](int prev_key, int curr_key,
                                       double prev_t, double curr_t) {
             return submapTrajDeltaBetween(prev_key, curr_key, prev_t, curr_t);
-        });
+        },
+        benchmark_log_dir_);
 
     registration_ = std::make_unique<RegistrationManager>(
         *smoother_,
@@ -506,7 +552,8 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         cfg_.visualization,
         cfg_.gmm_dir,
         loop_closure_markers_pub,
-        cfg_.ros.odom_frame);
+        cfg_.ros.odom_frame,
+        benchmark_log_dir_);
     registration_->setOnFitComplete(
         [this](int /*frame_idx*/, const ros::Time& stamp) {
             if (global_graph_ && global_graph_->enable) {
@@ -955,6 +1002,16 @@ std::optional<Matrix4d> GMMSLAMNode::sampleNoisyGtRelativePose(const ros::Time& 
     const Matrix4d T_prev_gt = last_gt_T_for_factor_.value();
     const Matrix4d T_rel_gt = T_prev_gt.inverse() * T_curr_gt;
 
+    Matrix4d T_yaw_bias = Matrix4d::Identity();
+    if (std::abs(cfg_.gt_noise.initial_yaw_offset_deg) > 1e-12) {
+        const double yaw_rad =
+            cfg_.gt_noise.initial_yaw_offset_deg * M_PI / 180.0;
+        T_yaw_bias.block<3, 3>(0, 0) =
+            Eigen::AngleAxisd(yaw_rad, Vector3d::UnitZ()).toRotationMatrix();
+    }
+    const Matrix4d T_rel_biased =
+        T_yaw_bias.inverse() * T_rel_gt * T_yaw_bias;
+
     // Sample rotation noise as a small-angle axis-angle
     const Vector3d rot_noise(
         normal_dist_(rng_) * cfg_.gt_noise.sigma_r,
@@ -972,8 +1029,8 @@ std::optional<Matrix4d> GMMSLAMNode::sampleNoisyGtRelativePose(const ros::Time& 
         normal_dist_(rng_) * cfg_.gt_noise.sigma_t);
 
     Matrix4d T_noisy = Matrix4d::Identity();
-    T_noisy.block<3,3>(0,0) = R_noise * T_rel_gt.block<3,3>(0,0);
-    T_noisy.block<3,1>(0,3) = T_rel_gt.block<3,1>(0,3) + trans_noise;
+    T_noisy.block<3,3>(0,0) = R_noise * T_rel_biased.block<3,3>(0,0);
+    T_noisy.block<3,1>(0,3) = T_rel_biased.block<3,1>(0,3) + trans_noise;
 
     last_gt_T_for_factor_ = T_curr_gt;
     return T_noisy;
@@ -1119,6 +1176,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
 
         const ros::Time stamp = msg->header.stamp;
         const double t_cloud = stampToSec(stamp);
+        const auto callback_t0 = std::chrono::steady_clock::now();
 
         // Monotonicity check
         if (last_cloud_t_sec_processed_ >= 0.0 &&
@@ -1138,6 +1196,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         maybeReanchorSmootherFromGt(stamp, t_cloud);
 
         // 1. Convert & preprocess
+        const auto preprocess_t0 = std::chrono::steady_clock::now();
         std::optional<OrganizedDepthImage> organized_depth;
         if (cfg_.sogmm.backend == "gmmap" || cfg_.sogmm.backend == "GMMap") {
             organized_depth = pc2ToOrganizedDepth(
@@ -1163,6 +1222,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
                 static_cast<int>(pts.rows()));
             return;
         }
+        const auto preprocess_t1 = std::chrono::steady_clock::now();
 
         // 2. Drain pending async registration results
         if (cfg_.registration.enable_async) {
@@ -1201,6 +1261,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
 
         Matrix4d T_pub;
         int smoother_pose_key = -1;
+        bool keyframe_created = false;
         if (is_smoother_frame) {
             std::vector<std::tuple<double, Vector3d, Vector3d>> imu_measurements;
             if (has_last_smoother_stamp_) {
@@ -1222,8 +1283,9 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
             const auto* imu_ptr = imu_measurements.empty()
                                   ? nullptr : &imu_measurements;
 
-            smoother_->addFrame(prev_odom, curr_odom, stamp,
-                                predicted, gt_rel_ptr, imu_ptr);
+            smoother_->addFrame(
+                prev_odom, curr_odom, stamp, predicted, gt_rel_ptr, imu_ptr,
+                cfg_.smoother.enable_external_odometry_factor);
 
             last_smoother_stamp_ = stamp;
             has_last_smoother_stamp_ = true;
@@ -1251,6 +1313,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
 
             // 7. Keyframe check (global graph + registration only)
             if (shouldAddKeyframe(stamp, current_pose)) {
+                keyframe_created = true;
                 last_keyframe_pose_ = current_pose;
                 last_keyframe_t_sec_ = stampToSec(stamp);
                 has_last_keyframe_ = true;
@@ -1318,12 +1381,115 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         visualizer_->publishPoseLpf(T_lpf, stamp);
         visualizer_->enqueueFrame(stamp, pts, frame_count_, T_pub, smoother_pose_key);
 
+        const auto callback_t1 = std::chrono::steady_clock::now();
+        const double preprocess_ms =
+            std::chrono::duration<double, std::milli>(
+                preprocess_t1 - preprocess_t0).count();
+        const double callback_ms =
+            std::chrono::duration<double, std::milli>(
+                callback_t1 - callback_t0).count();
+        logBenchmarkFrame(stampToSec(stamp), frame_count_, smoother_pose_key,
+                          is_smoother_frame, keyframe_created,
+                          static_cast<int>(pts.rows()), preprocess_ms,
+                          callback_ms, T_pub, currentGtPoseOdomFrame(stamp));
+
         logBackpressure(stamp);
         ++frame_count_;
 
     } catch (const std::exception& e) {
         ROS_ERROR("[gmmslam] exception in cloud callback: %s", e.what());
     }
+}
+
+void GMMSLAMNode::initBenchmarkLogs(const std::string& log_dir)
+{
+    if (log_dir.empty()) {
+        return;
+    }
+
+    try {
+        std::filesystem::create_directories(log_dir);
+        benchmark_frames_csv_.open(log_dir + "/frames.csv", std::ios::out);
+        benchmark_est_tum_.open(log_dir + "/estimated_trajectory.tum", std::ios::out);
+        benchmark_gt_tum_.open(log_dir + "/groundtruth_trajectory.tum", std::ios::out);
+
+        if (!benchmark_frames_csv_ || !benchmark_est_tum_ || !benchmark_gt_tum_) {
+            ROS_WARN("[benchmark] failed to open one or more benchmark log files in %s",
+                     log_dir.c_str());
+            return;
+        }
+
+        benchmark_frames_csv_
+            << "stamp,frame_idx,odom_idx,is_smoother_frame,is_keyframe,"
+            << "point_count,preprocess_ms,callback_ms,"
+            << "est_x,est_y,est_z,est_qx,est_qy,est_qz,est_qw,"
+            << "has_gt,gt_x,gt_y,gt_z,gt_qx,gt_qy,gt_qz,gt_qw\n";
+        benchmark_frames_csv_ << std::fixed << std::setprecision(9);
+        benchmark_est_tum_ << std::fixed << std::setprecision(9);
+        benchmark_gt_tum_ << std::fixed << std::setprecision(9);
+        benchmark_logs_enabled_ = true;
+
+        ROS_INFO("[benchmark] writing structured metrics to %s", log_dir.c_str());
+        ROS_INFO("[benchmark] evo trajectories: estimated_trajectory.tum and groundtruth_trajectory.tum");
+    } catch (const std::exception& e) {
+        ROS_WARN("[benchmark] failed to initialize benchmark logs in %s: %s",
+                 log_dir.c_str(), e.what());
+    }
+}
+
+void GMMSLAMNode::logBenchmarkFrame(
+    double stamp_sec, int frame_idx, int odom_idx,
+    bool is_smoother_frame, bool is_keyframe,
+    int point_count, double preprocess_ms, double callback_ms,
+    const Matrix4d& estimate, const std::optional<Matrix4d>& gt_pose)
+{
+    if (!benchmark_logs_enabled_) {
+        return;
+    }
+
+    const auto write_tum_pose = [](std::ofstream& out,
+                                   double stamp,
+                                   const Matrix4d& T) {
+        Eigen::Quaterniond q(T.block<3, 3>(0, 0));
+        q.normalize();
+        const auto p = T.block<3, 1>(0, 3);
+        out << stamp << ' '
+            << p(0) << ' ' << p(1) << ' ' << p(2) << ' '
+            << q.x() << ' ' << q.y() << ' ' << q.z() << ' ' << q.w() << '\n';
+    };
+
+    Eigen::Quaterniond q_est(estimate.block<3, 3>(0, 0));
+    q_est.normalize();
+    const auto p_est = estimate.block<3, 1>(0, 3);
+
+    benchmark_frames_csv_
+        << stamp_sec << ','
+        << frame_idx << ','
+        << odom_idx << ','
+        << (is_smoother_frame ? 1 : 0) << ','
+        << (is_keyframe ? 1 : 0) << ','
+        << point_count << ','
+        << preprocess_ms << ','
+        << callback_ms << ','
+        << p_est(0) << ',' << p_est(1) << ',' << p_est(2) << ','
+        << q_est.x() << ',' << q_est.y() << ',' << q_est.z() << ',' << q_est.w();
+
+    write_tum_pose(benchmark_est_tum_, stamp_sec, estimate);
+
+    if (gt_pose.has_value()) {
+        Eigen::Quaterniond q_gt(gt_pose->block<3, 3>(0, 0));
+        q_gt.normalize();
+        const auto p_gt = gt_pose->block<3, 1>(0, 3);
+        benchmark_frames_csv_
+            << ",1,"
+            << p_gt(0) << ',' << p_gt(1) << ',' << p_gt(2) << ','
+            << q_gt.x() << ',' << q_gt.y() << ',' << q_gt.z() << ',' << q_gt.w();
+        write_tum_pose(benchmark_gt_tum_, stamp_sec, gt_pose.value());
+    } else {
+        benchmark_frames_csv_
+            << ",0,nan,nan,nan,nan,nan,nan,nan";
+    }
+    benchmark_frames_csv_ << '\n';
 }
 
 } // namespace gmmslam

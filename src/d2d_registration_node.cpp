@@ -7,6 +7,7 @@
 #include <nlohmann/json.hpp>
 
 #include <Eigen/Core>
+#include <Eigen/Geometry>
 #include <Eigen/LU>
 #include <atomic>
 #include <cmath>
@@ -34,6 +35,14 @@ void applyDebugPrints(bool enable) {
     }
 }
 
+const char* d2dSuccessColor(bool is_loop, bool is_submap) {
+    if (is_loop) return "\033[31m";      // red
+    if (is_submap) return "\033[38;5;208m";  // orange
+    return "\033[37m";                   // white
+}
+
+constexpr const char* kAnsiReset = "\033[0m";
+
 } // namespace
 
 class D2DRegistrationNode {
@@ -46,10 +55,32 @@ public:
                                "/gmmslam_node/registration/result");
         pnh.param<int>("num_workers", num_workers_, 2);
         num_workers_ = std::max(1, num_workers_);
-        pnh.param<double>("score_threshold", score_threshold_, -1.0e9);
+        nh.param("/gmmslam/registration/score_threshold", score_threshold_, 0.85);
+        nh.param("/gmmslam/loop_closure/detect_score_threshold",
+                 loop_score_threshold_, loop_score_threshold_);
         pnh.param<bool>("suppress_backend_output", suppress_backend_output_, true);
         pnh.param<double>("drop_stale_keyframe_age_s",
                           drop_stale_keyframe_age_s_, 2.0);
+        nh.param("/gmmslam/registration/sequential_prior_gate_trans_m",
+                 sequential_prior_gate_trans_m_, sequential_prior_gate_trans_m_);
+        nh.param("/gmmslam/registration/sequential_prior_gate_rot_deg",
+                 sequential_prior_gate_rot_deg_, sequential_prior_gate_rot_deg_);
+        nh.param("/gmmslam/registration/loop_prior_gate_trans_m",
+                 loop_prior_gate_trans_m_, loop_prior_gate_trans_m_);
+        nh.param("/gmmslam/registration/loop_prior_gate_rot_deg",
+                 loop_prior_gate_rot_deg_, loop_prior_gate_rot_deg_);
+        pnh.param<double>("sequential_prior_gate_trans_m",
+                          sequential_prior_gate_trans_m_,
+                          sequential_prior_gate_trans_m_);
+        pnh.param<double>("sequential_prior_gate_rot_deg",
+                          sequential_prior_gate_rot_deg_,
+                          sequential_prior_gate_rot_deg_);
+        pnh.param<double>("loop_prior_gate_trans_m",
+                          loop_prior_gate_trans_m_,
+                          loop_prior_gate_trans_m_);
+        pnh.param<double>("loop_prior_gate_rot_deg",
+                          loop_prior_gate_rot_deg_,
+                          loop_prior_gate_rot_deg_);
         nh.param("/gmmslam/DEBUG_PRINTS", debug_prints_, debug_prints_);
         pnh.param<bool>("debug_prints", debug_prints_, debug_prints_);
         applyDebugPrints(debug_prints_);
@@ -65,10 +96,18 @@ public:
 
         ROS_INFO("[d2d_reg] ready | workers=%d | %s -> %s | "
                  "suppress_backend_output=%s | drop_stale_keyframe_age_s=%.2f | "
+                 "score_thresholds(seq=%.3f loop=%.3f) | "
+                 "prior_gates(seq=%.2fm/%.1fdeg loop=%.2fm/%.1fdeg) | "
                  "debug_prints=%s",
                  num_workers_, request_topic.c_str(), result_topic.c_str(),
                  suppress_backend_output_ ? "true" : "false",
                  drop_stale_keyframe_age_s_,
+                 score_threshold_,
+                 loop_score_threshold_,
+                 sequential_prior_gate_trans_m_,
+                 sequential_prior_gate_rot_deg_,
+                 loop_prior_gate_trans_m_,
+                 loop_prior_gate_rot_deg_,
                  debug_prints_ ? "true" : "false");
     }
 
@@ -210,6 +249,15 @@ private:
         } else if (is_submap) {
             submap_queue_.push_back(msg->data);
         } else {
+            const std::size_t dropped = sequential_queue_.size();
+            sequential_queue_.clear();
+            if (dropped > 0) {
+                ROS_WARN_THROTTLE(
+                    2.0,
+                    "[d2d_reg] dropped %zu queued sequential D2D job(s); "
+                    "keeping newest prev=%d curr=%d",
+                    dropped, prev_idx, curr_idx);
+            }
             sequential_queue_.push_back(msg->data);
         }
         queue_cv_.notify_one();
@@ -398,18 +446,98 @@ private:
                 T_iso = T_init;
             }
 
-            // Step 2: anisotropic registration
-            if (suppress_backend_output_) {
-                std::lock_guard<std::mutex> lk(backend_call_mutex_);
-                ScopedBackendOutputSilencer silence(true);
-                aniso_result =
-                    gmmslam::anisotropicRegistration(T_iso, source_path, target_path);
-            } else {
-                aniso_result =
-                    gmmslam::anisotropicRegistration(T_iso, source_path, target_path);
+            const double active_score_threshold =
+                is_loop ? loop_score_threshold_ : score_threshold_;
+
+            auto run_anisotropic = [&](const Eigen::Matrix4f& seed) {
+                if (suppress_backend_output_) {
+                    std::lock_guard<std::mutex> lk(backend_call_mutex_);
+                    ScopedBackendOutputSilencer silence(true);
+                    return gmmslam::anisotropicRegistration(
+                        seed, source_path, target_path);
+                }
+                return gmmslam::anisotropicRegistration(
+                    seed, source_path, target_path);
+            };
+
+            // Step 2: anisotropic registration. Loop closures try the latest-pose
+            // seed first; if it scores too low, retry once with SOLiD yaw while
+            // keeping the same translation.
+            aniso_result = run_anisotropic(T_iso);
+            Eigen::Matrix4f T_final = aniso_result.transform;
+            float score_final = aniso_result.score;
+
+            if (is_loop && has_initial_transform &&
+                score_final < active_score_threshold &&
+                req.contains("solid_yaw_prior_rad") &&
+                req.at("solid_yaw_prior_rad").is_number()) {
+                const double yaw_rad =
+                    req.at("solid_yaw_prior_rad").get<double>();
+                if (std::isfinite(yaw_rad)) {
+                    Eigen::Matrix4f T_yaw = T_init;
+                    T_yaw.block<3, 3>(0, 0) =
+                        Eigen::AngleAxisf(static_cast<float>(yaw_rad),
+                                           Eigen::Vector3f::UnitZ())
+                            .toRotationMatrix();
+                    const auto yaw_result = run_anisotropic(T_yaw);
+                    ROS_INFO("[d2d_reg] %s SOLiD yaw retry | prev=%d curr=%d "
+                             "score_latest=%.4f score_yaw=%.4f yaw=%.1fdeg",
+                             requestTag(is_loop, is_submap).c_str(),
+                             prev_idx, curr_idx,
+                             static_cast<double>(score_final),
+                             static_cast<double>(yaw_result.score),
+                             yaw_rad * 180.0 / M_PI);
+                    if (std::isfinite(yaw_result.score) &&
+                        (!std::isfinite(score_final) ||
+                         yaw_result.score > score_final)) {
+                        T_init = T_yaw;
+                        aniso_result = yaw_result;
+                        T_final = aniso_result.transform;
+                        score_final = aniso_result.score;
+                        result["solid_yaw_retry_used"] = true;
+
+                        Eigen::Matrix<float, 4, 4, Eigen::RowMajor> T_row(T_init);
+                        std::vector<double> flat(16);
+                        for (int k = 0; k < 16; ++k) {
+                            flat[static_cast<std::size_t>(k)] =
+                                static_cast<double>(T_row.data()[k]);
+                        }
+                        result["initial_transform"] = std::move(flat);
+                    }
+                }
             }
-            const Eigen::Matrix4f T_final = aniso_result.transform;
-            const float score_final = aniso_result.score;
+
+            {
+                const float init_t = has_initial_transform
+                    ? T_init.block<3, 1>(0, 3).norm() : 0.0f;
+                const float init_r_deg = has_initial_transform
+                    ? static_cast<float>(rotationAngleDeg(T_init.block<3, 3>(0, 0))) : 0.0f;
+                const Eigen::Matrix4f T_delta = T_init.inverse() * T_final;
+                const float delta_t = T_delta.block<3, 1>(0, 3).norm();
+                const float delta_r_deg =
+                    static_cast<float>(rotationAngleDeg(T_delta.block<3, 3>(0, 0)));
+                result["n_source"] = aniso_result.n_source;
+                result["n_target"] = aniso_result.n_target;
+                result["init_t_m"] = static_cast<double>(init_t);
+                result["init_r_deg"] = static_cast<double>(init_r_deg);
+                result["delta_t_m"] = static_cast<double>(delta_t);
+                result["delta_r_deg"] = static_cast<double>(delta_r_deg);
+                result["coarse_score"] = static_cast<double>(aniso_result.coarse_score);
+                ROS_INFO("[d2d_reg] %s dbg | prev=%d curr=%d "
+                         "K_src=%d K_tgt=%d "
+                         "init_t=%.3fm init_r=%.1fdeg "
+                         "delta_t=%.3fm delta_r=%.1fdeg "
+                         "coarse=%.4f final=%.4f",
+                         requestTag(is_loop, is_submap).c_str(),
+                         prev_idx, curr_idx,
+                         aniso_result.n_source, aniso_result.n_target,
+                         static_cast<double>(init_t),
+                         static_cast<double>(init_r_deg),
+                         static_cast<double>(delta_t),
+                         static_cast<double>(delta_r_deg),
+                         static_cast<double>(aniso_result.coarse_score),
+                         static_cast<double>(score_final));
+            }
 
             if (!std::isfinite(score_final) || T_final.hasNaN()) {
                 ROS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
@@ -426,8 +554,12 @@ private:
                     T_err.block<3, 1>(0, 3).cast<double>().norm();
                 const double rot_err_deg =
                     rotationAngleDeg(T_err.block<3, 3>(0, 0));
-                const double trans_limit_m = is_loop ? 3.0 : 0.50;
-                const double rot_limit_deg = is_loop ? 45.0 : 15.0;
+                const double trans_limit_m = is_loop
+                    ? loop_prior_gate_trans_m_
+                    : sequential_prior_gate_trans_m_;
+                const double rot_limit_deg = is_loop
+                    ? loop_prior_gate_rot_deg_
+                    : sequential_prior_gate_rot_deg_;
                 if (trans_err > trans_limit_m || rot_err_deg > rot_limit_deg) {
                     ROS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
                              "reason=prior_consistency_gate trans=%.3fm rot=%.2fdeg "
@@ -440,12 +572,12 @@ private:
                     return;
                 }
             }
-            if (score_final < score_threshold_) {
+            if (score_final < active_score_threshold) {
                 ROS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
                          "reason=worker_score_threshold score=%.4f < %.4f",
                          requestTag(is_loop, is_submap).c_str(),
                          prev_idx, curr_idx, static_cast<double>(score_final),
-                         score_threshold_);
+                         active_score_threshold);
                 fail("worker_score_threshold");
                 return;
             }
@@ -464,20 +596,25 @@ private:
             const auto elapsed_ms =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     std::chrono::steady_clock::now() - request_t0).count();
+            result["elapsed_ms"] = static_cast<long>(elapsed_ms);
             if (is_submap) {
-                ROS_INFO("[d2d_reg] %s registration success | prev=%d curr=%d "
-                         "score=%.4f elapsed_ms=%ld",
+                ROS_INFO("%s[d2d_reg] %s registration success | prev=%d curr=%d "
+                         "score=%.4f elapsed_ms=%ld%s",
+                         d2dSuccessColor(is_loop, is_submap),
                          tag.c_str(), prev_idx, curr_idx,
                          static_cast<double>(score_final),
-                         static_cast<long>(elapsed_ms));
+                         static_cast<long>(elapsed_ms),
+                         kAnsiReset);
             } else {
                 ROS_INFO_THROTTLE(
                     5.0,
-                    "[d2d_reg] %s registration success | prev=%d curr=%d "
-                    "score=%.4f elapsed_ms=%ld",
+                    "%s[d2d_reg] %s registration success | prev=%d curr=%d "
+                    "score=%.4f elapsed_ms=%ld%s",
+                    d2dSuccessColor(is_loop, is_submap),
                     tag.c_str(), prev_idx, curr_idx,
                     static_cast<double>(score_final),
-                    static_cast<long>(elapsed_ms));
+                    static_cast<long>(elapsed_ms),
+                    kAnsiReset);
             }
         } catch (const std::exception& e) {
             ROS_WARN_THROTTLE(2.0, "[d2d_reg] registration failed: %s", e.what());
@@ -500,8 +637,13 @@ private:
     ros::Publisher result_pub_;
     int num_workers_ = 2;
     double score_threshold_ = -1.0e9;
+    double loop_score_threshold_ = 1.1;
     bool suppress_backend_output_ = true;
     double drop_stale_keyframe_age_s_ = 2.0;
+    double sequential_prior_gate_trans_m_ = 0.25;
+    double sequential_prior_gate_rot_deg_ = 15.0;
+    double loop_prior_gate_trans_m_ = 3.0;
+    double loop_prior_gate_rot_deg_ = 45.0;
     bool debug_prints_ = true;
 
     bool running_ = true;

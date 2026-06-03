@@ -4,6 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LOG_DIR="${SCRIPT_DIR}/logs"
 LOG_FILE=""
+BENCHMARK_LOG_DIR=""
 ROS_DISTRO_TO_USE="noetic"
 BUILD_TYPE="${BUILD_TYPE:-Release}"
 SAMPLE_INTERVAL="1"
@@ -21,6 +22,7 @@ Usage:
 Options:
   --log-dir DIR           Directory for benchmark logs (default: ./logs)
   --log-file FILE         Exact txt log file path to write
+  --benchmark-log-dir DIR Directory for structured CSV/TUM metrics
   --ros-distro DISTRO     ROS distribution for run_gmmslam_cpp.sh (default: noetic)
   --build-type TYPE       CMake build type for run_gmmslam_cpp.sh (default: Release)
   --docker                Run inside the project's Docker container
@@ -36,8 +38,9 @@ Examples:
   ./benchmark_gmmslam_cpp.sh --log-dir /tmp/gmmslam_logs --no-build config_file:=/path/to/params_bench.yaml
 
 The script launches run_gmmslam_cpp.sh and writes stdout, stderr, and
-/usr/bin/time -v resource usage into a txt file while also printing to screen.
-It also writes time-series process and GPU metrics next to the main log.
+/usr/bin/time -v resource usage into console.txt while also printing to screen.
+It also writes time-series process/GPU metrics and structured ROS benchmark
+metrics next to the main log.
 EOF
 }
 
@@ -102,6 +105,14 @@ while [[ $# -gt 0 ]]; do
                 exit 2
             fi
             LOG_FILE="$2"
+            shift 2
+            ;;
+        --benchmark-log-dir)
+            if [[ $# -lt 2 ]]; then
+                echo "error: --benchmark-log-dir requires a directory" >&2
+                exit 2
+            fi
+            BENCHMARK_LOG_DIR="$2"
             shift 2
             ;;
         --ros-distro)
@@ -182,15 +193,33 @@ fi
 if [[ -z "${LOG_FILE}" ]]; then
     mkdir -p "${LOG_DIR}"
     TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
-    LOG_FILE="${LOG_DIR}/gmmslam_cpp_${TIMESTAMP}.txt"
+    BENCHMARK_LOG_DIR="${BENCHMARK_LOG_DIR:-${LOG_DIR}/gmmslam_cpp_${TIMESTAMP}}"
+    mkdir -p "${BENCHMARK_LOG_DIR}"
+    LOG_FILE="${BENCHMARK_LOG_DIR}/console.txt"
 else
     mkdir -p "$(dirname "${LOG_FILE}")"
+    if [[ -z "${BENCHMARK_LOG_DIR}" ]]; then
+        LOG_BASE_FOR_DIR="${LOG_FILE%.txt}"
+        BENCHMARK_LOG_DIR="${LOG_BASE_FOR_DIR}_artifacts"
+    fi
+    mkdir -p "${BENCHMARK_LOG_DIR}"
 fi
 
 LOG_BASE="${LOG_FILE%.txt}"
-PROCESS_METRICS_FILE="${LOG_BASE}_processes.tsv"
-GPU_METRICS_FILE="${LOG_BASE}_gpu.csv"
-GPU_PROCESS_METRICS_FILE="${LOG_BASE}_gpu_processes.csv"
+PROCESS_METRICS_FILE="${BENCHMARK_LOG_DIR}/processes.tsv"
+GPU_METRICS_FILE="${BENCHMARK_LOG_DIR}/gpu.csv"
+GPU_PROCESS_METRICS_FILE="${BENCHMARK_LOG_DIR}/gpu_processes.csv"
+RUN_ARGS_FOR_LAUNCH=("${RUN_ARGS[@]}")
+HAS_BENCHMARK_LOG_DIR_ARG=false
+for arg in "${RUN_ARGS[@]}"; do
+    if [[ "${arg}" == benchmark_log_dir:=* ]]; then
+        HAS_BENCHMARK_LOG_DIR_ARG=true
+        break
+    fi
+done
+if [[ "${HAS_BENCHMARK_LOG_DIR_ARG}" = false ]]; then
+    RUN_ARGS_FOR_LAUNCH+=("benchmark_log_dir:=${BENCHMARK_LOG_DIR}")
+fi
 SAMPLER_STOP_FILE="$(mktemp)"
 rm -f "${SAMPLER_STOP_FILE}"
 SAMPLER_PID=""
@@ -210,10 +239,11 @@ trap cleanup EXIT INT TERM
     echo "Started: $(date --iso-8601=seconds)"
     echo "Host: $(hostname)"
     echo "Workspace: ${SCRIPT_DIR}"
-    echo "Command: ROS_DISTRO=${ROS_DISTRO_TO_USE} BUILD_TYPE=${BUILD_TYPE} ${SCRIPT_DIR}/run_gmmslam_cpp.sh ${RUN_ARGS[*]}"
+    echo "Command: ROS_DISTRO=${ROS_DISTRO_TO_USE} BUILD_TYPE=${BUILD_TYPE} ${SCRIPT_DIR}/run_gmmslam_cpp.sh ${RUN_ARGS_FOR_LAUNCH[*]}"
     echo "ROS distro: ${ROS_DISTRO_TO_USE}"
     echo "Build type: ${BUILD_TYPE}"
     echo "Log file: ${LOG_FILE}"
+    echo "Benchmark metrics directory: ${BENCHMARK_LOG_DIR}"
     if [[ "${ENABLE_SAMPLING}" = true ]]; then
         echo "Process metrics: ${PROCESS_METRICS_FILE}"
         echo "GPU metrics: ${GPU_METRICS_FILE}"
@@ -234,12 +264,12 @@ fi
 set +e
 if [[ -x /usr/bin/time ]]; then
     echo "Timer: /usr/bin/time -v" | tee -a "${LOG_FILE}"
-    stdbuf -oL -eL /usr/bin/time -v env ROS_DISTRO="${ROS_DISTRO_TO_USE}" BUILD_TYPE="${BUILD_TYPE}" "${SCRIPT_DIR}/run_gmmslam_cpp.sh" "${RUN_ARGS[@]}" > >(tee -a "${LOG_FILE}") 2>&1
+    stdbuf -oL -eL /usr/bin/time -v env ROS_DISTRO="${ROS_DISTRO_TO_USE}" BUILD_TYPE="${BUILD_TYPE}" "${SCRIPT_DIR}/run_gmmslam_cpp.sh" "${RUN_ARGS_FOR_LAUNCH[@]}" > >(tee -a "${LOG_FILE}") 2>&1
     EXIT_CODE=$?
 else
     echo "Timer: bash time fallback" | tee -a "${LOG_FILE}"
     TIMEFORMAT=$'real\t%3R\nuser\t%3U\nsys\t%3S'
-    { time stdbuf -oL -eL env ROS_DISTRO="${ROS_DISTRO_TO_USE}" BUILD_TYPE="${BUILD_TYPE}" "${SCRIPT_DIR}/run_gmmslam_cpp.sh" "${RUN_ARGS[@]}"; } > >(tee -a "${LOG_FILE}") 2>&1
+    { time stdbuf -oL -eL env ROS_DISTRO="${ROS_DISTRO_TO_USE}" BUILD_TYPE="${BUILD_TYPE}" "${SCRIPT_DIR}/run_gmmslam_cpp.sh" "${RUN_ARGS_FOR_LAUNCH[@]}"; } > >(tee -a "${LOG_FILE}") 2>&1
     EXIT_CODE=$?
 fi
 set -e
@@ -255,6 +285,7 @@ trap - EXIT INT TERM
 } | tee -a "${LOG_FILE}"
 
 echo "Benchmark log written to: ${LOG_FILE}"
+echo "Structured benchmark metrics written to: ${BENCHMARK_LOG_DIR}"
 if [[ "${ENABLE_SAMPLING}" = true ]]; then
     echo "Process metrics written to: ${PROCESS_METRICS_FILE}"
     echo "GPU metrics written to: ${GPU_METRICS_FILE}"
