@@ -5,6 +5,7 @@
 #include <gtsam/navigation/CombinedImuFactor.h>
 #include <gtsam/navigation/ImuFactor.h>
 #include <gtsam/navigation/ImuBias.h>
+#include <gtsam/navigation/NavState.h>
 #include <gtsam/inference/Symbol.h>
 
 #include <ros/ros.h>
@@ -416,12 +417,70 @@ bool FixedLagBackend::initialize(const Matrix4d& init_pose, const ros::Time& sta
     }
 }
 
+std::optional<FixedLagBackend::ImuPrediction>
+FixedLagBackend::predictWithImu(
+    int prev_idx,
+    const std::vector<std::tuple<double, Vector3d, Vector3d>>& imu_measurements) const
+{
+    if (!enable_imu_ || imu_measurements.empty() || !imu_preint_params_) {
+        return std::nullopt;
+    }
+
+    Matrix4d T_prev = Matrix4d::Identity();
+    Vector3d v_prev = Vector3d::Zero();
+    Eigen::Matrix<double,6,1> b_prev = Eigen::Matrix<double,6,1>::Zero();
+    {
+        std::lock_guard<std::mutex> lk(graph_lock);
+        const auto pose_it = pose_by_idx.find(prev_idx);
+        if (pose_it == pose_by_idx.end()) {
+            return std::nullopt;
+        }
+        T_prev = pose_it->second;
+
+        const auto vel_it = velocity_by_idx.find(prev_idx);
+        if (vel_it != velocity_by_idx.end()) {
+            v_prev = vel_it->second;
+        }
+        const auto bias_it = bias_by_idx.find(prev_idx);
+        if (bias_it != bias_by_idx.end()) {
+            b_prev = bias_it->second;
+        }
+    }
+
+    const ConstantBias prev_bias(b_prev.head<3>(), b_prev.tail<3>());
+    gtsam::PreintegratedCombinedMeasurements preint(imu_preint_params_, prev_bias);
+
+    int n_imu = 0;
+    for (const auto& [dt, acc, gyro] : imu_measurements) {
+        if (dt <= 0.0) {
+            continue;
+        }
+        preint.integrateMeasurement(acc, gyro, dt);
+        ++n_imu;
+    }
+    if (n_imu == 0) {
+        return std::nullopt;
+    }
+
+    const gtsam::NavState prev_state(pose3FromMatrix(T_prev), v_prev);
+    const gtsam::NavState predicted = preint.predict(prev_state, prev_bias);
+
+    ImuPrediction out;
+    out.pose = matrixFromPose3(predicted.pose());
+    out.velocity = predicted.velocity();
+    out.bias = b_prev;
+    out.sample_count = n_imu;
+    return out;
+}
+
 bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
                                const ros::Time& stamp,
                                const Matrix4d& predicted_pose,
                                const Matrix4d* gt_rel_mat,
                                const std::vector<std::tuple<double, Vector3d, Vector3d>>* imu_measurements,
-                               bool add_external_odometry_factor) {
+                               bool add_external_odometry_factor,
+                               const Vector3d* initial_velocity,
+                               const Eigen::Matrix<double,6,1>* initial_bias) {
     if (!initialize(predicted_pose, stamp)) return false;
 
     if (prev_idx < 0) {
@@ -487,6 +546,8 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
     Vector3d vel_wb = Vector3d::Zero();
     Eigen::Matrix<double,6,1> bias_vec_wb =
         Eigen::Matrix<double,6,1>::Zero();
+    Eigen::Matrix<double,6,1> curr_bias_guess_wb =
+        Eigen::Matrix<double,6,1>::Zero();
 
     // ---- Optional IMU preintegration ----
     if (enable_imu_) {
@@ -500,6 +561,9 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
             auto it = bias_by_idx.find(factor_prev_idx);
             if (it != bias_by_idx.end()) bias_vec_wb = it->second;
         }
+        curr_bias_guess_wb = initial_bias != nullptr
+            ? *initial_bias
+            : bias_vec_wb;
         const ConstantBias prev_bias(bias_vec_wb.head<3>(), bias_vec_wb.tail<3>());
 
         auto preint = boost::make_shared<gtsam::PreintegratedCombinedMeasurements>(
@@ -541,9 +605,14 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
                 if (vit != velocity_by_idx.end()) vel_wb = vit->second;
             }
         }
+        if (initial_velocity != nullptr) {
+            vel_wb = *initial_velocity;
+        }
 
         new_values_.insert(kv_curr, vel_wb);
-        new_values_.insert(kb_curr, prev_bias);
+        new_values_.insert(
+            kb_curr,
+            ConstantBias(curr_bias_guess_wb.head<3>(), curr_bias_guess_wb.tail<3>()));
         new_timestamps_[kv_curr] = t_sec;
         new_timestamps_[kb_curr] = t_sec;
 
@@ -589,7 +658,7 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
         key_t_sec[curr_idx] = t_sec;
         if (enable_imu_) {
             velocity_by_idx[curr_idx] = vel_wb;
-            bias_by_idx[curr_idx] = bias_vec_wb;
+            bias_by_idx[curr_idx] = curr_bias_guess_wb;
         }
     }
     return true;

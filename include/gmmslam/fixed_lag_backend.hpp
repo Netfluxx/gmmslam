@@ -19,15 +19,24 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <optional>
 #include <mutex>
 #include <set>
 #include <string>
 #include <thread>
+#include <tuple>
 
 namespace gmmslam {
 
 class FixedLagBackend {
 public:
+    struct ImuPrediction {
+        Matrix4d pose = Matrix4d::Identity();
+        Vector3d velocity = Vector3d::Zero();
+        Eigen::Matrix<double,6,1> bias = Eigen::Matrix<double,6,1>::Zero();
+        int sample_count = 0;
+    };
+
     FixedLagBackend(const SmootherConfig& smoother_cfg,
                     const GtNoiseConfig& gt_cfg,
                     const LoopClosureConfig& loop_cfg,
@@ -41,7 +50,13 @@ public:
                   const Matrix4d& predicted_pose,
                   const Matrix4d* gt_rel_mat = nullptr,
                   const std::vector<std::tuple<double, Vector3d, Vector3d>>* imu_measurements = nullptr,
-                  bool add_external_odometry_factor = true);
+                  bool add_external_odometry_factor = true,
+                  const Vector3d* initial_velocity = nullptr,
+                  const Eigen::Matrix<double,6,1>* initial_bias = nullptr);
+
+    std::optional<ImuPrediction> predictWithImu(
+        int prev_idx,
+        const std::vector<std::tuple<double, Vector3d, Vector3d>>& imu_measurements) const;
 
     void stageFactor(const gtsam::NonlinearFactor::shared_ptr& factor);
     bool flushStagedFactors();

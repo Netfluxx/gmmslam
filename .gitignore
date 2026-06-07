@@ -1,0 +1,16 @@
+# Build
+build/
+
+# Logs
+logs/
+
+# Graphs / plots
+*.png
+*.pdf
+
+# Data
+*.csv
+*.txt
+
+# Python
+**/__pycache__/

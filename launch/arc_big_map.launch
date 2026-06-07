@@ -15,5 +15,6 @@
     <arg name="pose_topic" value="/m500_1/macortex_bridge/m500_1/pose"/>
     <arg name="csv_path" value="$(arg csv_path)"/>
     <arg name="log_hz" value="$(arg log_hz)"/>
+    <arg name="reference_mode" value="mid_arc"/>
   </include>
 </launch>

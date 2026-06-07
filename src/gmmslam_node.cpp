@@ -1238,13 +1238,18 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         // 3. Per-frame GT relative motion
         const auto gt_rel_opt = sampleNoisyGtRelativePose(stamp);
 
-        // 4. Predicted pose = current smoother pose + GT motion
+        // 4. Pose prediction.  External odometry/noisy GT remains the primary
+        // pose prior when available; IMU propagation is evaluated below once
+        // the smoother-frame interval is known.
         Matrix4d predicted;
+        const bool has_external_prediction = gt_rel_opt.has_value();
+        bool has_restart_prediction = false;
         {
             std::lock_guard<std::mutex> lk(smoother_->graph_lock);
             if (!smoother_->initialized() && restart_pose_.has_value()) {
+                has_restart_prediction = true;
                 predicted = restart_pose_.value();
-            } else if (gt_rel_opt.has_value()) {
+            } else if (has_external_prediction) {
                 predicted = smoother_->pose * gt_rel_opt.value();
             } else {
                 predicted = smoother_->pose;
@@ -1289,9 +1294,38 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
             const auto* imu_ptr = imu_measurements.empty()
                                   ? nullptr : &imu_measurements;
 
+            std::optional<FixedLagBackend::ImuPrediction> imu_prediction;
+            if (cfg_.imu.enable_preintegration && prev_odom >= 0 &&
+                !imu_measurements.empty()) {
+                imu_prediction = smoother_->predictWithImu(prev_odom, imu_measurements);
+            }
+
+            if (imu_prediction.has_value()) {
+                if (!has_external_prediction && !has_restart_prediction) {
+                    predicted = imu_prediction->pose;
+                    ROS_INFO_THROTTLE(
+                        2.0,
+                        "[gmmslam] X(%d) using IMU propagation for pose prediction "
+                        "(samples=%d, no external odometry delta)",
+                        curr_odom, imu_prediction->sample_count);
+                } else if (has_external_prediction || gt_rel_ptr != nullptr) {
+                    const Matrix4d T_err =
+                        predicted.inverse() * imu_prediction->pose;
+                    const double dt_m = T_err.block<3,1>(0,3).norm();
+                    const Eigen::AngleAxisd aa(T_err.block<3,3>(0,0));
+                    const double dr_deg = std::abs(aa.angle()) * 180.0 / M_PI;
+                    ROS_DEBUG("[gmmslam] X(%d) external-vs-IMU prediction "
+                              "delta: %.3fm %.2fdeg (%d imu samples)",
+                              curr_odom, dt_m, dr_deg,
+                              imu_prediction->sample_count);
+                }
+            }
+
             smoother_->addFrame(
                 prev_odom, curr_odom, stamp, predicted, gt_rel_ptr, imu_ptr,
-                cfg_.smoother.enable_external_odometry_factor);
+                cfg_.smoother.enable_external_odometry_factor,
+                imu_prediction.has_value() ? &imu_prediction->velocity : nullptr,
+                imu_prediction.has_value() ? &imu_prediction->bias : nullptr);
 
             last_smoother_stamp_ = stamp;
             has_last_smoother_stamp_ = true;

@@ -8,8 +8,12 @@ Panels:
         - /Grid1
         - /TF1
         - /DepthCloud1
+        - /GroundTruthPath1
         - /Odometry1
         - /LPFOdometry1
+        - /LoopClosures1
+        - /MarkerArray1
+        - /MarkerArray2
         - /MarkerArray3
       Splitter Ratio: 0.4514877200126648
     Tree Height: 954
@@ -41,7 +45,7 @@ Visualization Manager:
       Cell Size: 1
       Class: rviz/Grid
       Color: 160; 160; 164
-      Enabled: true
+      Enabled: false
       Line Style:
         Line Width: 0.029999999329447746
         Value: Lines
@@ -54,7 +58,7 @@ Visualization Manager:
       Plane: XY
       Plane Cell Count: 300
       Reference Frame: <Fixed Frame>
-      Value: true
+      Value: false
     - Class: rviz/TF
       Enabled: true
       Filter (blacklist): ""
@@ -66,10 +70,6 @@ Visualization Manager:
           Value: true
         m500_1_base_link:
           Value: true
-        map:
-          Value: true
-        world:
-          Value: true
       Marker Alpha: 1
       Marker Scale: 0.5
       Name: TF
@@ -77,11 +77,9 @@ Visualization Manager:
       Show Axes: true
       Show Names: true
       Tree:
-        map:
-          world:
-            m500_1_base_link:
-              depth_camera_1:
-                {}
+        m500_1_base_link:
+          depth_camera_1:
+            {}
       Update Interval: 0.10000000149011612
       Value: true
     - Alpha: 1
@@ -169,29 +167,29 @@ Visualization Manager:
       Use rainbow: false
       Value: false
     - Class: rviz/MarkerArray
-      Enabled: true
+      Enabled: false
       Marker Topic: /gmmslam_node/gmm_global_markers
       Name: GmmMap
       Namespaces:
         {}
       Queue Size: 1
-      Value: true
+      Value: false
     - Class: rviz/MarkerArray
       Enabled: true
       Marker Topic: /gmmslam_node/gmm_markers
       Name: GmmLatest
       Namespaces:
-        gmm_latest: true
+        {}
       Queue Size: 1
       Value: true
     - Class: rviz/MarkerArray
-      Enabled: true
+      Enabled: false
       Marker Topic: /gmmslam_node/global_graph_markers
       Name: SubmapGraph
       Namespaces:
-        global_submaps: true
+        {}
       Queue Size: 1
-      Value: true
+      Value: false
     - Class: rviz/MarkerArray
       Enabled: false
       Marker Topic: /gmmslam_node/graph_nodes
@@ -375,7 +373,7 @@ Visualization Manager:
       Marker Topic: /gmmslam_node/graph_nodes
       Name: MarkerArray
       Namespaces:
-        graph_nodes: true
+        {}
       Queue Size: 1
       Value: true
     - Class: rviz/MarkerArray
@@ -414,7 +412,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz/Orbit
-      Distance: 29.277767181396484
+      Distance: 33.17570495605469
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -430,9 +428,9 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 1.5697963237762451
+      Pitch: 0.6047969460487366
       Target Frame: m500_1_base_link
-      Yaw: 3.13539981842041
+      Yaw: 3.155400276184082
     Saved: ~
 Window Geometry:
   DepthImage:

@@ -285,11 +285,11 @@ imu:
 # ---------------------------------------------------------------------------
 visualization:
   gmm_marker_sigma:           3.0    # ellipsoid scale factor, number of standard deviations
-  global_gmm_markers_enable:  false   # show corrected global/submap GMM ellipsoid markers in RViz
+  global_gmm_markers_enable:  true   # show corrected global/submap GMM ellipsoid markers in RViz
   global_gmm_publish_period_s: 5.0   # [s]
-  d2d_frame_to_frame_text_enable:    true  # show frame-to-frame D2D score labels in RViz
-  d2d_submap_overlap_text_enable:    true  # show submap-overlap D2D score labels in RViz
-  d2d_loop_closure_text_enable:      true  # show loop-closure D2D score labels in RViz
+  d2d_frame_to_frame_text_enable:    false  # show frame-to-frame D2D score labels in RViz
+  d2d_submap_overlap_text_enable:    false  # show submap-overlap D2D score labels in RViz
+  d2d_loop_closure_text_enable:      false  # show loop-closure D2D score labels in RViz
   output_pose_lpf_cutoff_hz:  5.0    # [Hz] first-order low-pass published on odom_lpf (<=0 disables)
   map_cloud_publish_hz:     0.5     # accumulated raw map PointCloud2 rate
   map_cloud_max_chunks:     3000    # max smoother frames kept (oldest dropped)
