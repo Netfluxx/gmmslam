@@ -1,6 +1,6 @@
 # GMM-SLAM
 
-GMM-SLAM is a lidar / depth–driven SLAM stack that represents geometry with **Gaussian mixture models (GMMs)**, runs a **fixed-lag smoother** for high-rate poses, and maintains a **global submap pose graph** optimized with **GTSAM iSAM2**. Loop closure and submap alignment use **distribution-to-distribution (D2D)** GMM registration from the GIRA3D ecosystem.
+GMM-SLAM is a lidar / depth–driven SLAM stack that represents geometry with **Gaussian mixture models (GMMs)**, runs a **fixed-lag smoother** for high-rate poses, and maintains a **global submap pose graph** optimized with **GTSAM iSAM2**. Registration is done using GMM Distribution-to-Distribution registration from the GIRA3D ecosystem. Place recognition for loop closure is done using the SOLiD Descriptor.
 
 ---
 
