@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -29,6 +30,26 @@ geometry_msgs::PoseStamped poseToPoseStamped(
     const std::string& frame_id);
 
 Eigen::MatrixXf pc2ToEigen(const sensor_msgs::PointCloud2& msg);
+
+struct PreprocessedCloud {
+    std::shared_ptr<const Eigen::MatrixXf> points;
+    std::optional<OrganizedDepthImage> organized_depth;
+    int raw_valid_points = 0;
+};
+
+PreprocessedCloud preprocessPointCloud2(
+    const sensor_msgs::PointCloud2& msg,
+    double min_range,
+    double max_range,
+    double voxel_size,
+    int target_points,
+    bool build_organized_depth = false,
+    bool estimate_intrinsics = false,
+    double fx = 0.0,
+    double fy = 0.0,
+    double cx = -1.0,
+    double cy = -1.0,
+    double horizontal_fov_deg = 120.0);
 
 std::optional<OrganizedDepthImage> pc2ToOrganizedDepth(
     const sensor_msgs::PointCloud2& msg,

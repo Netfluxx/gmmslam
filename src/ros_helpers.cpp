@@ -285,6 +285,168 @@ std::optional<OrganizedDepthImage> pc2ToOrganizedDepth(
     return organized;
 }
 
+PreprocessedCloud preprocessPointCloud2(
+    const sensor_msgs::PointCloud2& msg,
+    double min_range,
+    double max_range,
+    double voxel_size,
+    int target_points,
+    bool build_organized_depth,
+    bool estimate_intrinsics,
+    double fx,
+    double fy,
+    double cx,
+    double cy,
+    double horizontal_fov_deg) {
+
+    PreprocessedCloud out;
+    const int n_points = static_cast<int>(msg.height * msg.width);
+    if (n_points == 0) {
+        out.points = std::make_shared<Eigen::MatrixXf>(0, 3);
+        return out;
+    }
+
+    std::optional<OrganizedDepthImage> organized;
+    if (build_organized_depth && msg.height > 1 && msg.width > 1) {
+        organized.emplace();
+        organized->depth =
+            Eigen::MatrixXf::Zero(static_cast<int>(msg.height),
+                                  static_cast<int>(msg.width));
+    }
+
+    const float min_r = static_cast<float>(min_range);
+    const float max_r = static_cast<float>(max_range);
+    const float min_r2 = min_r * min_r;
+    const float max_r2 = max_r * max_r;
+    const double depth_min_r = std::max(0.0, min_range);
+    const double depth_max_r = max_range > 0.0
+        ? max_range
+        : std::numeric_limits<double>::infinity();
+
+    const bool need_intrinsic_fit = organized.has_value() &&
+                                    estimate_intrinsics &&
+                                    !(fx > 0.0 && fy > 0.0);
+    double sum_u = 0.0, sum_u2 = 0.0, sum_xz = 0.0, sum_u_xz = 0.0;
+    double sum_v = 0.0, sum_v2 = 0.0, sum_yz = 0.0, sum_v_yz = 0.0;
+    int n_fit = 0;
+
+    Eigen::MatrixXf filtered(n_points, 3);
+    int filtered_count = 0;
+
+    sensor_msgs::PointCloud2ConstIterator<float> it_x(msg, "x");
+    sensor_msgs::PointCloud2ConstIterator<float> it_y(msg, "y");
+    sensor_msgs::PointCloud2ConstIterator<float> it_z(msg, "z");
+
+    for (uint32_t v = 0; v < msg.height; ++v) {
+        for (uint32_t u = 0; u < msg.width; ++u, ++it_x, ++it_y, ++it_z) {
+            const float x = *it_x;
+            const float y = *it_y;
+            const float z = *it_z;
+            if (!std::isfinite(x) || !std::isfinite(y) ||
+                !std::isfinite(z)) {
+                continue;
+            }
+            ++out.raw_valid_points;
+
+            const float range2 = x * x + y * y + z * z;
+            const bool min_ok = min_range <= 0.0 || range2 >= min_r2;
+            const bool max_ok = max_range >= 0.0 && range2 <= max_r2;
+            if (min_ok && max_ok) {
+                filtered(filtered_count, 0) = x;
+                filtered(filtered_count, 1) = y;
+                filtered(filtered_count, 2) = z;
+                ++filtered_count;
+            }
+
+            if (!organized.has_value() || x <= 0.0f) {
+                continue;
+            }
+
+            const double depth_m = static_cast<double>(x);
+            if (depth_m < depth_min_r || depth_m > depth_max_r) {
+                continue;
+            }
+
+            organized->depth(static_cast<int>(v), static_cast<int>(u)) = x;
+            ++organized->valid_points;
+
+            if (need_intrinsic_fit) {
+                const double du = static_cast<double>(u);
+                const double dv = static_cast<double>(v);
+                const double right_over_depth = -static_cast<double>(y) / x;
+                const double down_over_depth = -static_cast<double>(z) / x;
+                sum_u += du;
+                sum_u2 += du * du;
+                sum_xz += right_over_depth;
+                sum_u_xz += du * right_over_depth;
+                sum_v += dv;
+                sum_v2 += dv * dv;
+                sum_yz += down_over_depth;
+                sum_v_yz += dv * down_over_depth;
+                ++n_fit;
+            }
+        }
+    }
+
+    filtered.conservativeResize(filtered_count, 3);
+    filtered = voxelDownsample(filtered, voxel_size);
+    filtered = subsampleToMax(filtered, target_points);
+    out.points = std::make_shared<Eigen::MatrixXf>(std::move(filtered));
+
+    if (organized.has_value() && organized->valid_points >= 16) {
+        const double width = static_cast<double>(msg.width);
+        const double height = static_cast<double>(msg.height);
+        if (fx > 0.0 && fy > 0.0) {
+            organized->fx = fx;
+            organized->fy = fy;
+            organized->cx = (cx >= 0.0) ? cx : (width - 1.0) * 0.5;
+            organized->cy = (cy >= 0.0) ? cy : (height - 1.0) * 0.5;
+        } else if (!estimate_intrinsics) {
+            const double pi = std::acos(-1.0);
+            const double fov_rad =
+                std::clamp(horizontal_fov_deg, 1.0, 179.0) * pi / 180.0;
+            const double focal = width / (2.0 * std::tan(0.5 * fov_rad));
+            organized->fx = focal;
+            organized->fy = focal;
+            organized->cx = (cx >= 0.0) ? cx : (width - 1.0) * 0.5;
+            organized->cy = (cy >= 0.0) ? cy : (height - 1.0) * 0.5;
+        } else {
+            const double denom_u =
+                static_cast<double>(n_fit) * sum_u2 - sum_u * sum_u;
+            const double denom_v =
+                static_cast<double>(n_fit) * sum_v2 - sum_v * sum_v;
+            if (std::abs(denom_u) >= 1e-9 && std::abs(denom_v) >= 1e-9) {
+                const double ax =
+                    (static_cast<double>(n_fit) * sum_u_xz - sum_u * sum_xz) /
+                    denom_u;
+                const double bx =
+                    (sum_xz - ax * sum_u) / static_cast<double>(n_fit);
+                const double ay =
+                    (static_cast<double>(n_fit) * sum_v_yz - sum_v * sum_yz) /
+                    denom_v;
+                const double by =
+                    (sum_yz - ay * sum_v) / static_cast<double>(n_fit);
+                if (std::abs(ax) >= 1e-9 && std::abs(ay) >= 1e-9) {
+                    organized->fx = 1.0 / ax;
+                    organized->fy = 1.0 / ay;
+                    organized->cx = -bx / ax;
+                    organized->cy = -by / ay;
+                }
+            }
+        }
+
+        if (std::isfinite(organized->fx) && std::isfinite(organized->fy) &&
+            std::isfinite(organized->cx) && std::isfinite(organized->cy) &&
+            organized->fx > 0.0 && organized->fy > 0.0 &&
+            organized->cx >= -width && organized->cx <= 2.0 * width &&
+            organized->cy >= -height && organized->cy <= 2.0 * height) {
+            out.organized_depth = std::move(organized);
+        }
+    }
+
+    return out;
+}
+
 sensor_msgs::PointCloud2 eigenToPc2Rgb(
     const Eigen::MatrixXf& pts,
     const ros::Time& stamp,

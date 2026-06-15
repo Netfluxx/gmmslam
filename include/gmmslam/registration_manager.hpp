@@ -49,7 +49,7 @@ public:
 
     // Enqueue a GMM fit. Returns true if enqueued, false if dropped.
     bool enqueueFit(int frame_idx, const ros::Time& stamp,
-                    const Eigen::MatrixXf& pts,
+                    std::shared_ptr<const Eigen::MatrixXf> pts,
                     std::optional<OrganizedDepthImage> organized_depth,
                     double capture_t_sec, const Matrix4d& capture_pose);
 
@@ -99,7 +99,7 @@ private:
     struct FitJob {
         int frame_idx;
         ros::Time stamp;
-        Eigen::MatrixXf points;
+        std::shared_ptr<const Eigen::MatrixXf> points;
         std::optional<OrganizedDepthImage> organized_depth;
         double capture_t_sec;
         Matrix4d capture_pose;
@@ -240,6 +240,7 @@ private:
     double loop_closure_consistency_gate_trans_m_;
     double loop_closure_consistency_gate_rot_deg_;
     int max_sequential_odom_gap_;
+    bool d2d_frame_to_frame_markers_enable_;
     bool d2d_frame_to_frame_text_enable_;
     bool d2d_submap_overlap_text_enable_;
     bool d2d_loop_closure_text_enable_;

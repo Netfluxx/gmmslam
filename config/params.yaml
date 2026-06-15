@@ -13,6 +13,7 @@ ros:
   imu_topic:    "/m500_1/mavros/imu/data"
   sensor_frame: "depth_camera_1"
   odom_frame:   "world"
+  map_frame:    "map"
   base_frame:   "m500_1_base_link"
   odometry_input: "/gmmslam_node/noisy_gt_pose"  # PoseStamped
   restart_state_path: ""  # latest odom pose for respawn recovery (empty disables)
@@ -61,15 +62,15 @@ gmmap:
     measure_memory: false
     frame_alg_name: "spgf_extended"
     max_depth: 50.0
-    hell_thresh_squard_oversized_gau: 0.3
-    hell_thresh_squard_free: 0.07
-    hell_thresh_squard_obs_scale: 7.0
+    hell_thresh_squard_oversized_gau: 0.5
+    hell_thresh_squard_free: 0.1
+    hell_thresh_squard_obs_scale: 8.0
     min_gau_len: 0.035
     frame_max_scale: 120.0
     min_num_neighbor_clusters: 4
     hell_thresh_squard_min: 0.1e-5
-    gau_fusion_bd: 2.0
-    gau_rtree_bd: 2.0
+    gau_fusion_bd: 4.0
+    gau_rtree_bd: 4.0
     depth_scale: 1.0
     track_color: false
     track_intensity: false
@@ -139,6 +140,28 @@ registration:
   loop_sigma_t_max:          0.5
   loop_sigma_r_min:          0.06
   loop_sigma_r_max:          0.5
+  d2d:
+    sequential:
+      initial_score_fast_path: true
+      initial_score_margin: 0.05
+      coarse_max_iterations: 10
+      fine_refine_enable: false
+    loop:
+      initial_score_fast_path: false
+      coarse_max_iterations: 20
+      fine_refine_enable: true
+      fine_min_coarse_score: 0.5
+    submap:
+      initial_score_fast_path: true
+      coarse_max_iterations: 20
+      fine_refine_enable: true
+      fine_min_coarse_score: 0.5
+    objective_delta_stop: 1.0e-5
+    initial_trust_radius: 2.0
+    fine_objective_delta_stop: 1.0e-6
+    fine_max_iterations: 4
+    fine_initial_trust_radius: 0.25
+    hessian_damping: 1.0e-3
 
 # ---------------------------------------------------------------------------
 # Loop-closure detection
@@ -287,6 +310,7 @@ visualization:
   gmm_marker_sigma:           3.0    # ellipsoid scale factor, number of standard deviations
   global_gmm_markers_enable:  true   # show corrected global/submap GMM ellipsoid markers in RViz
   global_gmm_publish_period_s: 5.0   # [s]
+  d2d_frame_to_frame_markers_enable: false  # show yellow sequential D2D edge trail in RViz
   d2d_frame_to_frame_text_enable:    false  # show frame-to-frame D2D score labels in RViz
   d2d_submap_overlap_text_enable:    false  # show submap-overlap D2D score labels in RViz
   d2d_loop_closure_text_enable:      true  # show loop-closure D2D score labels in RViz

@@ -21,6 +21,7 @@
 #include <functional>
 #include <iomanip>
 #include <limits>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 
@@ -122,6 +123,7 @@ RegistrationManager::RegistrationManager(
       loop_closure_consistency_gate_trans_m_(lc_cfg.consistency_gate_trans_m),
       loop_closure_consistency_gate_rot_deg_(lc_cfg.consistency_gate_rot_deg),
       max_sequential_odom_gap_(reg_cfg.max_sequential_odom_gap),
+      d2d_frame_to_frame_markers_enable_(vis_cfg.d2d_frame_to_frame_markers_enable),
       d2d_frame_to_frame_text_enable_(vis_cfg.d2d_frame_to_frame_text_enable),
       d2d_submap_overlap_text_enable_(vis_cfg.d2d_submap_overlap_text_enable),
       d2d_loop_closure_text_enable_(vis_cfg.d2d_loop_closure_text_enable),
@@ -142,6 +144,15 @@ RegistrationManager::RegistrationManager(
 {
     std::filesystem::create_directories(gmm_dir_);
     initBenchmarkLogs(benchmark_log_dir);
+    if (!loop_closure_markers_pub_.getTopic().empty()) {
+        visualization_msgs::MarkerArray clear_arr;
+        visualization_msgs::Marker clear;
+        clear.header.frame_id = map_frame_;
+        clear.header.stamp = ros::Time::now();
+        clear.action = visualization_msgs::Marker::DELETEALL;
+        clear_arr.markers.push_back(std::move(clear));
+        loop_closure_markers_pub_.publish(clear_arr);
+    }
     ROS_INFO("[registration] GMM fitting backend requested: %s%s",
              sogmm_cfg_.backend.c_str(),
              gmmapFittingAvailable() ? " (GMMap adapter built)"
@@ -370,15 +381,21 @@ void RegistrationManager::submitKeyframeDescriptor(int frame_idx,
 // ---------------------------------------------------------------------------
 
 bool RegistrationManager::enqueueFit(int frame_idx, const ros::Time& stamp,
-                                      const Eigen::MatrixXf& pts,
+                                      std::shared_ptr<const Eigen::MatrixXf> pts,
                                       std::optional<OrganizedDepthImage> organized_depth,
                                       double capture_t_sec,
                                       const Matrix4d& capture_pose)
 {
+    if (!pts) {
+        ++dropped_fit_frames;
+        ROS_WARN("[registration][DBG] enqueueFit X(%d) dropped null cloud",
+                 frame_idx);
+        return false;
+    }
     const std::size_t qsize_before = fit_queue_.size();
     ROS_INFO("[registration][DBG] enqueueFit ENTER X(%d) pts=%ld "
              "queue_depth=%zu",
-             frame_idx, static_cast<long>(pts.rows()), qsize_before);
+             frame_idx, static_cast<long>(pts->rows()), qsize_before);
     FitJob job{frame_idx, stamp, pts, organized_depth,
                capture_t_sec, capture_pose};
 
@@ -426,11 +443,14 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
         const std::size_t qsize_after_pop = fit_queue_.size();
         ROS_INFO("[registration][DBG] fit START X(%d) pts=%ld "
                  "queue_depth_after_pop=%zu",
-                 fid, static_cast<long>(job.points.rows()),
+                 fid, static_cast<long>(job.points ? job.points->rows() : 0),
                  qsize_after_pop);
         const auto t0 = std::chrono::steady_clock::now();
         bool finish_ok = false;
         try {
+            if (!job.points) {
+                throw std::runtime_error("fit job has null point cloud");
+            }
             const std::string backend = lowercase(sogmm_cfg_.backend);
             GmmModel model;
             std::string backend_used = "sogmm";
@@ -447,25 +467,25 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
                         !gmmapFittingAvailable()
                             ? "GMMap is not built"
                             : "organized depth is unavailable");
-                    model = fitSogmm(job.points, sogmm_cfg_);
+                    model = fitSogmm(*job.points, sogmm_cfg_);
                 }
             } else {
-                model = fitSogmm(job.points, sogmm_cfg_);
+                model = fitSogmm(*job.points, sogmm_cfg_);
             }
             const auto t1 = std::chrono::steady_clock::now();
             const double dt_ms =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
             ROS_INFO("[registration][DBG] fit DONE  X(%d) backend=%s pts=%ld K=%d "
                      "elapsed_ms=%.1f",
-                     fid, backend_used.c_str(), static_cast<long>(job.points.rows()),
+                     fid, backend_used.c_str(), static_cast<long>(job.points->rows()),
                      model.numComponents(), dt_ms);
             ROS_INFO("[timing][gmm_fit] X(%d) backend=%s pts=%ld K=%d "
                      "elapsed_ms=%.3f",
-                     fid, backend_used.c_str(), static_cast<long>(job.points.rows()),
+                     fid, backend_used.c_str(), static_cast<long>(job.points->rows()),
                      model.numComponents(), dt_ms);
             if (model.numComponents() > 0) {
                 logGmmFitTiming(job.stamp.toSec(), fid, backend_used,
-                                static_cast<int>(job.points.rows()),
+                                static_cast<int>(job.points->rows()),
                                 model.numComponents(), qsize_after_pop,
                                 dt_ms, true, "fit_ok");
                 finishFit(model, job.frame_idx, job.stamp,
@@ -475,10 +495,10 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
                 ROS_WARN(
                     "[registration][DBG] GMM fit returned EMPTY model "
                     "for frame %d pts=%ld elapsed_ms=%.1f",
-                    fid, static_cast<long>(job.points.rows()),
+                    fid, static_cast<long>(job.points->rows()),
                     dt_ms);
                 logGmmFitTiming(job.stamp.toSec(), fid, backend_used,
-                                static_cast<int>(job.points.rows()),
+                                static_cast<int>(job.points->rows()),
                                 0, qsize_after_pop, dt_ms, false,
                                 "empty_model");
             }
@@ -489,10 +509,10 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
             ROS_ERROR(
                 "[registration][DBG] fit THROW X(%d) pts=%ld elapsed_ms=%.1f "
                 "what=%s",
-                fid, static_cast<long>(job.points.rows()), dt_ms,
+                fid, static_cast<long>(job.points ? job.points->rows() : 0), dt_ms,
                 e.what());
             logGmmFitTiming(job.stamp.toSec(), fid, "unknown",
-                            static_cast<int>(job.points.rows()), 0,
+                            static_cast<int>(job.points ? job.points->rows() : 0), 0,
                             qsize_after_pop, dt_ms, false,
                             std::string("exception:") + e.what());
         }
@@ -1116,7 +1136,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
         if (curr_idx > last_loop_accepted_idx_) {
             last_loop_accepted_idx_ = curr_idx;
         }
-    } else {
+    } else if (d2d_frame_to_frame_markers_enable_) {
         Vector3d p_prev = Vector3d::Zero();
         Vector3d p_curr = Vector3d::Zero();
         bool have_positions = false;

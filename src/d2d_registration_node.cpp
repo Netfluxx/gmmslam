@@ -15,9 +15,13 @@
 #include <cstdio>
 #include <deque>
 #include <filesystem>
+#include <list>
+#include <limits>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <fcntl.h>
@@ -84,6 +88,7 @@ public:
         nh.param("/gmmslam/DEBUG_PRINTS", debug_prints_, debug_prints_);
         pnh.param<bool>("debug_prints", debug_prints_, debug_prints_);
         applyDebugPrints(debug_prints_);
+        loadD2DOptions(nh, pnh);
 
         result_pub_ = nh.advertise<std_msgs::String>(result_topic, 50);
 
@@ -109,6 +114,30 @@ public:
                  loop_prior_gate_trans_m_,
                  loop_prior_gate_rot_deg_,
                  debug_prints_ ? "true" : "false");
+        ROS_INFO("[d2d_reg] d2d_options | "
+                 "seq(fast=%s margin=%.3f coarse_iter=%lu fine=%s) | "
+                 "loop(fast=%s coarse_iter=%lu fine=%s fine_min=%.3f) | "
+                 "submap(fast=%s coarse_iter=%lu fine=%s fine_min=%.3f) | "
+                 "delta_stop=%.1e fine_delta_stop=%.1e trust=%.2f fine_trust=%.2f "
+                 "fine_iter=%lu hessian_damping=%.1e",
+                 sequential_d2d_options_.initial_score_fast_path ? "true" : "false",
+                 sequential_d2d_options_.initial_score_margin,
+                 sequential_d2d_options_.coarse_max_iterations,
+                 sequential_d2d_options_.fine_refine_enable ? "true" : "false",
+                 loop_d2d_options_.initial_score_fast_path ? "true" : "false",
+                 loop_d2d_options_.coarse_max_iterations,
+                 loop_d2d_options_.fine_refine_enable ? "true" : "false",
+                 loop_d2d_options_.fine_min_coarse_score,
+                 submap_d2d_options_.initial_score_fast_path ? "true" : "false",
+                 submap_d2d_options_.coarse_max_iterations,
+                 submap_d2d_options_.fine_refine_enable ? "true" : "false",
+                 submap_d2d_options_.fine_min_coarse_score,
+                 sequential_d2d_options_.objective_delta_stop,
+                 sequential_d2d_options_.fine_objective_delta_stop,
+                 sequential_d2d_options_.initial_trust_radius,
+                 sequential_d2d_options_.fine_initial_trust_radius,
+                 sequential_d2d_options_.fine_max_iterations,
+                 sequential_d2d_options_.hessian_damping);
     }
 
     ~D2DRegistrationNode() {
@@ -124,6 +153,60 @@ public:
 
 private:
     static constexpr std::size_t kMaxQueueSize = 64;
+    static constexpr std::size_t kGmmCacheCapacity = 128;
+
+    class GmmLruCache {
+    public:
+        explicit GmmLruCache(std::size_t capacity) : capacity_(capacity) {}
+
+        std::shared_ptr<const gmm_utils::GMM3f> get(const std::string& path,
+                                                    bool isoplanar) {
+            const std::string key =
+                std::filesystem::absolute(path).lexically_normal().string();
+            std::lock_guard<std::mutex> lk(mutex_);
+
+            auto it = entries_.find(key);
+            if (it != entries_.end()) {
+                lru_.splice(lru_.begin(), lru_, it->second.lru_it);
+                ++hits_;
+                return it->second.model;
+            }
+
+            auto model_ptr = std::make_shared<gmm_utils::GMM3f>();
+            model_ptr->load(key);
+            if (isoplanar) {
+                model_ptr->makeCovsIsoplanar();
+            }
+            lru_.push_front(key);
+            entries_.emplace(key, Entry{model_ptr, lru_.begin()});
+            ++misses_;
+
+            while (entries_.size() > capacity_ && !lru_.empty()) {
+                entries_.erase(lru_.back());
+                lru_.pop_back();
+            }
+
+            ROS_DEBUG_THROTTLE(
+                10.0,
+                "[d2d_reg] %s GMM cache size=%zu hits=%zu misses=%zu",
+                isoplanar ? "isoplanar" : "normal",
+                entries_.size(), hits_, misses_);
+            return model_ptr;
+        }
+
+    private:
+        struct Entry {
+            std::shared_ptr<const gmm_utils::GMM3f> model;
+            std::list<std::string>::iterator lru_it;
+        };
+
+        std::size_t capacity_;
+        std::mutex mutex_;
+        std::list<std::string> lru_;
+        std::unordered_map<std::string, Entry> entries_;
+        std::size_t hits_ = 0;
+        std::size_t misses_ = 0;
+    };
 
     class ScopedBackendOutputSilencer {
     public:
@@ -197,6 +280,119 @@ private:
             stamp = 0.0;
             return false;
         }
+    }
+
+    static void readDoubleParam(ros::NodeHandle& nh,
+                                ros::NodeHandle& pnh,
+                                const std::string& absolute_key,
+                                const std::string& private_key,
+                                double& value) {
+        nh.param<double>(absolute_key, value, value);
+        pnh.param<double>(private_key, value, value);
+    }
+
+    static void readBoolParam(ros::NodeHandle& nh,
+                              ros::NodeHandle& pnh,
+                              const std::string& absolute_key,
+                              const std::string& private_key,
+                              bool& value) {
+        nh.param<bool>(absolute_key, value, value);
+        pnh.param<bool>(private_key, value, value);
+    }
+
+    static void readUnsignedParam(ros::NodeHandle& nh,
+                                  ros::NodeHandle& pnh,
+                                  const std::string& absolute_key,
+                                  const std::string& private_key,
+                                  unsigned long& value) {
+        int parsed = static_cast<int>(std::min<unsigned long>(
+            value, static_cast<unsigned long>(std::numeric_limits<int>::max())));
+        nh.param<int>(absolute_key, parsed, parsed);
+        pnh.param<int>(private_key, parsed, parsed);
+        value = static_cast<unsigned long>(std::max(1, parsed));
+    }
+
+    static void loadModeOptions(ros::NodeHandle& nh,
+                                ros::NodeHandle& pnh,
+                                const std::string& mode,
+                                gmmslam::D2DRegistrationOptions& options) {
+        const std::string absolute_prefix =
+            "/gmmslam/registration/d2d/" + mode + "/";
+        const std::string private_prefix = "d2d_" + mode + "_";
+
+        readBoolParam(nh, pnh,
+                      absolute_prefix + "initial_score_fast_path",
+                      private_prefix + "initial_score_fast_path",
+                      options.initial_score_fast_path);
+        readDoubleParam(nh, pnh,
+                        absolute_prefix + "initial_score_margin",
+                        private_prefix + "initial_score_margin",
+                        options.initial_score_margin);
+        readUnsignedParam(nh, pnh,
+                          absolute_prefix + "coarse_max_iterations",
+                          private_prefix + "coarse_max_iterations",
+                          options.coarse_max_iterations);
+        readBoolParam(nh, pnh,
+                      absolute_prefix + "fine_refine_enable",
+                      private_prefix + "fine_refine_enable",
+                      options.fine_refine_enable);
+        readDoubleParam(nh, pnh,
+                        absolute_prefix + "fine_min_coarse_score",
+                        private_prefix + "fine_min_coarse_score",
+                        options.fine_min_coarse_score);
+    }
+
+    void loadD2DOptions(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
+        gmmslam::D2DRegistrationOptions base;
+        readDoubleParam(nh, pnh,
+                        "/gmmslam/registration/d2d/objective_delta_stop",
+                        "d2d_objective_delta_stop",
+                        base.objective_delta_stop);
+        readDoubleParam(nh, pnh,
+                        "/gmmslam/registration/d2d/initial_trust_radius",
+                        "d2d_initial_trust_radius",
+                        base.initial_trust_radius);
+        readDoubleParam(nh, pnh,
+                        "/gmmslam/registration/d2d/fine_objective_delta_stop",
+                        "d2d_fine_objective_delta_stop",
+                        base.fine_objective_delta_stop);
+        readUnsignedParam(nh, pnh,
+                          "/gmmslam/registration/d2d/fine_max_iterations",
+                          "d2d_fine_max_iterations",
+                          base.fine_max_iterations);
+        readDoubleParam(nh, pnh,
+                        "/gmmslam/registration/d2d/fine_initial_trust_radius",
+                        "d2d_fine_initial_trust_radius",
+                        base.fine_initial_trust_radius);
+        readDoubleParam(nh, pnh,
+                        "/gmmslam/registration/d2d/hessian_damping",
+                        "d2d_hessian_damping",
+                        base.hessian_damping);
+
+        sequential_d2d_options_ = base;
+        sequential_d2d_options_.initial_score_fast_path = true;
+        sequential_d2d_options_.initial_score_margin = 0.05;
+        sequential_d2d_options_.coarse_max_iterations = 10;
+        sequential_d2d_options_.fine_refine_enable = false;
+
+        loop_d2d_options_ = base;
+        loop_d2d_options_.initial_score_fast_path = false;
+        loop_d2d_options_.coarse_max_iterations = 20;
+        loop_d2d_options_.fine_refine_enable = true;
+        loop_d2d_options_.fine_min_coarse_score = 0.5;
+
+        submap_d2d_options_ = loop_d2d_options_;
+
+        loadModeOptions(nh, pnh, "sequential", sequential_d2d_options_);
+        loadModeOptions(nh, pnh, "loop", loop_d2d_options_);
+        loadModeOptions(nh, pnh, "submap", submap_d2d_options_);
+    }
+
+    gmmslam::D2DRegistrationOptions optionsForRequest(bool is_loop,
+                                                      bool is_submap) const {
+        if (is_submap) return submap_d2d_options_;
+        if (is_loop) return loop_d2d_options_;
+        return sequential_d2d_options_;
     }
 
     void requestCallback(const std_msgs::String::ConstPtr& msg) {
@@ -325,6 +521,11 @@ private:
             const std::string target_path = req["target_path"].get<std::string>();
             const bool is_loop = req.value("is_loop_closure", false);
             const bool is_submap = req.value("is_submap_registration", false);
+            const double active_score_threshold =
+                is_loop ? loop_score_threshold_ : score_threshold_;
+            gmmslam::D2DRegistrationOptions d2d_options =
+                optionsForRequest(is_loop, is_submap);
+            d2d_options.initial_score_threshold = active_score_threshold;
             ROS_INFO("[d2d_reg] %s request start | prev=%d curr=%d",
                      requestTag(is_loop, is_submap).c_str(), prev_idx, curr_idx);
 
@@ -427,11 +628,21 @@ private:
                 // is process-wide, so serialize backend calls while silencing is on.
                 std::lock_guard<std::mutex> lk(backend_call_mutex_);
                 ScopedBackendOutputSilencer silence(true);
+                const auto source_iso =
+                    isoplanar_gmm_cache_.get(source_path, true);
+                const auto target_iso =
+                    isoplanar_gmm_cache_.get(target_path, true);
                 iso_result =
-                    gmmslam::isoplanarRegistration(T_init, source_path, target_path);
+                    gmmslam::isoplanarRegistration(
+                        T_init, *source_iso, *target_iso, d2d_options);
             } else {
+                const auto source_iso =
+                    isoplanar_gmm_cache_.get(source_path, true);
+                const auto target_iso =
+                    isoplanar_gmm_cache_.get(target_path, true);
                 iso_result =
-                    gmmslam::isoplanarRegistration(T_init, source_path, target_path);
+                    gmmslam::isoplanarRegistration(
+                        T_init, *source_iso, *target_iso, d2d_options);
             }
             if (!has_initial_transform) {
                 T_iso = iso_result.transform;
@@ -446,18 +657,23 @@ private:
                 T_iso = T_init;
             }
 
-            const double active_score_threshold =
-                is_loop ? loop_score_threshold_ : score_threshold_;
-
             auto run_anisotropic = [&](const Eigen::Matrix4f& seed) {
                 if (suppress_backend_output_) {
                     std::lock_guard<std::mutex> lk(backend_call_mutex_);
                     ScopedBackendOutputSilencer silence(true);
+                    const auto source_gmm =
+                        normal_gmm_cache_.get(source_path, false);
+                    const auto target_gmm =
+                        normal_gmm_cache_.get(target_path, false);
                     return gmmslam::anisotropicRegistration(
-                        seed, source_path, target_path);
+                        seed, *source_gmm, *target_gmm, d2d_options);
                 }
+                const auto source_gmm =
+                    normal_gmm_cache_.get(source_path, false);
+                const auto target_gmm =
+                    normal_gmm_cache_.get(target_path, false);
                 return gmmslam::anisotropicRegistration(
-                    seed, source_path, target_path);
+                    seed, *source_gmm, *target_gmm, d2d_options);
             };
 
             // Step 2: anisotropic registration. Loop closures try the latest-pose
@@ -505,6 +721,14 @@ private:
                         result["initial_transform"] = std::move(flat);
                     }
                 }
+            }
+
+            if (aniso_result.initial_score_fast_path_used) {
+                const int hits = ++d2d_fast_path_hits_;
+                ROS_DEBUG_THROTTLE(
+                    5.0,
+                    "[d2d_reg] initial-score fast-path hits=%d",
+                    hits);
             }
 
             {
@@ -645,6 +869,10 @@ private:
     double loop_prior_gate_trans_m_ = 3.0;
     double loop_prior_gate_rot_deg_ = 45.0;
     bool debug_prints_ = true;
+    gmmslam::D2DRegistrationOptions sequential_d2d_options_;
+    gmmslam::D2DRegistrationOptions loop_d2d_options_;
+    gmmslam::D2DRegistrationOptions submap_d2d_options_;
+    std::atomic<int> d2d_fast_path_hits_{0};
 
     bool running_ = true;
     std::mutex queue_mutex_;
@@ -654,6 +882,8 @@ private:
     std::deque<std::string> submap_queue_;
     std::deque<std::string> sequential_queue_;
     std::vector<std::thread> workers_;
+    GmmLruCache normal_gmm_cache_{kGmmCacheCapacity};
+    GmmLruCache isoplanar_gmm_cache_{kGmmCacheCapacity};
 };
 
 int main(int argc, char** argv) {

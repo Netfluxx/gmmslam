@@ -436,11 +436,17 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("global_gmm_markers_enable",   cfg_.visualization.global_gmm_markers_enable, true);
         pnh.param("global_gmm_publish_period_s",  cfg_.visualization.global_gmm_publish_period_s, 1.0);
         pnh.param("d2d_frame_to_frame_text_enable",
-                  cfg_.visualization.d2d_frame_to_frame_text_enable, true);
+                  cfg_.visualization.d2d_frame_to_frame_text_enable,
+                  cfg_.visualization.d2d_frame_to_frame_text_enable);
+        pnh.param("d2d_frame_to_frame_markers_enable",
+                  cfg_.visualization.d2d_frame_to_frame_markers_enable,
+                  cfg_.visualization.d2d_frame_to_frame_markers_enable);
         pnh.param("d2d_submap_overlap_text_enable",
-                  cfg_.visualization.d2d_submap_overlap_text_enable, true);
+                  cfg_.visualization.d2d_submap_overlap_text_enable,
+                  cfg_.visualization.d2d_submap_overlap_text_enable);
         pnh.param("d2d_loop_closure_text_enable",
-                  cfg_.visualization.d2d_loop_closure_text_enable, true);
+                  cfg_.visualization.d2d_loop_closure_text_enable,
+                  cfg_.visualization.d2d_loop_closure_text_enable);
         pnh.param("output_pose_lpf_cutoff_hz",   cfg_.visualization.output_pose_lpf_cutoff_hz, 0.0);
         pnh.param("map_cloud_publish_hz",        cfg_.visualization.map_cloud_publish_hz, 0.5);
         pnh.param("map_cloud_max_chunks",        cfg_.visualization.map_cloud_max_chunks, 3000);
@@ -1205,29 +1211,29 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
 
         // 1. Convert & preprocess
         const auto preprocess_t0 = std::chrono::steady_clock::now();
-        std::optional<OrganizedDepthImage> organized_depth;
-        if (cfg_.sogmm.backend == "gmmap" || cfg_.sogmm.backend == "GMMap") {
-            organized_depth = pc2ToOrganizedDepth(
-                *msg, cfg_.preprocess.min_range, cfg_.preprocess.max_range,
-                cfg_.sogmm.gmmap_estimate_intrinsics,
-                cfg_.sogmm.gmmap_fx, cfg_.sogmm.gmmap_fy,
-                cfg_.sogmm.gmmap_cx, cfg_.sogmm.gmmap_cy,
-                cfg_.sogmm.gmmap_horizontal_fov_deg);
-        }
-        Eigen::MatrixXf pts = pc2ToEigen(*msg);
-        if (pts.rows() == 0) {
+        const bool build_organized_depth =
+            cfg_.sogmm.backend == "gmmap" || cfg_.sogmm.backend == "GMMap";
+        PreprocessedCloud cloud = preprocessPointCloud2(
+            *msg,
+            cfg_.preprocess.min_range,
+            cfg_.preprocess.max_range,
+            cfg_.preprocess.voxel_leaf_size,
+            cfg_.preprocess.target_points,
+            build_organized_depth,
+            cfg_.sogmm.gmmap_estimate_intrinsics,
+            cfg_.sogmm.gmmap_fx, cfg_.sogmm.gmmap_fy,
+            cfg_.sogmm.gmmap_cx, cfg_.sogmm.gmmap_cy,
+            cfg_.sogmm.gmmap_horizontal_fov_deg);
+        const auto pts = cloud.points;
+        if (!pts || pts->rows() == 0) {
             ROS_WARN_THROTTLE(5.0,
                 "[gmmslam] received empty point cloud, skipping");
             return;
         }
-        pts = preprocess(pts, cfg_.preprocess.min_range,
-                         cfg_.preprocess.max_range,
-                         cfg_.preprocess.voxel_leaf_size,
-                         cfg_.preprocess.target_points);
-        if (pts.rows() < cfg_.preprocess.min_points) {
+        if (pts->rows() < cfg_.preprocess.min_points) {
             ROS_WARN_THROTTLE(5.0,
                 "[gmmslam] only %d points after filtering, skipping",
-                static_cast<int>(pts.rows()));
+                static_cast<int>(pts->rows()));
             return;
         }
         const auto preprocess_t1 = std::chrono::steady_clock::now();
@@ -1368,7 +1374,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
                 ROS_INFO("[gmmslam][DBG] NEW KEYFRAME X(%d) "
                          "keyframe_count=%d pts=%ld",
                          curr_odom, keyframe_count_,
-                         static_cast<long>(pts.rows()));
+                         static_cast<long>(pts->rows()));
 
                 global_graph_->updateWithKeyframe(
                     curr_odom, stamp, T_curr, stampToSec(stamp));
@@ -1376,7 +1382,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
                 // SOLiD descriptor first — cheap and synchronous — so that
                 // the subsequent async GMM fit's loop search (triggered
                 // from finishFit) can already query by appearance.
-                registration_->submitKeyframeDescriptor(curr_odom, pts);
+                registration_->submitKeyframeDescriptor(curr_odom, *pts);
 
                 const bool gate_async  = cfg_.registration.enable_async;
                 const bool gate_modulo =
@@ -1396,7 +1402,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
                 {
                     const double capture_t = stampToSec(stamp);
                     const bool ok = registration_->enqueueFit(
-                        curr_odom, stamp, pts, organized_depth,
+                        curr_odom, stamp, pts, cloud.organized_depth,
                         capture_t, T_curr);
                     ROS_INFO("[gmmslam][DBG] enqueueFit result X(%d) ok=%d",
                              curr_odom, ok ? 1 : 0);
@@ -1444,7 +1450,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         }
         logBenchmarkFrame(stampToSec(stamp), frame_count_, smoother_pose_key,
                           is_smoother_frame, keyframe_created,
-                          static_cast<int>(pts.rows()), preprocess_ms,
+                          static_cast<int>(pts->rows()), preprocess_ms,
                           callback_ms, T_lpf, T_map, T_pub,
                           currentGtPoseOdomFrame(stamp));
 

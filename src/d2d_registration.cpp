@@ -18,19 +18,22 @@ constexpr int kNumDims = 3;
 constexpr float kInitialInflation = 0.3f * 0.3f;
 constexpr float kFineInitialInflation = 0.03f * 0.03f;
 constexpr float kGateRadiusMultiplierSq = 16.0f;
-constexpr double kD2DObjectiveDeltaStop = 1e-5;
-constexpr unsigned long kD2DMaxIterations = 20;
-constexpr double kD2DInitialTrustRadius = 2.0;
-constexpr double kD2DFineObjectiveDeltaStop = 1e-6;
-constexpr unsigned long kD2DFineMaxIterations = 4;
-constexpr double kD2DFineInitialTrustRadius = 0.25;
-constexpr float kFineRefineMinCoarseScore = 0.5f;
 constexpr float kTranslationPriorWeight = 0.0f;
 constexpr float kRotationPriorWeight = 2.5f;
 constexpr float kPi32 = 1.0f / (2.0f * static_cast<float>(M_PI) *
                                 std::sqrt(2.0f * static_cast<float>(M_PI)));
 
 using ColumnVector = dlib::matrix<float, 0, 1>;
+
+struct CachedComponent {
+    Eigen::Vector3f mean = Eigen::Vector3f::Zero();
+    Eigen::Matrix3f covariance = Eigen::Matrix3f::Identity();
+    float trace = 0.0f;
+    float weight = 0.0f;
+    bool valid = false;
+};
+
+using ComponentCache = std::vector<CachedComponent>;
 
 Eigen::Transform<float, 3, Eigen::Affine, Eigen::ColMajor>
 toAffine(const Eigen::Matrix4f& T) {
@@ -62,6 +65,27 @@ Eigen::Matrix3f covarianceFromColumn(const Eigen::MatrixXf& covs,
                                      std::uint32_t k) {
     return Eigen::Map<const Eigen::Matrix3f>(covs.col(k).data(),
                                              kNumDims, kNumDims);
+}
+
+ComponentCache buildComponentCache(const gmm_utils::GMM3f& gmm) {
+    ComponentCache cache;
+    const std::uint32_t n = gmm.getNClusters();
+    cache.reserve(static_cast<std::size_t>(n));
+    const auto& weights = gmm.getWeights();
+    const auto& covs = gmm.getCovs();
+    const auto& means = gmm.getMeans();
+    for (std::uint32_t k = 0; k < n; ++k) {
+        CachedComponent c;
+        c.mean = means.col(k);
+        c.covariance = covarianceFromColumn(covs, k);
+        c.trace = c.covariance.trace();
+        c.weight = weights(k);
+        c.valid = c.mean.allFinite() && c.covariance.allFinite() &&
+                  std::isfinite(c.trace) && std::isfinite(c.weight) &&
+                  c.weight > 0.0f;
+        cache.push_back(c);
+    }
+    return cache;
 }
 
 bool inverseAndDeterminant(const Eigen::Matrix3f& S,
@@ -99,16 +123,18 @@ public:
                          const gmm_utils::GMM3f& target_gmm,
                          const Eigen::Vector3f& translation_prior,
                          const Eigen::Vector3f& rotation_prior_u,
+                         const D2DRegistrationOptions& options,
                          float initial_inflation = kInitialInflation)
-        : source_gmm_(source_gmm),
-          target_gmm_(target_gmm),
+        : source_cache_(buildComponentCache(source_gmm)),
+          target_cache_(buildComponentCache(target_gmm)),
           translation_prior_(translation_prior),
           rotation_prior_u_(rotation_prior_u),
+          options_(options),
           initial_inflation_(initial_inflation),
           inflation_factor_(initial_inflation) {
         const Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
         const Eigen::Vector3f t = Eigen::Vector3f::Zero();
-        Et_ = rawScore(R, t, target_gmm_, target_gmm_, 1.0f,
+        Et_ = rawScore(R, t, target_cache_, target_cache_, 1.0f,
                        inflation_factor_);
         if (!std::isfinite(Et_) || Et_ <= std::numeric_limits<float>::min()) {
             Et_ = 1.0f;
@@ -120,7 +146,7 @@ public:
         const Eigen::Vector3f u(x(3), x(4), x(5));
         const float d2d_score =
             rawScore(rotationFromAxisAngleVector(u), t,
-                     target_gmm_, source_gmm_, Et_, inflation_factor_);
+                     target_cache_, source_cache_, Et_, inflation_factor_);
 
         const Eigen::Vector3f trans_delta = t - translation_prior_;
         const Eigen::Vector3f rot_delta = u - rotation_prior_u_;
@@ -133,7 +159,6 @@ public:
                                     column_vector& der,
                                     general_matrix& hess) const {
         constexpr int n = 6;
-        const float f0 = (*this)(x);
         der.set_size(n);
         hess.set_size(n, n);
         for (int r = 0; r < n; ++r) {
@@ -142,21 +167,8 @@ public:
                 hess(r, c) = 0.0f;
             }
         }
-
-        float step[n] = {1e-3f, 1e-3f, 1e-3f, 1e-4f, 1e-4f, 1e-4f};
-        float f_plus[n];
-        float f_minus[n];
-
         for (int i = 0; i < n; ++i) {
-            column_vector xp = x;
-            column_vector xm = x;
-            xp(i) += step[i];
-            xm(i) -= step[i];
-            f_plus[i] = (*this)(xp);
-            f_minus[i] = (*this)(xm);
-            der(i) = (f_plus[i] - f_minus[i]) / (2.0f * step[i]);
-            hess(i, i) = (f_plus[i] - 2.0f * f0 + f_minus[i]) /
-                         (step[i] * step[i]);
+            hess(i, i) = -1.0f;
         }
 
         const Eigen::Vector3f t(x(0), x(1), x(2));
@@ -173,14 +185,8 @@ public:
         Eigen::Matrix<float, 6, 6> unused_full_hess =
             Eigen::Matrix<float, 6, 6>::Zero();
         corrGradHess(R, t,
-                     target_gmm_.getNClusters(),
-                     source_gmm_.getNClusters(),
-                     target_gmm_.getWeights(),
-                     source_gmm_.getWeights(),
-                     target_gmm_.getCovs(),
-                     source_gmm_.getCovs(),
-                     target_gmm_.getMeans(),
-                     source_gmm_.getMeans(),
+                     target_cache_,
+                     source_cache_,
                      Et_,
                      dRdu, d2Rdu2,
                      false,
@@ -200,20 +206,11 @@ public:
 private:
     static float rawScore(const Eigen::Matrix3f& R,
                           const Eigen::Vector3f& t,
-                          const gmm_utils::GMM3f& target_gmm,
-                          const gmm_utils::GMM3f& source_gmm,
+                          const ComponentCache& target_gmm,
+                          const ComponentCache& source_gmm,
                           float normalizer,
                           float inflation_factor) {
-        const std::uint32_t Nm = target_gmm.getNClusters();
-        const std::uint32_t Nk = source_gmm.getNClusters();
-        const auto& wm = target_gmm.getWeights();
-        const auto& wk = source_gmm.getWeights();
-        const auto& Lm = target_gmm.getCovs();
-        const auto& Omk = source_gmm.getCovs();
-        const auto& mu_m = target_gmm.getMeans();
-        const auto& nu_k = source_gmm.getMeans();
-
-        if (Nm == 0 || Nk == 0 || normalizer == 0.0f) {
+        if (target_gmm.empty() || source_gmm.empty() || normalizer == 0.0f) {
             return 0.0f;
         }
 
@@ -221,13 +218,19 @@ private:
             Eigen::Matrix3f::Identity() * inflation_factor;
         float score = 0.0f;
 
-        for (std::uint32_t m = 0; m < Nm; ++m) {
-            const Eigen::Matrix3f L = covarianceFromColumn(Lm, m);
-            const Eigen::Vector3f mu = mu_m.col(m);
-            for (std::uint32_t k = 0; k < Nk; ++k) {
-                const Eigen::Matrix3f Om = covarianceFromColumn(Omk, k);
-                const Eigen::Vector3f nu = nu_k.col(k);
-                const float w = wm(m) * wk(k);
+        for (const auto& cm : target_gmm) {
+            if (!cm.valid) {
+                continue;
+            }
+            const Eigen::Matrix3f& L = cm.covariance;
+            const Eigen::Vector3f& mu = cm.mean;
+            for (const auto& ck : source_gmm) {
+                if (!ck.valid) {
+                    continue;
+                }
+                const Eigen::Matrix3f& Om = ck.covariance;
+                const Eigen::Vector3f& nu = ck.mean;
+                const float w = cm.weight * ck.weight;
                 if (!std::isfinite(w) || w <= 0.0f) {
                     continue;
                 }
@@ -236,7 +239,7 @@ private:
                 const Eigen::Vector3f y = mu - Rnu - t;
 
                 const float radius2 = std::max(
-                    L.trace() + Om.trace(),
+                    cm.trace + ck.trace,
                     std::numeric_limits<float>::epsilon());
                 if (y.squaredNorm() > kGateRadiusMultiplierSq * radius2) {
                     continue;
@@ -268,18 +271,11 @@ private:
         return score;
     }
 
-    template <typename WeightVectorM, typename WeightVectorK>
     void corrGradHess(
         const Eigen::Matrix3f& R,
         const Eigen::Vector3f& t,
-        std::uint32_t Nm,
-        std::uint32_t Nk,
-        const WeightVectorM& wm,
-        const WeightVectorK& wk,
-        const Eigen::MatrixXf& Lm,
-        const Eigen::MatrixXf& Omk,
-        const Eigen::MatrixXf& mu_m,
-        const Eigen::MatrixXf& nu_k,
+        const ComponentCache& target_gmm,
+        const ComponentCache& source_gmm,
         float normalizer,
         const std::vector<Eigen::Matrix3f>& dRdu,
         const std::vector<std::vector<Eigen::Matrix3f>>& d2Rdu2,
@@ -290,7 +286,7 @@ private:
         score = 0.0f;
         J.setZero();
         H.setZero();
-        if (Nm == 0 || Nk == 0 || normalizer == 0.0f) {
+        if (target_gmm.empty() || source_gmm.empty() || normalizer == 0.0f) {
             return;
         }
 
@@ -305,13 +301,19 @@ private:
         const Eigen::Matrix3f Minf =
             Eigen::Matrix3f::Identity() * inflation_factor_;
 
-        for (std::uint32_t m = 0; m < Nm; ++m) {
-            const Eigen::Matrix3f L = covarianceFromColumn(Lm, m);
-            const Eigen::Vector3f mu = mu_m.col(m);
-            for (std::uint32_t k = 0; k < Nk; ++k) {
-                const Eigen::Matrix3f Om = covarianceFromColumn(Omk, k);
-                const Eigen::Vector3f nu = nu_k.col(k);
-                const float w = wm(m) * wk(k);
+        for (const auto& cm : target_gmm) {
+            if (!cm.valid) {
+                continue;
+            }
+            const Eigen::Matrix3f& L = cm.covariance;
+            const Eigen::Vector3f& mu = cm.mean;
+            for (const auto& ck : source_gmm) {
+                if (!ck.valid) {
+                    continue;
+                }
+                const Eigen::Matrix3f& Om = ck.covariance;
+                const Eigen::Vector3f& nu = ck.mean;
+                const float w = cm.weight * ck.weight;
                 if (!std::isfinite(w) || w <= 0.0f) {
                     continue;
                 }
@@ -319,7 +321,7 @@ private:
                 const Eigen::Vector3f Rnu = R * nu;
                 const Eigen::Vector3f y = mu - Rnu - t;
                 const float radius2 = std::max(
-                    L.trace() + Om.trace(),
+                    cm.trace + ck.trace,
                     std::numeric_limits<float>::epsilon());
                 if (y.squaredNorm() > kGateRadiusMultiplierSq * radius2) {
                     continue;
@@ -855,7 +857,8 @@ private:
     void updateInflation(const Eigen::Matrix<float, 6, 1>& grad,
                          const Eigen::Matrix<float, 6, 6>& hess) const {
         const Eigen::Matrix<float, 6, 6> damped =
-            hess + 1e-3f * Eigen::Matrix<float, 6, 6>::Identity();
+            hess - static_cast<float>(std::max(options_.hessian_damping, 1e-9)) *
+                       Eigen::Matrix<float, 6, 6>::Identity();
         const Eigen::Matrix<float, 6, 1> dx = -damped.ldlt().solve(grad);
         if (!dx.allFinite()) {
             return;
@@ -876,7 +879,8 @@ private:
         constexpr int n = 6;
         dlib::matrix<float> damped = hess;
         for (int i = 0; i < n; ++i) {
-            damped(i, i) += 1e-3f;
+            damped(i, i) -=
+                static_cast<float>(std::max(options_.hessian_damping, 1e-9));
         }
 
         column_vector dx;
@@ -898,11 +902,12 @@ private:
             std::clamp(alpha * initial_inflation_, 0.0f, inflation_factor_);
     }
 
-    const gmm_utils::GMM3f& source_gmm_;
-    const gmm_utils::GMM3f& target_gmm_;
+    ComponentCache source_cache_;
+    ComponentCache target_cache_;
     float Et_ = 1.0f;
     const Eigen::Vector3f translation_prior_;
     const Eigen::Vector3f rotation_prior_u_;
+    const D2DRegistrationOptions options_;
     const float initial_inflation_;
     mutable float inflation_factor_;
 };
@@ -912,7 +917,10 @@ float runD2DRegistration(
     const gmm_utils::GMM3f& target_gmm,
     const Eigen::Transform<float, 3, Eigen::Affine, Eigen::ColMajor>& Tinit,
     Eigen::Transform<float, 3, Eigen::Affine, Eigen::ColMajor>& Tout,
-    float& out_coarse_score) {
+    float& out_coarse_score,
+    bool& out_fast_path_used,
+    const D2DRegistrationOptions& options) {
+    out_fast_path_used = false;
     ColumnVector x(6);
     const Eigen::Vector3f t = Tinit.translation();
     const Eigen::AngleAxisf aa(Tinit.rotation());
@@ -922,27 +930,45 @@ float runD2DRegistration(
     }
     x = t(0), t(1), t(2), u(0), u(1), u(2);
 
+    GmmRegistrationModel coarse_model(source_gmm, target_gmm, t, u, options);
+    if (options.initial_score_fast_path &&
+        std::isfinite(options.initial_score_threshold)) {
+        const float initial_score = coarse_model(x);
+        if (std::isfinite(initial_score) &&
+            initial_score >= static_cast<float>(
+                options.initial_score_threshold + options.initial_score_margin)) {
+            out_coarse_score = initial_score;
+            Tout = Tinit;
+            out_fast_path_used = true;
+            return initial_score;
+        }
+    }
+
     const float coarse_score = dlib::find_max_trust_region(
-        dlib::objective_delta_stop_strategy(kD2DObjectiveDeltaStop,
-                                            kD2DMaxIterations),
-        GmmRegistrationModel(source_gmm, target_gmm, t, u),
+        dlib::objective_delta_stop_strategy(
+            options.objective_delta_stop,
+            std::max<unsigned long>(1, options.coarse_max_iterations)),
+        coarse_model,
         x,
-        kD2DInitialTrustRadius);
+        options.initial_trust_radius);
     out_coarse_score = coarse_score;
 
     float score = coarse_score;
-    if (std::isfinite(coarse_score) &&
-        coarse_score >= kFineRefineMinCoarseScore) {
+    if (options.fine_refine_enable &&
+        std::isfinite(coarse_score) &&
+        coarse_score >= static_cast<float>(options.fine_min_coarse_score)) {
         ColumnVector x_coarse = x;
         const Eigen::Vector3f t_coarse(x_coarse(0), x_coarse(1), x_coarse(2)); // 0, 1, 2 --> translation tx, ty, tz
         const Eigen::Vector3f u_coarse(x_coarse(3), x_coarse(4), x_coarse(5)); // 3, 4, 5 --> rotation vector (axis-angle representation) ux, uy, uz
         const float fine_score = dlib::find_max_trust_region(
-            dlib::objective_delta_stop_strategy(kD2DFineObjectiveDeltaStop,
-                                                kD2DFineMaxIterations),
+            dlib::objective_delta_stop_strategy(
+                options.fine_objective_delta_stop,
+                std::max<unsigned long>(1, options.fine_max_iterations)),
             GmmRegistrationModel(source_gmm, target_gmm, t_coarse, u_coarse,
+                                 options,
                                  kFineInitialInflation),
             x,
-            kD2DFineInitialTrustRadius);
+            options.fine_initial_trust_radius);
         if (std::isfinite(fine_score) && fine_score > coarse_score) {
             score = fine_score;
         } else {
@@ -958,56 +984,80 @@ float runD2DRegistration(
 
 RegistrationResult isoplanarRegistration(
     const Eigen::Matrix4f& T_init,
-    const std::string& source_path,
-    const std::string& target_path) {
+    const gmm_utils::GMM3f& source_gmm,
+    const gmm_utils::GMM3f& target_gmm,
+    const D2DRegistrationOptions& options) {
 
     RegistrationResult result;
 
     auto Tinit = toAffine(T_init);
     Eigen::Transform<float, 3, Eigen::Affine, Eigen::ColMajor> Tout;
+
+    float coarse_score = -std::numeric_limits<float>::infinity();
+    bool fast_path_used = false;
+    float score = runD2DRegistration(source_gmm, target_gmm, Tinit, Tout,
+                                     coarse_score, fast_path_used, options);
+
+    result.transform = Tout.matrix();
+    result.score = score;
+    result.coarse_score = coarse_score;
+    result.n_source = static_cast<int>(source_gmm.getNClusters());
+    result.n_target = static_cast<int>(target_gmm.getNClusters());
+    result.success = std::isfinite(score) && !result.transform.hasNaN();
+    result.initial_score_fast_path_used = fast_path_used;
+    return result;
+}
+
+RegistrationResult anisotropicRegistration(
+    const Eigen::Matrix4f& T_init,
+    const gmm_utils::GMM3f& source_gmm,
+    const gmm_utils::GMM3f& target_gmm,
+    const D2DRegistrationOptions& options) {
+
+    RegistrationResult result;
+
+    auto Tinit = toAffine(T_init);
+    Eigen::Transform<float, 3, Eigen::Affine, Eigen::ColMajor> Tout;
+
+    float coarse_score = -std::numeric_limits<float>::infinity();
+    bool fast_path_used = false;
+    float score = runD2DRegistration(source_gmm, target_gmm, Tinit, Tout,
+                                     coarse_score, fast_path_used, options);
+
+    result.transform = Tout.matrix();
+    result.score = score;
+    result.coarse_score = coarse_score;
+    result.n_source = static_cast<int>(source_gmm.getNClusters());
+    result.n_target = static_cast<int>(target_gmm.getNClusters());
+    result.success = std::isfinite(score) && !result.transform.hasNaN();
+    result.initial_score_fast_path_used = fast_path_used;
+    return result;
+}
+
+RegistrationResult isoplanarRegistration(
+    const Eigen::Matrix4f& T_init,
+    const std::string& source_path,
+    const std::string& target_path,
+    const D2DRegistrationOptions& options) {
 
     gmm_utils::GMM3f source_gmm, target_gmm;
     source_gmm.load(source_path);
     source_gmm.makeCovsIsoplanar();
     target_gmm.load(target_path);
     target_gmm.makeCovsIsoplanar();
-
-    float coarse_score = -std::numeric_limits<float>::infinity();
-    float score = runD2DRegistration(source_gmm, target_gmm, Tinit, Tout, coarse_score);
-
-    result.transform = Tout.matrix();
-    result.score = score;
-    result.coarse_score = coarse_score;
-    result.n_source = static_cast<int>(source_gmm.getNClusters());
-    result.n_target = static_cast<int>(target_gmm.getNClusters());
-    result.success = std::isfinite(score) && !result.transform.hasNaN();
-    return result;
+    return isoplanarRegistration(T_init, source_gmm, target_gmm, options);
 }
 
 RegistrationResult anisotropicRegistration(
     const Eigen::Matrix4f& T_init,
     const std::string& source_path,
-    const std::string& target_path) {
-
-    RegistrationResult result;
-
-    auto Tinit = toAffine(T_init);
-    Eigen::Transform<float, 3, Eigen::Affine, Eigen::ColMajor> Tout;
+    const std::string& target_path,
+    const D2DRegistrationOptions& options) {
 
     gmm_utils::GMM3f source_gmm, target_gmm;
     source_gmm.load(source_path);
     target_gmm.load(target_path);
-
-    float coarse_score = -std::numeric_limits<float>::infinity();
-    float score = runD2DRegistration(source_gmm, target_gmm, Tinit, Tout, coarse_score);
-
-    result.transform = Tout.matrix();
-    result.score = score;
-    result.coarse_score = coarse_score;
-    result.n_source = static_cast<int>(source_gmm.getNClusters());
-    result.n_target = static_cast<int>(target_gmm.getNClusters());
-    result.success = std::isfinite(score) && !result.transform.hasNaN();
-    return result;
+    return anisotropicRegistration(T_init, source_gmm, target_gmm, options);
 }
 
 } // namespace gmmslam

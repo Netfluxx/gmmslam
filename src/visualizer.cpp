@@ -155,10 +155,13 @@ void Visualizer::publishPoseLpf(const Matrix4d& T, const ros::Time& stamp) {
 // =====================================================================
 
 void Visualizer::enqueueFrame(const ros::Time& stamp,
-                              const Eigen::MatrixXf& pts,
+                              std::shared_ptr<const Eigen::MatrixXf> pts,
                               int frame_count,
                               const Matrix4d& capture_pose,
                               int smoother_pose_key) {
+    if (!pts) {
+        return;
+    }
     VisFrame frame;
     frame.stamp             = stamp;
     frame.points            = pts;
@@ -184,6 +187,9 @@ void Visualizer::visLoop(const std::atomic<bool>& shutdown) {
         }
         try {
             auto& f = opt.value();
+            if (!f.points) {
+                continue;
+            }
             last_vis_stamp_ = f.stamp;
             publishScanProducts(f.stamp, f.points, f.frame_count, f.capture_pose,
                                 f.smoother_pose_key);
@@ -198,10 +204,13 @@ void Visualizer::visLoop(const std::atomic<bool>& shutdown) {
 // =====================================================================
 
 void Visualizer::publishScanProducts(const ros::Time& stamp,
-                                     const Eigen::MatrixXf& pts,
+                                     std::shared_ptr<const Eigen::MatrixXf> pts,
                                      int frame_count,
                                      const Matrix4d& capture_pose,
                                      int smoother_pose_key) {
+    if (!pts) {
+        return;
+    }
     const Matrix4d& T = capture_pose;
 
     // --- Path ---
@@ -210,19 +219,24 @@ void Visualizer::publishScanProducts(const ros::Time& stamp,
     path_.poses.push_back(ps);
     pubs_.path.publish(path_);
 
-    // --- Transform current scan into world frame ---
-    // pts is Nx3 float; stay in float to avoid double↔float round-trip.
-    const Eigen::Matrix3f R = T.block<3, 3>(0, 0).cast<float>();
-    const Eigen::RowVector3f t = T.block<3, 1>(0, 3).cast<float>().transpose();
-    const Eigen::MatrixXf pts_w = (pts * R.transpose()).rowwise() + t;
+    const bool latest_cloud_has_subs =
+        pubs_.latest_frame_cloud.getNumSubscribers() > 0;
+    const bool map_cloud_has_subs =
+        pubs_.map_cloud.getNumSubscribers() > 0;
 
-    // --- Latest frame cloud (red) ---
-    pubs_.latest_frame_cloud.publish(
-        eigenToPc2Rgb(pts_w, stamp, odom_frame_, 255, 0, 0));
+    if (latest_cloud_has_subs) {
+        // pts is Nx3 float; stay in float to avoid double↔float round-trip.
+        const Eigen::Matrix3f R = T.block<3, 3>(0, 0).cast<float>();
+        const Eigen::RowVector3f t =
+            T.block<3, 1>(0, 3).cast<float>().transpose();
+        const Eigen::MatrixXf pts_w = ((*pts) * R.transpose()).rowwise() + t;
+        pubs_.latest_frame_cloud.publish(
+            eigenToPc2Rgb(pts_w, stamp, odom_frame_, 255, 0, 0));
+    }
 
     // --- Accumulated map: store lidar-frame points keyed by smoother pose X(k);
     //     map_cloud is rebuilt from current pose_by_idx at map_cloud_publish_hz.
-    if (smoother_pose_key >= 0 && pts.rows() > 0) {
+    if (map_cloud_has_subs && smoother_pose_key >= 0 && pts->rows() > 0) {
         MapCloudChunk chunk;
         chunk.pose_key       = smoother_pose_key;
         chunk.points_lidar   = pts;
@@ -235,14 +249,18 @@ void Visualizer::publishScanProducts(const ros::Time& stamp,
 
     const double now_t = stampToSec(stamp);
 
-    // --- Graph node markers ---
-    publishGraphNodeMarkers(stamp, now_t);
+    if (pubs_.graph_nodes.getNumSubscribers() > 0) {
+        publishGraphNodeMarkers(stamp, now_t);
+    }
 
-    // --- Global submap graph markers ---
-    publishGlobalGraphMarkers(stamp, now_t);
+    if (pubs_.global_graph_markers.getNumSubscribers() > 0) {
+        publishGlobalGraphMarkers(stamp, now_t);
+    }
 
-    // --- GMM component markers ---
-    publishGmmMarkers(stamp, T);
+    if (pubs_.gmm_markers.getNumSubscribers() > 0 ||
+        pubs_.gmm_global_markers.getNumSubscribers() > 0) {
+        publishGmmMarkers(stamp, T);
+    }
 
     maybePublishMapCloud(stamp);
 }
@@ -253,6 +271,9 @@ void Visualizer::publishScanProducts(const ros::Time& stamp,
 
 void Visualizer::maybePublishMapCloud(const ros::Time& header_stamp) {
     if (pubs_.map_cloud.getTopic().empty()) {
+        return;
+    }
+    if (pubs_.map_cloud.getNumSubscribers() == 0) {
         return;
     }
 
@@ -275,8 +296,10 @@ void Visualizer::maybePublishMapCloud(const ros::Time& header_stamp) {
         for (std::size_t i = 0; i < map_cloud_chunks_.size(); ++i) {
             MapCloudChunk& ch = map_cloud_chunks_[i];
             auto it = pose_snap.find(ch.pose_key);
-            if (it != pose_snap.end() && it->second.allFinite()) {
-                total_rows += static_cast<std::size_t>(ch.points_lidar.rows());
+            if (it != pose_snap.end() && it->second.allFinite() &&
+                ch.points_lidar) {
+                total_rows +=
+                    static_cast<std::size_t>(ch.points_lidar->rows());
                 kept.push_back(std::move(ch));
             }
         }
@@ -302,7 +325,10 @@ void Visualizer::maybePublishMapCloud(const ros::Time& header_stamp) {
             const Eigen::Matrix3f Rw = Tw.block<3, 3>(0, 0).cast<float>();
             const Eigen::RowVector3f tw =
                 Tw.block<3, 1>(0, 3).cast<float>().transpose();
-            const Eigen::MatrixXf& pl = ch.points_lidar;
+            if (!ch.points_lidar) {
+                continue;
+            }
+            const Eigen::MatrixXf& pl = *ch.points_lidar;
             const Eigen::Index n = pl.rows();
             if (row_out + n > world_pts.rows()) {
                 ROS_WARN_THROTTLE(
@@ -555,11 +581,14 @@ void Visualizer::publishGlobalGraphMarkers(const ros::Time& stamp,
 
 void Visualizer::publishGmmMarkers(const ros::Time& stamp,
                                    const Matrix4d& T) {
+    const bool latest_has_subs = pubs_.gmm_markers.getNumSubscribers() > 0;
+    const bool global_has_subs = pubs_.gmm_global_markers.getNumSubscribers() > 0;
+
     // --- Latest-frame ellipsoids (white) ---
     int latest_idx = -1;
     GmmModel latest_gmm;
     bool has_latest = false;
-    {
+    if (latest_has_subs) {
         std::lock_guard<std::mutex> lk(registration_.lock);
         latest_idx = registration_.latest_gmm_idx;
         if (registration_.has_latest_gmm) {
@@ -568,7 +597,7 @@ void Visualizer::publishGmmMarkers(const ros::Time& stamp,
         }
     }
 
-    if (has_latest) {
+    if (latest_has_subs && has_latest) {
         Matrix4d T_latest;
         {
             std::lock_guard<std::mutex> lk(smoother_.graph_lock);
@@ -584,6 +613,9 @@ void Visualizer::publishGmmMarkers(const ros::Time& stamp,
     }
 
     // --- Global GMM map: per-submap with distinct colors ---
+    if (!global_has_subs) {
+        return;
+    }
     const double now_t = stampToSec(stamp);
     if (!global_gmm_markers_enable_) {
         if (!global_gmm_markers_cleared_) {

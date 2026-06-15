@@ -19,6 +19,7 @@ void loadRos(const YAML::Node& root, RosConfig& c) {
     c.imu_topic = readOr<std::string>(n, "imu_topic", c.imu_topic);
     c.sensor_frame = readOr<std::string>(n, "sensor_frame", c.sensor_frame);
     c.odom_frame = readOr<std::string>(n, "odom_frame", c.odom_frame);
+    c.map_frame = readOr<std::string>(n, "map_frame", c.map_frame);
     c.base_frame = readOr<std::string>(n, "base_frame", c.base_frame);
     c.odometry_input = readOr<std::string>(
         n, "odometry_input",
@@ -348,6 +349,9 @@ void loadVisualization(const YAML::Node& root, VisualizationConfig& c) {
     c.global_gmm_markers_enable =
         readOr(n, "global_gmm_markers_enable", c.global_gmm_markers_enable);
     c.global_gmm_publish_period_s = readOr(n, "global_gmm_publish_period_s", c.global_gmm_publish_period_s);
+    c.d2d_frame_to_frame_markers_enable =
+        readOr(n, "d2d_frame_to_frame_markers_enable",
+               c.d2d_frame_to_frame_markers_enable);
     c.d2d_frame_to_frame_text_enable =
         readOr(n, "d2d_frame_to_frame_text_enable",
                c.d2d_frame_to_frame_text_enable);

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <map>
 #include <deque>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -55,7 +56,8 @@ public:
 
     /// @param smoother_pose_key Pose graph index `X(k)` for this scan when
     ///        `pts` was captured (smoother frames only); `-1` skips map buffer.
-    void enqueueFrame(const ros::Time& stamp, const Eigen::MatrixXf& pts,
+    void enqueueFrame(const ros::Time& stamp,
+                      std::shared_ptr<const Eigen::MatrixXf> pts,
                       int frame_count, const Matrix4d& capture_pose,
                       int smoother_pose_key);
 
@@ -64,7 +66,7 @@ public:
 private:
     struct VisFrame {
         ros::Time stamp;
-        Eigen::MatrixXf points;
+        std::shared_ptr<const Eigen::MatrixXf> points;
         int frame_count;
         Matrix4d capture_pose;
         int smoother_pose_key = -1;
@@ -72,10 +74,11 @@ private:
 
     struct MapCloudChunk {
         int pose_key;
-        Eigen::MatrixXf points_lidar;
+        std::shared_ptr<const Eigen::MatrixXf> points_lidar;
     };
 
-    void publishScanProducts(const ros::Time& stamp, const Eigen::MatrixXf& pts,
+    void publishScanProducts(const ros::Time& stamp,
+                             std::shared_ptr<const Eigen::MatrixXf> pts,
                              int frame_count, const Matrix4d& capture_pose,
                              int smoother_pose_key);
     void maybePublishMapCloud(const ros::Time& header_stamp);

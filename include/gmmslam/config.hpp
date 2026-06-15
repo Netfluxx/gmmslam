@@ -271,6 +271,7 @@ struct VisualizationConfig {
     double gmm_marker_sigma = 3.0;
     bool global_gmm_markers_enable = true;
     double global_gmm_publish_period_s = 1.0;
+    bool d2d_frame_to_frame_markers_enable = false;
     bool d2d_frame_to_frame_text_enable = true;
     bool d2d_submap_overlap_text_enable = true;
     bool d2d_loop_closure_text_enable = true;
