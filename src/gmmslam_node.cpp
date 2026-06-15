@@ -107,6 +107,7 @@ private:
     ros::Time last_smoother_stamp_;
     bool has_last_smoother_stamp_ = false;
     std::optional<Matrix4d> accumulated_gt_rel_;
+    std::optional<Matrix4d> last_rel_motion_;
     int reg_enqueue_resume_frame_ = 0;
     double last_backpressure_log_t_ = 0.0;
     double last_cloud_t_sec_processed_ = -1.0;
@@ -956,6 +957,7 @@ void GMMSLAMNode::maybeReanchorSmootherFromGt(const ros::Time& stamp,
     smoother_->scheduleReanchorToGt(anchor, T_gt.value(), t_cloud);
     last_gt_T_for_factor_ = T_gt.value();
     accumulated_gt_rel_.reset();
+    last_rel_motion_.reset();
     ROS_WARN("[gmmslam] Scheduled fixed-lag re-anchor to GT at X(%d) "
              "(smoothed trajectory hit submap aux gate — SLAM estimate was reset to GT)",
              anchor);
@@ -1251,6 +1253,9 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
                 predicted = restart_pose_.value();
             } else if (has_external_prediction) {
                 predicted = smoother_->pose * gt_rel_opt.value();
+                last_rel_motion_ = gt_rel_opt.value();
+            } else if (last_rel_motion_.has_value()) {
+                predicted = smoother_->pose * last_rel_motion_.value();
             } else {
                 predicted = smoother_->pose;
             }

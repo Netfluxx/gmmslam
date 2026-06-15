@@ -935,25 +935,32 @@ def _dedup_global_map(rows: List[Row]) -> List[Row]:
 
 def plot_global_map_gaussians(rows: List[Row], out_dir: Path) -> Optional[Path]:
     """Gaussian count growth and pruning deltas."""
-    rows = _dedup_global_map(rows)
     if not rows:
         return None
-    stamps = [f(r, "stamp") for r in rows]
-    t0 = stamps[0]
-    times = [s - t0 for s in stamps]
-    gaussians = [f(r, "total_gaussians") for r in rows]
 
+    # Compute per-event deltas BEFORE deduplication so that co-timestamped
+    # events (e.g. submap_finalized + internal_submap_prune at the same stamp)
+    # each get their own correct delta rather than being collapsed into one.
+    t0 = f(rows[0], "stamp")
+    TRACKED = {"submap_finalized", "internal_submap_prune", "cross_submap_prune"}
     delta_rows = []
-    prev_total = None
-    for t, r in zip(times, rows):
+    prev_total: Optional[float] = None
+    for r in rows:
         total = f(r, "total_gaussians")
         if not math.isfinite(total):
             continue
+        t = f(r, "stamp") - t0
         delta = 0.0 if prev_total is None else total - prev_total
         prev_total = total
         event = r.get("event", "unknown")
-        if event in {"submap_finalized", "internal_submap_prune", "cross_submap_prune"}:
+        if event in TRACKED:
             delta_rows.append((t, delta, event))
+
+    # Dedup only for the cumulative top curve (last value per timestamp)
+    deduped = _dedup_global_map(rows)
+    stamps = [f(r, "stamp") for r in deduped]
+    times = [s - t0 for s in stamps]
+    gaussians = [f(r, "total_gaussians") for r in deduped]
 
     fig, axes = plt.subplots(2, 1, figsize=(11, 8), sharex=True)
 

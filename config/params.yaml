@@ -103,7 +103,7 @@ smoother:
   odom_noise_sigma_r: 0.05 # [rad] rotation odometry noise
   lost_scale:        100.0    # multiplier on odom noise when tracking is lost
   prior_scale:       0.1     # multiplier on odom noise for the origin prior
-  pose_history_keep: 9999    # max keyframes kept in pose history.
+  pose_history_keep: 999999    # max keyframes kept in pose history.
 
 # ---------------------------------------------------------------------------
 # D2D registration (async worker pool)
@@ -145,15 +145,15 @@ registration:
 # ---------------------------------------------------------------------------
 loop_closure:
   enable:                     true  # keep loop D2D off until sequential D2D is stable
-  search_radius_m:            10.0   # [m] spatial search radius
+  search_radius_m:            15.0   # [m] spatial search radius
   min_keyframe_gap:           180    # skip local matches (~10 submaps at 10 keyframes/submap)
   max_candidates:             2     # max loop D2D requests dispatched per search
   request_every_n_keyframes:  1     # only run loop search when curr_idx % this == 0
   search_cooldown_keyframes:  20    # minimum keyframe/odom gap between loop searches
   min_separation_m:           0.2    # [m] translation gate
   min_separation_deg:         5.0   # [deg] paired with min_separation_m for diversity
-  max_age_s:                  99999.0  # [s] ignore keyframes older than this
-  gmm_keep_keyframes:         99999  # GMMs kept for loop-closure matching
+  max_age_s:                  999999.0  # [s] ignore keyframes older than this
+  gmm_keep_keyframes:         999999  # GMMs kept for loop-closure matching
   detect_score_threshold:     0.45  # accept loop if D2D score >= this
   super_sigma_t:              0.05   # noise for very confident loops
   super_sigma_r:              0.05
@@ -175,7 +175,7 @@ solid:
   num_range:                  50      # radial bins
   num_height:                 16      # vertical bins across FOV
   voxel_size_m:               0.0     # extra coarse voxel (<=0 disables)
-  cos_similarity_threshold:   0.98    # minimum range-cosine to pass the gate
+  cos_similarity_threshold:   0.97    # minimum range-cosine to pass the gate
   radius_weight:              0.55    # fused-score weight on radius term
   appearance_weight:          0.45    # fused-score weight on cosine term
   provide_yaw_prior:          true    # attach SOLiD yaw as T_init for D2D
@@ -193,8 +193,8 @@ solid:
 # Keyframe triggers
 # ---------------------------------------------------------------------------
 keyframe:
-  translation_thresh_m: 0.25
-  rotation_thresh_deg:  10.0
+  translation_thresh_m: 0.3
+  rotation_thresh_deg:  5.0
   use_time_trigger:     false
   max_interval_s:       2.0   # [s] force keyframe after this long
 
@@ -289,7 +289,7 @@ visualization:
   global_gmm_publish_period_s: 5.0   # [s]
   d2d_frame_to_frame_text_enable:    false  # show frame-to-frame D2D score labels in RViz
   d2d_submap_overlap_text_enable:    false  # show submap-overlap D2D score labels in RViz
-  d2d_loop_closure_text_enable:      false  # show loop-closure D2D score labels in RViz
+  d2d_loop_closure_text_enable:      true  # show loop-closure D2D score labels in RViz
   output_pose_lpf_cutoff_hz:  5.0    # [Hz] first-order low-pass published on odom_lpf (<=0 disables)
   map_cloud_publish_hz:     0.5     # accumulated raw map PointCloud2 rate
   map_cloud_max_chunks:     3000    # max smoother frames kept (oldest dropped)
@@ -304,7 +304,7 @@ visualization:
 # ---------------------------------------------------------------------------
 map:
   prune_enable:           true
-  prune_frame_to_frame_enable: true  # keep older source frame, drop duplicate components from newer measurements
+  prune_frame_to_frame_enable: false  # keep older source frame, drop duplicate components from newer measurements
   prune_bhatt_threshold:  3.0    # merge if D_B < this (lower = more conservative)
   prune_search_radius_m:  1.0    # AABB margin for inflation (m) on each axis
   prune_use_rtree:        true   # index components by 3D AABB; else mean-radius prefilter only

@@ -7,6 +7,8 @@
 #include <unordered_map>
 #include <vector>
 
+// SOLiD : https://github.com/sparolab/SOLiD/tree/main/cpp
+
 namespace gmmslam {
 
 namespace {
@@ -29,9 +31,10 @@ Eigen::MatrixXf voxelDownsample(const Eigen::MatrixXf& pts, double leaf_size) {
     bins.reserve(static_cast<std::size_t>(pts.rows()));
 
     auto pack = [](std::int32_t a, std::int32_t b, std::int32_t c) {
-        // XOR-shift hashing is sufficient here; collisions only cost accuracy,
-        // not correctness (we keep the bin centroid).
+        // take voxel indices (ix, iy, iz) and hash into a 64-bit integer. 
+        // then multiply by large prime number
         std::int64_t h = static_cast<std::int64_t>(a) * 73856093LL;
+        //XOR
         h ^= static_cast<std::int64_t>(b) * 19349663LL;
         h ^= static_cast<std::int64_t>(c) * 83492791LL;
         return h;
@@ -42,6 +45,7 @@ Eigen::MatrixXf voxelDownsample(const Eigen::MatrixXf& pts, double leaf_size) {
         const auto iy = static_cast<std::int32_t>(std::floor(pts(i, 1) * inv));
         const auto iz = static_cast<std::int32_t>(std::floor(pts(i, 2) * inv));
         const auto key = pack(ix, iy, iz);
+        //store key in unordered map
         auto& acc = bins[key];
         acc.sx += pts(i, 0); acc.sy += pts(i, 1); acc.sz += pts(i, 2);
         acc.n  += 1;
@@ -129,9 +133,6 @@ SolidDescriptor SOLiDModule::makeDescriptor(const Eigen::MatrixXf& raw) const {
     desc.point_count = accepted;
     if (accepted == 0) return desc;
 
-    // Height-weight vector, normalized to [0, 1]. The paper uses this to give
-    // more weight to heights with more points, making the descriptor robust
-    // to sparsity at the extremes of the vertical FOV.
     Eigen::VectorXd height_weight(cfg_.num_height);
     for (int c = 0; c < cfg_.num_height; ++c) {
         height_weight(c) = range_matrix.col(c).sum();
