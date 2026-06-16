@@ -14,7 +14,7 @@
 #include <string>
 #include <vector>
 
-#include <ros/ros.h>
+#include "gmmslam/ros2_compat.hpp"
 #include <nav_msgs/Odometry.h>
 #include <nav_msgs/Path.h>
 #include <visualization_msgs/MarkerArray.h>

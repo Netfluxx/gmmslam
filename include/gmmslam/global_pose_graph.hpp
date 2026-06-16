@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-#include <ros/ros.h>
+#include "gmmslam/ros2_compat.hpp"
 #include <nav_msgs/Path.h>
 
 namespace gmmslam {

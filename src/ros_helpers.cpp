@@ -83,7 +83,7 @@ Eigen::MatrixXf subsampleToMax(const Eigen::MatrixXf& pts, int target) {
 } // namespace
 
 double stampToSec(const ros::Time& stamp) {
-    return static_cast<double>(stamp.sec) + 1e-9 * static_cast<double>(stamp.nsec);
+    return stamp.toSec();
 }
 
 geometry_msgs::TransformStamped poseToTransformStamped(

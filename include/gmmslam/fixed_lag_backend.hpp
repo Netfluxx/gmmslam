@@ -4,7 +4,7 @@
 #include "gmmslam/config.hpp"
 #include "gmmslam/thread_safe_queue.hpp"
 
-#include <ros/ros.h>
+#include "gmmslam/ros2_compat.hpp"
 #include <Eigen/Core>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
@@ -38,7 +38,7 @@ public:
     };
 
     FixedLagBackend(const SmootherConfig& smoother_cfg,
-                    const GtNoiseConfig& gt_cfg,
+                    const ExtOdomConfig& gt_cfg,
                     const LoopClosureConfig& loop_cfg,
                     const ImuConfig& imu_cfg,
                     const std::string& benchmark_log_dir = {});

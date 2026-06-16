@@ -7,8 +7,7 @@
 #include "gmmslam/visualizer.hpp"
 #include "gmmslam/util/gmm_utils.hpp"
 
-#include <ros/ros.h>
-#include <ros/console.h>
+#include "gmmslam/ros2_compat.hpp"
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <nav_msgs/Odometry.h>
@@ -57,15 +56,15 @@ public:
     ~GMMSLAMNode();
 
 private:
-    void pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg);
-    void gtCallback(const geometry_msgs::PoseStamped::ConstPtr& msg);
-    void noisyGtCallback(const geometry_msgs::PoseStamped::ConstPtr& msg);
-    void imuCallback(const sensor_msgs::Imu::ConstPtr& msg);
+    void pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& msg);
+    void gtCallback(const geometry_msgs::PoseStamped::ConstSharedPtr& msg);
+    void extOdomCallback(const geometry_msgs::PoseStamped::ConstSharedPtr& msg);
+    void imuCallback(const sensor_msgs::Imu::ConstSharedPtr& msg);
 
     bool ensureGtOriginInitialized(const ros::Time& stamp);
     bool shouldAddKeyframe(const ros::Time& stamp, const Matrix4d& current_pose);
-    std::optional<Matrix4d> sampleNoisyGtRelativePose(const ros::Time& stamp);
-    std::optional<Matrix4d> lookupNoisyGtAt(double t_sec) const;
+    std::optional<Matrix4d> sampleExtOdomRelativePose(const ros::Time& stamp);
+    std::optional<Matrix4d> lookupExtOdomAt(double t_sec) const;
     std::vector<std::tuple<double, Vector3d, Vector3d>> imuMeasurementsBetween(
         double t_prev, double t_curr) const;
     std::optional<Matrix4d> submapTrajDeltaBetween(
@@ -93,7 +92,7 @@ private:
     std::unique_ptr<RegistrationManager> registration_;
     std::unique_ptr<Visualizer> visualizer_;
 
-    ros::Subscriber lidar_sub_, gt_sub_, noisy_gt_sub_, imu_sub_, reg_result_sub_;
+    ros::Subscriber lidar_sub_, gt_sub_, ext_odom_sub_, imu_sub_, reg_result_sub_;
     ros::Publisher gt_path_pub_, gt_pose_pub_;
 
     int frame_count_ = 0;
@@ -121,20 +120,20 @@ private:
     std::ofstream benchmark_est_map_tum_;
     std::ofstream benchmark_gt_tum_;
 
-    geometry_msgs::PoseStamped::ConstPtr latest_gt_pose_raw_;
+    geometry_msgs::PoseStamped::ConstSharedPtr latest_gt_pose_raw_;
     std::optional<Matrix4d> gt_origin_inv_;
     ros::Time gt_init_start_time_;
     std::optional<Matrix4d> last_gt_T_for_factor_;
     double last_gt_T_stamp_sec_ = 0.0;
     nav_msgs::Path gt_path_;
 
-    struct NoisyGtEntry {
+    struct ExtOdomEntry {
         double t_sec;
         Matrix4d pose;
     };
-    std::deque<NoisyGtEntry> noisy_gt_buffer_;
-    static constexpr int kNoisyGtBufferMax = 200;
-    geometry_msgs::PoseStamped::ConstPtr latest_noisy_gt_msg_;
+    std::deque<ExtOdomEntry> ext_odom_buffer_;
+    static constexpr int kExtOdomBufferMax = 200;
+    geometry_msgs::PoseStamped::ConstSharedPtr latest_ext_odom_msg_;
 
     struct ImuEntry {
         ros::Time stamp;
@@ -172,9 +171,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param<std::string>("base_frame",   cfg_.ros.base_frame,   "m500_1_base_link");
         pnh.param<std::string>("map_frame",    cfg_.ros.map_frame,    "map");
         if (!pnh.getParam("odometry_input", cfg_.ros.odometry_input)) {
-            if (!pnh.getParam("noisy_gt_topic", cfg_.ros.odometry_input)) {
-                cfg_.ros.odometry_input = "/gmmslam_node/noisy_gt_pose";
-            }
+            cfg_.ros.odometry_input = "/gmmslam_node/ext_odom_pose";
         }
         pnh.param<std::string>("restart_state_path", cfg_.ros.restart_state_path,
                                cfg_.ros.restart_state_path);
@@ -191,7 +188,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("target_points",   cfg_.preprocess.target_points,   0);
         pnh.param("min_points",      cfg_.preprocess.min_points,      50);
 
-        pnh.param<std::string>("sogmm_backend", cfg_.sogmm.backend, "sogmm");
+        pnh.param<std::string>("sogmm_backend", cfg_.sogmm.backend, "gmmap");
         pnh.param("sogmm_bandwidth",     cfg_.sogmm.bandwidth,     0.02);
         pnh.param("sogmm_max_points",    cfg_.sogmm.max_points,    2000);
         pnh.param("sogmm_n_components",  cfg_.sogmm.n_components,  0);
@@ -412,14 +409,14 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("submap_finalize_max_wait_s",
                   cfg_.global_graph.submap_finalize_max_wait_s, 0.0);
 
-        pnh.param("gt_init_wait_s",    cfg_.gt_noise.init_wait_s, 3.0);
-        pnh.param("gt_noise_sigma_t",  cfg_.gt_noise.sigma_t, 0.03);
-        pnh.param("gt_noise_sigma_r",  cfg_.gt_noise.sigma_r, 0.03);
-        pnh.param("gt_initial_yaw_offset_deg",
-                  cfg_.gt_noise.initial_yaw_offset_deg, 0.0);
-        pnh.param("gt_factor_sigma_t", cfg_.gt_noise.factor_sigma_t, 0.045);
-        pnh.param("gt_factor_sigma_r", cfg_.gt_noise.factor_sigma_r, 0.045);
-        pnh.param("gt_noise_seed",     cfg_.gt_noise.seed, -1);
+        pnh.param("ext_odom_init_wait_s",    cfg_.ext_odom.init_wait_s, 3.0);
+        pnh.param("ext_odom_noise_sigma_t",  cfg_.ext_odom.sigma_t, 0.03);
+        pnh.param("ext_odom_noise_sigma_r",  cfg_.ext_odom.sigma_r, 0.03);
+        pnh.param("ext_odom_initial_yaw_offset_deg",
+                  cfg_.ext_odom.initial_yaw_offset_deg, 0.0);
+        pnh.param("ext_odom_factor_sigma_t", cfg_.ext_odom.factor_sigma_t, 0.045);
+        pnh.param("ext_odom_factor_sigma_r", cfg_.ext_odom.factor_sigma_r, 0.045);
+        pnh.param("ext_odom_seed",           cfg_.ext_odom.seed, -1);
 
         pnh.param("enable_imu_preintegration",  cfg_.imu.enable_preintegration, false);
         pnh.param("imu_gravity_mps2",           cfg_.imu.gravity_mps2, 9.81);
@@ -466,11 +463,18 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
     pnh.param("debug_prints", cfg_.debug_prints, cfg_.debug_prints);
     applyDebugPrints(cfg_.debug_prints);
 
+    // Allow launch-argument overrides for ROS interface fields even when
+    // config_file was used (loadConfig sets them from YAML; these win if set).
+    pnh.param<std::string>("lidar_topic",   cfg_.ros.lidar_topic,   cfg_.ros.lidar_topic);
+    pnh.param<std::string>("gt_topic",      cfg_.ros.gt_topic,      cfg_.ros.gt_topic);
+    pnh.param<std::string>("sensor_frame",  cfg_.ros.sensor_frame,  cfg_.ros.sensor_frame);
+    pnh.param<std::string>("odom_frame",    cfg_.ros.odom_frame,    cfg_.ros.odom_frame);
+    pnh.param<std::string>("map_frame",     cfg_.ros.map_frame,     cfg_.ros.map_frame);
+    pnh.param<std::string>("base_frame",    cfg_.ros.base_frame,    cfg_.ros.base_frame);
+
     {
         std::string oin;
         if (pnh.getParam("odometry_input", oin)) {
-            cfg_.ros.odometry_input = oin;
-        } else if (pnh.getParam("noisy_gt_topic", oin)) {
             cfg_.ros.odometry_input = oin;
         }
         pnh.param<std::string>("restart_state_path", cfg_.ros.restart_state_path,
@@ -485,16 +489,16 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
     ROS_INFO("[gmmslam] odom_frame    : %s", cfg_.ros.odom_frame.c_str());
     ROS_INFO("[gmmslam] fixed_lag_s   : %.2f", cfg_.smoother.fixed_lag_s);
     ROS_INFO("[gmmslam] smoother_stride: %d", cfg_.smoother.smoother_stride);
-    ROS_INFO("[gmmslam] gt_factor_sigma: t=%.6f r=%.6f (gt_noise: t=%.4f r=%.4f)",
-             cfg_.gt_noise.factor_sigma_t, cfg_.gt_noise.factor_sigma_r,
-             cfg_.gt_noise.sigma_t, cfg_.gt_noise.sigma_r);
+    ROS_INFO("[gmmslam] ext_odom factor_sigma: t=%.6f r=%.6f (noise: t=%.4f r=%.4f)",
+             cfg_.ext_odom.factor_sigma_t, cfg_.ext_odom.factor_sigma_r,
+             cfg_.ext_odom.sigma_t, cfg_.ext_odom.sigma_r);
     ROS_INFO("[gmmslam] async reg     : %s", cfg_.registration.enable_async ? "true" : "false");
     ROS_INFO("[gmmslam] keyframe (global graph / reg only): %.3f m | %.2f deg",
              cfg_.keyframe.translation_thresh_m, cfg_.keyframe.rotation_thresh_deg);
 
     // --- RNG ---
-    if (cfg_.gt_noise.seed >= 0) {
-        rng_.seed(static_cast<uint64_t>(cfg_.gt_noise.seed));
+    if (cfg_.ext_odom.seed >= 0) {
+        rng_.seed(static_cast<uint64_t>(cfg_.ext_odom.seed));
     } else {
         rng_.seed(std::random_device{}());
     }
@@ -522,7 +526,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
 
     // --- Subsystems ---
     smoother_ = std::make_unique<FixedLagBackend>(
-        cfg_.smoother, cfg_.gt_noise, cfg_.loop_closure, cfg_.imu,
+        cfg_.smoother, cfg_.ext_odom, cfg_.loop_closure, cfg_.imu,
         benchmark_log_dir_);
 
     global_graph_ = std::make_unique<GlobalPoseGraph>(
@@ -607,9 +611,9 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         cfg_.ros.gt_topic, 1,
         &GMMSLAMNode::gtCallback, this);
 
-    noisy_gt_sub_ = nh.subscribe(
+    ext_odom_sub_ = nh.subscribe(
         cfg_.ros.odometry_input, 1,
-        &GMMSLAMNode::noisyGtCallback, this);
+        &GMMSLAMNode::extOdomCallback, this);
 
     if (!cfg_.ros.imu_topic.empty()) {
         imu_sub_ = nh.subscribe(
@@ -631,7 +635,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
             worker_threads_.emplace_back(&RegistrationManager::fitWorkerLoop,
                                          registration_.get(), std::cref(shutdown_));
         }
-        ROS_INFO("[gmmslam] started %d SOGMM fit worker thread(s)", n_fit);
+    ROS_INFO("[gmmslam] started %d GMMap fit worker thread(s)", n_fit);
     }
 
     worker_threads_.emplace_back(&Visualizer::visLoop,
@@ -670,7 +674,7 @@ GMMSLAMNode::~GMMSLAMNode()
 // GT callback
 // =====================================================================
 
-void GMMSLAMNode::gtCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
+void GMMSLAMNode::gtCallback(const geometry_msgs::PoseStamped::ConstSharedPtr& msg)
 {
     latest_gt_pose_raw_ = msg;
     if (!ensureGtOriginInitialized(msg->header.stamp)) {
@@ -691,15 +695,15 @@ void GMMSLAMNode::gtCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
 // Noisy GT callback
 // =====================================================================
 
-void GMMSLAMNode::noisyGtCallback(const geometry_msgs::PoseStamped::ConstPtr& msg)
+void GMMSLAMNode::extOdomCallback(const geometry_msgs::PoseStamped::ConstSharedPtr& msg)
 {
-    latest_noisy_gt_msg_ = msg;
+    latest_ext_odom_msg_ = msg;
     const double t = stampToSec(msg->header.stamp);
     const Matrix4d T = poseMsgToMatrix(msg->pose);
 
-    noisy_gt_buffer_.push_back({t, T});
-    while (static_cast<int>(noisy_gt_buffer_.size()) > kNoisyGtBufferMax) {
-        noisy_gt_buffer_.pop_front();
+    ext_odom_buffer_.push_back({t, T});
+    while (static_cast<int>(ext_odom_buffer_.size()) > kExtOdomBufferMax) {
+        ext_odom_buffer_.pop_front();
     }
 }
 
@@ -707,7 +711,7 @@ void GMMSLAMNode::noisyGtCallback(const geometry_msgs::PoseStamped::ConstPtr& ms
 // IMU callback
 // =====================================================================
 
-void GMMSLAMNode::imuCallback(const sensor_msgs::Imu::ConstPtr& msg)
+void GMMSLAMNode::imuCallback(const sensor_msgs::Imu::ConstSharedPtr& msg)
 {
     const Vector3d acc(msg->linear_acceleration.x,
                        msg->linear_acceleration.y,
@@ -741,9 +745,9 @@ bool GMMSLAMNode::ensureGtOriginInitialized(const ros::Time& stamp)
         now = stamp;
     }
     const double elapsed = stampToSec(now) - stampToSec(gt_init_start_time_);
-    if (elapsed < cfg_.gt_noise.init_wait_s) {
+    if (elapsed < cfg_.ext_odom.init_wait_s) {
         ROS_WARN_THROTTLE(2.0, "[gmmslam] GT init window (%.2f/%.2fs)",
-                          elapsed, cfg_.gt_noise.init_wait_s);
+                          elapsed, cfg_.ext_odom.init_wait_s);
         return false;
     }
     if (!latest_gt_pose_raw_) {
@@ -797,27 +801,27 @@ bool GMMSLAMNode::shouldAddKeyframe(const ros::Time& stamp,
 }
 
 // =====================================================================
-// lookupNoisyGtAt — nearest-neighbour lookup in the ring buffer
+// lookupExtOdomAt — nearest-neighbour lookup in the ring buffer
 // =====================================================================
 
-std::optional<Matrix4d> GMMSLAMNode::lookupNoisyGtAt(double t_sec) const
+std::optional<Matrix4d> GMMSLAMNode::lookupExtOdomAt(double t_sec) const
 {
-    if (noisy_gt_buffer_.empty()) {
+    if (ext_odom_buffer_.empty()) {
         return std::nullopt;
     }
 
     int best_i = 0;
-    double best_dt = std::abs(noisy_gt_buffer_[0].t_sec - t_sec);
-    for (int i = 1; i < static_cast<int>(noisy_gt_buffer_.size()); ++i) {
-        const double dt = std::abs(noisy_gt_buffer_[i].t_sec - t_sec);
+    double best_dt = std::abs(ext_odom_buffer_[0].t_sec - t_sec);
+    for (int i = 1; i < static_cast<int>(ext_odom_buffer_.size()); ++i) {
+        const double dt = std::abs(ext_odom_buffer_[i].t_sec - t_sec);
         if (dt < best_dt) {
             best_dt = dt;
             best_i = i;
-        } else if (noisy_gt_buffer_[i].t_sec > t_sec) {
+        } else if (ext_odom_buffer_[i].t_sec > t_sec) {
             break;
         }
     }
-    return noisy_gt_buffer_[best_i].pose;
+    return ext_odom_buffer_[best_i].pose;
 }
 
 // =====================================================================
@@ -827,13 +831,13 @@ std::optional<Matrix4d> GMMSLAMNode::lookupNoisyGtAt(double t_sec) const
 std::optional<Matrix4d> GMMSLAMNode::currentGtPoseOdomFrame(
     const ros::Time& stamp) const {
     const double t_cloud = stampToSec(stamp);
-    if (!noisy_gt_buffer_.empty()) {
-        std::optional<Matrix4d> T_curr = lookupNoisyGtAt(t_cloud);
+    if (!ext_odom_buffer_.empty()) {
+        std::optional<Matrix4d> T_curr = lookupExtOdomAt(t_cloud);
         if (T_curr.has_value()) {
             return T_curr;
         }
-        if (latest_noisy_gt_msg_) {
-            return poseMsgToMatrix(latest_noisy_gt_msg_->pose);
+        if (latest_ext_odom_msg_) {
+            return poseMsgToMatrix(latest_ext_odom_msg_->pose);
         }
         return std::nullopt;
     }
@@ -970,18 +974,18 @@ void GMMSLAMNode::maybeReanchorSmootherFromGt(const ros::Time& stamp,
 }
 
 // =====================================================================
-// sampleNoisyGtRelativePose
+// sampleExtOdomRelativePose
 // =====================================================================
 
-std::optional<Matrix4d> GMMSLAMNode::sampleNoisyGtRelativePose(const ros::Time& stamp)
+std::optional<Matrix4d> GMMSLAMNode::sampleExtOdomRelativePose(const ros::Time& stamp)
 {
     const double t_cloud = stampToSec(stamp);
 
     // Prefer external noisy GT topic
-    if (!noisy_gt_buffer_.empty()) {
-        std::optional<Matrix4d> T_curr_opt = lookupNoisyGtAt(t_cloud);
-        if (!T_curr_opt.has_value() && latest_noisy_gt_msg_) {
-            T_curr_opt = poseMsgToMatrix(latest_noisy_gt_msg_->pose);
+    if (!ext_odom_buffer_.empty()) {
+        std::optional<Matrix4d> T_curr_opt = lookupExtOdomAt(t_cloud);
+        if (!T_curr_opt.has_value() && latest_ext_odom_msg_) {
+            T_curr_opt = poseMsgToMatrix(latest_ext_odom_msg_->pose);
         }
         if (!T_curr_opt.has_value()) {
             return std::nullopt;
@@ -1017,9 +1021,9 @@ std::optional<Matrix4d> GMMSLAMNode::sampleNoisyGtRelativePose(const ros::Time& 
     const Matrix4d T_rel_gt = T_prev_gt.inverse() * T_curr_gt;
 
     Matrix4d T_yaw_bias = Matrix4d::Identity();
-    if (std::abs(cfg_.gt_noise.initial_yaw_offset_deg) > 1e-12) {
+    if (std::abs(cfg_.ext_odom.initial_yaw_offset_deg) > 1e-12) {
         const double yaw_rad =
-            cfg_.gt_noise.initial_yaw_offset_deg * M_PI / 180.0;
+            cfg_.ext_odom.initial_yaw_offset_deg * M_PI / 180.0;
         T_yaw_bias.block<3, 3>(0, 0) =
             Eigen::AngleAxisd(yaw_rad, Vector3d::UnitZ()).toRotationMatrix();
     }
@@ -1028,9 +1032,9 @@ std::optional<Matrix4d> GMMSLAMNode::sampleNoisyGtRelativePose(const ros::Time& 
 
     // Sample rotation noise as a small-angle axis-angle
     const Vector3d rot_noise(
-        normal_dist_(rng_) * cfg_.gt_noise.sigma_r,
-        normal_dist_(rng_) * cfg_.gt_noise.sigma_r,
-        normal_dist_(rng_) * cfg_.gt_noise.sigma_r);
+        normal_dist_(rng_) * cfg_.ext_odom.sigma_r,
+        normal_dist_(rng_) * cfg_.ext_odom.sigma_r,
+        normal_dist_(rng_) * cfg_.ext_odom.sigma_r);
     const Eigen::AngleAxisd aa(rot_noise.norm(),
                                rot_noise.norm() > 1e-12
                                    ? rot_noise.normalized()
@@ -1038,9 +1042,9 @@ std::optional<Matrix4d> GMMSLAMNode::sampleNoisyGtRelativePose(const ros::Time& 
     const Matrix3d R_noise = aa.toRotationMatrix();
 
     const Vector3d trans_noise(
-        normal_dist_(rng_) * cfg_.gt_noise.sigma_t,
-        normal_dist_(rng_) * cfg_.gt_noise.sigma_t,
-        normal_dist_(rng_) * cfg_.gt_noise.sigma_t);
+        normal_dist_(rng_) * cfg_.ext_odom.sigma_t,
+        normal_dist_(rng_) * cfg_.ext_odom.sigma_t,
+        normal_dist_(rng_) * cfg_.ext_odom.sigma_t);
 
     Matrix4d T_noisy = Matrix4d::Identity();
     T_noisy.block<3,3>(0,0) = R_noise * T_rel_biased.block<3,3>(0,0);
@@ -1180,7 +1184,7 @@ void GMMSLAMNode::logBackpressure(const ros::Time& stamp)
 // pclCallback — main pipeline
 // =====================================================================
 
-void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
+void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& msg)
 {
     try {
         if (!first_cloud_seen_) {
@@ -1244,7 +1248,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstPtr& msg)
         }
 
         // 3. Per-frame GT relative motion
-        const auto gt_rel_opt = sampleNoisyGtRelativePose(stamp);
+        const auto gt_rel_opt = sampleExtOdomRelativePose(stamp);
 
         // 4. Pose prediction.  External odometry/noisy GT remains the primary
         // pose prior when available; IMU propagation is evaluated below once

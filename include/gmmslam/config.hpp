@@ -13,8 +13,8 @@ struct RosConfig {
     /// Parent of odom_frame; published as map->odom TF after each global graph commit.
     /// Empty string disables map->odom publishing.
     std::string map_frame = "map";
-    /// geometry_msgs/PoseStamped odometry-style input (e.g. noisy GT publisher).
-    std::string odometry_input = "/gmmslam_node/noisy_gt_pose";
+    /// geometry_msgs/PoseStamped odometry-style input (e.g. external odometry publisher).
+    std::string odometry_input = "/gmmslam_node/ext_odom_pose";
     /// Persist latest odom-frame pose here; on respawn, seed the smoother from it.
     /// Empty string disables restart pose persistence.
     std::string restart_state_path = "/tmp/gmmslam_restart_pose.txt";
@@ -37,10 +37,9 @@ struct SogmmConfig {
     int max_points = 2000;
     int n_components = 0;
     std::string compute = "GPU";
-    /// "sogmm" preserves the legacy GIRA/SOGMM fitter. "gmmap" uses the
-    /// optional GMMap adapter when the input cloud is organized and GMMap was
-    /// enabled at build time.
-    std::string backend = "sogmm";
+    /// ROS 2 Humble port supports GMMap fitting only. The key name remains
+    /// `sogmm.backend` for config compatibility.
+    std::string backend = "gmmap";
     std::string gmmap_dataset = "tum";
     int gmmap_num_threads = 0;
     bool gmmap_measure_memory = true;
@@ -90,7 +89,7 @@ struct SogmmConfig {
 struct SmootherConfig {
     double fixed_lag_s = 4.0;
     int smoother_stride = 3;
-    bool enable_external_odometry_factor = true;
+    bool enable_external_odometry_factor = false;
     double odom_noise_sigma_t = 0.03;
     double odom_noise_sigma_r = 0.03;
     double lost_scale = 10.0;
@@ -241,7 +240,7 @@ struct GlobalGraphConfig {
     double submap_finalize_max_wait_s = 0.0;
 };
 
-struct GtNoiseConfig {
+struct ExtOdomConfig {
     double init_wait_s = 3.0;
     double sigma_t = 0.01;
     double sigma_r = 0.01;
@@ -323,7 +322,7 @@ struct Config {
     SolidConfig solid;
     KeyframeConfig keyframe;
     GlobalGraphConfig global_graph;
-    GtNoiseConfig gt_noise;
+    ExtOdomConfig ext_odom;
     ImuConfig imu;
     VisualizationConfig visualization;
     MapConfig map;

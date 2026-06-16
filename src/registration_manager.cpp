@@ -2,7 +2,6 @@
 #include "gmmslam/fixed_lag_backend.hpp"
 #include "gmmslam/gmmap_fitting.hpp"
 #include "gmmslam/global_pose_graph.hpp"
-#include "gmmslam/sogmm_fitting.hpp"
 #include "gmmslam/util/gmm_utils.hpp"
 
 #include <gtsam/geometry/Pose3.h>
@@ -25,7 +24,7 @@
 #include <thread>
 #include <vector>
 
-#include <ros/ros.h>
+#include "gmmslam/ros2_compat.hpp"
 #include <std_msgs/String.h>
 #include <geometry_msgs/Point.h>
 #include <visualization_msgs/Marker.h>
@@ -452,26 +451,20 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
                 throw std::runtime_error("fit job has null point cloud");
             }
             const std::string backend = lowercase(sogmm_cfg_.backend);
-            GmmModel model;
-            std::string backend_used = "sogmm";
-            if (backend == "gmmap") {
-                if (job.organized_depth.has_value() &&
-                    job.organized_depth->valid() && gmmapFittingAvailable()) {
-                    model = fitGmmap(job.organized_depth.value(), sogmm_cfg_);
-                    backend_used = "gmmap";
-                } else {
-                    ROS_WARN_THROTTLE(
-                        5.0,
-                        "[registration] GMMap backend requested but %s; "
-                        "falling back to SOGMM",
-                        !gmmapFittingAvailable()
-                            ? "GMMap is not built"
-                            : "organized depth is unavailable");
-                    model = fitSogmm(*job.points, sogmm_cfg_);
-                }
-            } else {
-                model = fitSogmm(*job.points, sogmm_cfg_);
+            if (backend != "gmmap") {
+                throw std::runtime_error(
+                    "ROS 2 Humble port supports only sogmm.backend=gmmap");
             }
+            if (!gmmapFittingAvailable()) {
+                throw std::runtime_error("GMMap backend is not built");
+            }
+            if (!job.organized_depth.has_value() ||
+                !job.organized_depth->valid()) {
+                throw std::runtime_error(
+                    "GMMap backend requires organized depth input");
+            }
+            GmmModel model = fitGmmap(job.organized_depth.value(), sogmm_cfg_);
+            std::string backend_used = "gmmap";
             const auto t1 = std::chrono::steady_clock::now();
             const double dt_ms =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -973,7 +966,7 @@ void RegistrationManager::enqueueLoopClosureRequests(
 // resultCallback — ROS subscriber callback
 // ---------------------------------------------------------------------------
 
-void RegistrationManager::resultCallback(const std_msgs::String::ConstPtr& msg)
+void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr& msg)
 {
     nlohmann::json data;
     try {

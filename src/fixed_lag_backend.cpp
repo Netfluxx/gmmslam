@@ -8,7 +8,7 @@
 #include <gtsam/navigation/NavState.h>
 #include <gtsam/inference/Symbol.h>
 
-#include <ros/ros.h>
+#include "gmmslam/ros2_compat.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -45,7 +45,7 @@ static ConstantBias zeroBias() {
 // -----------------------------------------------------------------------
 
 FixedLagBackend::FixedLagBackend(const SmootherConfig& smoother_cfg,
-                                 const GtNoiseConfig& gt_cfg,
+                                 const ExtOdomConfig& gt_cfg,
                                  const LoopClosureConfig& loop_cfg,
                                  const ImuConfig& imu_cfg,
                                  const std::string& benchmark_log_dir)

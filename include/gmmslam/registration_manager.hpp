@@ -22,7 +22,7 @@
 #include <thread>
 #include <vector>
 
-#include <ros/ros.h>
+#include "gmmslam/ros2_compat.hpp"
 #include <std_msgs/String.h>
 #include <visualization_msgs/MarkerArray.h>
 
@@ -63,7 +63,7 @@ public:
     void fitWorkerLoop(const std::atomic<bool>& shutdown);
 
     // ROS result callback
-    void resultCallback(const std_msgs::String::ConstPtr& msg);
+    void resultCallback(const std_msgs::String::ConstSharedPtr& msg);
 
     // Drain result queue and stage factors in the smoother
     void drainResults(const ros::Time& stamp);

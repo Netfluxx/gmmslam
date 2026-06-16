@@ -7,7 +7,7 @@
  * forward arc leg and sets the reference to its temporal midpoint (true cosine).
  *
  * Typical use with Webots apartment + orbit supervisor:
- *   roslaunch gmmslam solid_descriptor_benchmark.launch
+ *   ros2 launch gmmslam solid_descriptor_benchmark.launch.py
  *
  * ~metrics (std_msgs/Float64MultiArray): [t_sec, x_m, y_m, z_m, yaw_rad,
  *                                         delta_yaw_deg, solid_score,
@@ -26,7 +26,7 @@
 #include <string>
 #include <vector>
 
-#include <ros/ros.h>
+#include "gmmslam/ros2_compat.hpp"
 #include <geometry_msgs/PoseStamped.h>
 #include <nav_msgs/Odometry.h>
 #include <sensor_msgs/PointCloud2.h>
@@ -146,7 +146,7 @@ public:
     }
 
 private:
-    void onPose(const geometry_msgs::PoseStamped::ConstPtr& msg) {
+    void onPose(const geometry_msgs::PoseStamped::ConstSharedPtr& msg) {
         const auto& q = msg->pose.orientation;
         const double yaw = yawFromQuatXYZW(q.x, q.y, q.z, q.w);
         std::lock_guard<std::mutex> lk(pose_mu_);
@@ -158,7 +158,7 @@ private:
         latest_pose_valid_ = true;
     }
 
-    void onOdom(const nav_msgs::Odometry::ConstPtr& msg) {
+    void onOdom(const nav_msgs::Odometry::ConstSharedPtr& msg) {
         const auto& q = msg->pose.pose.orientation;
         const double yaw = yawFromQuatXYZW(q.x, q.y, q.z, q.w);
         std::lock_guard<std::mutex> lk(pose_mu_);
@@ -170,7 +170,7 @@ private:
         latest_pose_valid_ = true;
     }
 
-    void onCloud(const sensor_msgs::PointCloud2::ConstPtr& msg) {
+    void onCloud(const sensor_msgs::PointCloud2::ConstSharedPtr& msg) {
         Eigen::MatrixXf pts = gmmslam::pc2ToEigen(*msg);
         pts = gmmslam::preprocess(pts, cfg_.preprocess.min_range,
                                   cfg_.preprocess.max_range,
@@ -219,7 +219,7 @@ private:
             return;
         }
 
-        const double t_sec = msg->header.stamp.toSec();
+        const double t_sec = ros::Time(msg->header.stamp).toSec();
 
         if (use_mid_arc_ref_ && !ref_ready_) {
             updateMidArcBuffer(t_sec, x_m, y_m, z_m, yaw_rad, desc, polar_context,

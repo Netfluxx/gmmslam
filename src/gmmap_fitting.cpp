@@ -12,7 +12,7 @@
 #include <vector>
 
 #include <Eigen/Eigenvalues>
-#include <ros/ros.h>
+#include "gmmslam/ros2_compat.hpp"
 
 #ifdef GMMSLAM_HAS_GMMAP
 #include <gmm_map/cluster.h>

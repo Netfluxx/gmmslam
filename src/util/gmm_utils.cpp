@@ -3,7 +3,7 @@
 #include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
 #include <gmm/GMM3.h>
-#include <ros/ros.h>
+#include "gmmslam/ros2_compat.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <cmath>

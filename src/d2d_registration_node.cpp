@@ -1,8 +1,7 @@
 #include "gmmslam/config.hpp"
 #include "gmmslam/d2d_registration.hpp"
 
-#include <ros/ros.h>
-#include <ros/console.h>
+#include "gmmslam/ros2_compat.hpp"
 #include <std_msgs/String.h>
 #include <nlohmann/json.hpp>
 
@@ -395,7 +394,7 @@ private:
         return sequential_d2d_options_;
     }
 
-    void requestCallback(const std_msgs::String::ConstPtr& msg) {
+    void requestCallback(const std_msgs::String::ConstSharedPtr& msg) {
         std::lock_guard<std::mutex> lk(queue_mutex_);
         bool is_loop = false;
         bool is_submap = false;

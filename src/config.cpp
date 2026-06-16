@@ -21,9 +21,7 @@ void loadRos(const YAML::Node& root, RosConfig& c) {
     c.odom_frame = readOr<std::string>(n, "odom_frame", c.odom_frame);
     c.map_frame = readOr<std::string>(n, "map_frame", c.map_frame);
     c.base_frame = readOr<std::string>(n, "base_frame", c.base_frame);
-    c.odometry_input = readOr<std::string>(
-        n, "odometry_input",
-        readOr<std::string>(n, "noisy_gt_topic", c.odometry_input));
+    c.odometry_input = readOr<std::string>(n, "odometry_input", c.odometry_input);
     c.restart_state_path = readOr<std::string>(
         n, "restart_state_path", c.restart_state_path);
     c.registration_request_topic = readOr<std::string>(n, "registration_request_topic", c.registration_request_topic);
@@ -312,9 +310,9 @@ void loadGlobalGraph(const YAML::Node& root, GlobalGraphConfig& c) {
         readOr(n, "submap_finalize_max_wait_s", c.submap_finalize_max_wait_s);
 }
 
-void loadGtNoise(const YAML::Node& root, GtNoiseConfig& c) {
-    if (!root["gt_noise"]) return;
-    const auto& n = root["gt_noise"];
+void loadExtOdom(const YAML::Node& root, ExtOdomConfig& c) {
+    if (!root["ext_odom"]) return;
+    const auto& n = root["ext_odom"];
     c.init_wait_s = readOr(n, "init_wait_s", c.init_wait_s);
     c.sigma_t = readOr(n, "sigma_t", c.sigma_t);
     c.sigma_r = readOr(n, "sigma_r", c.sigma_r);
@@ -397,7 +395,7 @@ Config loadConfig(const std::string& yaml_path) {
     loadSolid(root, cfg.solid);
     loadKeyframe(root, cfg.keyframe);
     loadGlobalGraph(root, cfg.global_graph);
-    loadGtNoise(root, cfg.gt_noise);
+    loadExtOdom(root, cfg.ext_odom);
     loadImu(root, cfg.imu);
     loadVisualization(root, cfg.visualization);
     loadMap(root, cfg.map);

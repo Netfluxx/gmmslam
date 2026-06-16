@@ -10,7 +10,7 @@ BUILD_TYPE="${BUILD_TYPE:-Release}"
 SAMPLE_INTERVAL="1"
 ENABLE_SAMPLING=true
 DOCKER_MODE="auto"
-PROCESS_PATTERN="gmmslam_node|d2d_registration_node|noisy_gt_publisher_node|run_gmmslam_cpp|benchmark_gmmslam_cpp|roslaunch|rosmaster|roscore|rosout|rosbag|rviz|webots|catkin_make|make|cmake|g\\+\\+|cc1plus"
+PROCESS_PATTERN="gmmslam_node|d2d_registration_node|ext_odom_publisher_node|run_gmmslam_cpp|benchmark_gmmslam_cpp|roslaunch|rosmaster|roscore|rosout|rosbag|rviz|webots|catkin_make|make|cmake|g\\+\\+|cc1plus"
 ORIGINAL_ARGS=("$@")
 RUN_ARGS=()
 

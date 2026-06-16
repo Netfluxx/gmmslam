@@ -9,7 +9,7 @@
 #include <geometry_msgs/Pose.h>
 #include <geometry_msgs/PoseStamped.h>
 #include <geometry_msgs/TransformStamped.h>
-#include <ros/time.h>
+#include "gmmslam/ros2_compat.hpp"
 #include <sensor_msgs/PointCloud2.h>
 
 #include "gmmslam/types.hpp"
