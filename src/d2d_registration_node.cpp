@@ -1,26 +1,31 @@
 #include "gmmslam/config.hpp"
+#include "gmmslam/rclcpp_logging.hpp"
 #include "gmmslam/d2d_registration.hpp"
 
-#include "gmmslam/ros2_compat.hpp"
-#include <std_msgs/String.h>
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <nlohmann/json.hpp>
+#include <yaml-cpp/yaml.h>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
 #include <Eigen/LU>
+#include <rcutils/logging.h>
+#include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cmath>
 #include <condition_variable>
 #include <cstdio>
-#include <deque>
+#include <cstdint>
 #include <filesystem>
-#include <list>
+#include <initializer_list>
 #include <limits>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
@@ -32,9 +37,8 @@ namespace {
 
 void applyDebugPrints(bool enable) {
     if (!enable) {
-        ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME,
-                                       ros::console::levels::Warn);
-        ros::console::notifyLoggerLevelsChanged();
+        rcutils_logging_set_logger_level(
+            "gmmslam", RCUTILS_LOG_SEVERITY_WARN);
     }
 }
 
@@ -46,32 +50,120 @@ const char* d2dSuccessColor(bool is_loop, bool is_submap) {
 
 constexpr const char* kAnsiReset = "\033[0m";
 
+class NodeParams {
+public:
+    explicit NodeParams(rclcpp::Node::SharedPtr node) : node_(std::move(node)) {}
+
+    template <typename T>
+    void param(const std::string& key, T& value, const T& default_value) const {
+        value = get<T>(key, default_value);
+    }
+
+    template <typename T>
+    bool getParam(const std::string& key, T& value) const {
+        if (!node_) return false;
+        if (node_->has_parameter(key)) {
+            return node_->get_parameter(key, value);
+        }
+        const std::string dotted = dottedName(key);
+        if (dotted != key && node_->has_parameter(dotted)) {
+            return node_->get_parameter(dotted, value);
+        }
+        return false;
+    }
+
+private:
+    static std::string dottedName(std::string key) {
+        while (!key.empty() && key.front() == '/') {
+            key.erase(key.begin());
+        }
+        for (char& ch : key) {
+            if (ch == '/') ch = '.';
+        }
+        return key;
+    }
+
+    template <typename T>
+    T get(const std::string& key, const T& fallback) const {
+        T value = fallback;
+        if (getParam(key, value)) {
+            return value;
+        }
+        if (node_ && !node_->has_parameter(key)) {
+            node_->declare_parameter<T>(key, fallback);
+        }
+        return value;
+    }
+
+    rclcpp::Node::SharedPtr node_;
+};
+
+rclcpp::QoS reliableQos(std::size_t depth) {
+    return rclcpp::QoS(rclcpp::KeepLast(depth)).reliable();
+}
+
+template <typename T>
+void readYamlValue(const YAML::Node& root,
+                   std::initializer_list<const char*> path,
+                   T& value) {
+    YAML::Node node = root;
+    for (const char* key : path) {
+        if (!node || !node[key]) {
+            return;
+        }
+        node = node[key];
+    }
+    try {
+        value = node.as<T>();
+    } catch (const YAML::Exception&) {
+    }
+}
+
 } // namespace
 
 class D2DRegistrationNode {
 public:
-    D2DRegistrationNode(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
+    explicit D2DRegistrationNode(rclcpp::Node::SharedPtr node)
+        : node_(std::move(node)) {
+        NodeParams pnh(node_);
         std::string request_topic, result_topic;
+        std::string config_path;
+        pnh.param<std::string>("config_file", config_path, "");
+        gmmslam::Config cfg;
+        YAML::Node yaml_root;
+        if (!config_path.empty()) {
+            cfg = gmmslam::loadConfig(config_path);
+            try {
+                yaml_root = YAML::LoadFile(config_path);
+            } catch (const YAML::Exception& e) {
+                GMS_WARN("[d2d_reg] failed to parse config_file for D2D-only "
+                         "options: %s", e.what());
+            }
+        }
+
         pnh.param<std::string>("request_topic", request_topic,
-                               "/gmmslam_node/registration/request");
+                               cfg.ros.registration_request_topic);
         pnh.param<std::string>("result_topic", result_topic,
-                               "/gmmslam_node/registration/result");
-        pnh.param<int>("num_workers", num_workers_, 2);
+                               cfg.ros.registration_result_topic);
+        pnh.param<int>("num_workers", num_workers_, cfg.registration.workers);
         num_workers_ = std::max(1, num_workers_);
-        nh.param("/gmmslam/registration/score_threshold", score_threshold_, 0.85);
-        nh.param("/gmmslam/loop_closure/detect_score_threshold",
-                 loop_score_threshold_, loop_score_threshold_);
+        score_threshold_ = cfg.registration.score_threshold;
+        loop_score_threshold_ = cfg.loop_closure.detect_score_threshold;
         pnh.param<bool>("suppress_backend_output", suppress_backend_output_, true);
         pnh.param<double>("drop_stale_keyframe_age_s",
                           drop_stale_keyframe_age_s_, 2.0);
-        nh.param("/gmmslam/registration/sequential_prior_gate_trans_m",
-                 sequential_prior_gate_trans_m_, sequential_prior_gate_trans_m_);
-        nh.param("/gmmslam/registration/sequential_prior_gate_rot_deg",
-                 sequential_prior_gate_rot_deg_, sequential_prior_gate_rot_deg_);
-        nh.param("/gmmslam/registration/loop_prior_gate_trans_m",
-                 loop_prior_gate_trans_m_, loop_prior_gate_trans_m_);
-        nh.param("/gmmslam/registration/loop_prior_gate_rot_deg",
-                 loop_prior_gate_rot_deg_, loop_prior_gate_rot_deg_);
+        readYamlValue(yaml_root,
+                      {"registration", "sequential_prior_gate_trans_m"},
+                      sequential_prior_gate_trans_m_);
+        readYamlValue(yaml_root,
+                      {"registration", "sequential_prior_gate_rot_deg"},
+                      sequential_prior_gate_rot_deg_);
+        readYamlValue(yaml_root,
+                      {"registration", "loop_prior_gate_trans_m"},
+                      loop_prior_gate_trans_m_);
+        readYamlValue(yaml_root,
+                      {"registration", "loop_prior_gate_rot_deg"},
+                      loop_prior_gate_rot_deg_);
         pnh.param<double>("sequential_prior_gate_trans_m",
                           sequential_prior_gate_trans_m_,
                           sequential_prior_gate_trans_m_);
@@ -84,21 +176,31 @@ public:
         pnh.param<double>("loop_prior_gate_rot_deg",
                           loop_prior_gate_rot_deg_,
                           loop_prior_gate_rot_deg_);
-        nh.param("/gmmslam/DEBUG_PRINTS", debug_prints_, debug_prints_);
+        debug_prints_ = cfg.debug_prints;
         pnh.param<bool>("debug_prints", debug_prints_, debug_prints_);
         applyDebugPrints(debug_prints_);
-        loadD2DOptions(nh, pnh);
+        loadD2DOptions(yaml_root, pnh);
 
-        result_pub_ = nh.advertise<std_msgs::String>(result_topic, 50);
+        result_pub_ =
+            node_->create_publisher<std_msgs::msg::String>(result_topic,
+                                                           reliableQos(50));
 
         for (int i = 0; i < num_workers_; ++i) {
             workers_.emplace_back(&D2DRegistrationNode::workerLoop, this);
         }
 
-        request_sub_ = nh.subscribe(request_topic, 200,
-                                    &D2DRegistrationNode::requestCallback, this);
+        request_callback_group_ = node_->create_callback_group(
+            rclcpp::CallbackGroupType::MutuallyExclusive);
+        rclcpp::SubscriptionOptions request_options;
+        request_options.callback_group = request_callback_group_;
+        request_sub_ = node_->create_subscription<std_msgs::msg::String>(
+            request_topic, reliableQos(200),
+            [this](std_msgs::msg::String::ConstSharedPtr msg) {
+                requestCallback(msg);
+            },
+            request_options);
 
-        ROS_INFO("[d2d_reg] ready | workers=%d | %s -> %s | "
+        GMS_INFO("[d2d_reg] ready | workers=%d | %s -> %s | "
                  "suppress_backend_output=%s | drop_stale_keyframe_age_s=%.2f | "
                  "score_thresholds(seq=%.3f loop=%.3f) | "
                  "prior_gates(seq=%.2fm/%.1fdeg loop=%.2fm/%.1fdeg) | "
@@ -113,12 +215,13 @@ public:
                  loop_prior_gate_trans_m_,
                  loop_prior_gate_rot_deg_,
                  debug_prints_ ? "true" : "false");
-        ROS_INFO("[d2d_reg] d2d_options | "
+        GMS_INFO("[d2d_reg] d2d_options | "
                  "seq(fast=%s margin=%.3f coarse_iter=%lu fine=%s) | "
                  "loop(fast=%s coarse_iter=%lu fine=%s fine_min=%.3f) | "
                  "submap(fast=%s coarse_iter=%lu fine=%s fine_min=%.3f) | "
                  "delta_stop=%.1e fine_delta_stop=%.1e trust=%.2f fine_trust=%.2f "
-                 "fine_iter=%lu hessian_damping=%.1e",
+                 "fine_iter=%lu hessian_damping=%.1e | "
+                 "openmp_raw_score=%s min_pairs=%d max_threads=%d timing_log=%s",
                  sequential_d2d_options_.initial_score_fast_path ? "true" : "false",
                  sequential_d2d_options_.initial_score_margin,
                  sequential_d2d_options_.coarse_max_iterations,
@@ -136,7 +239,11 @@ public:
                  sequential_d2d_options_.initial_trust_radius,
                  sequential_d2d_options_.fine_initial_trust_radius,
                  sequential_d2d_options_.fine_max_iterations,
-                 sequential_d2d_options_.hessian_damping);
+                 sequential_d2d_options_.hessian_damping,
+                 sequential_d2d_options_.openmp_raw_score_enable ? "true" : "false",
+                 sequential_d2d_options_.openmp_min_pairs,
+                 sequential_d2d_options_.openmp_max_threads,
+                 sequential_d2d_options_.openmp_timing_log_enable ? "true" : "false");
     }
 
     ~D2DRegistrationNode() {
@@ -154,21 +261,90 @@ private:
     static constexpr std::size_t kMaxQueueSize = 64;
     static constexpr std::size_t kGmmCacheCapacity = 128;
 
+    class StringRingQueue {
+    public:
+        explicit StringRingQueue(std::size_t capacity)
+            : slots_(capacity), capacity_(capacity) {}
+
+        bool empty() const { return size_ == 0; }
+        std::size_t size() const { return size_; }
+
+        std::string& front() { return slots_[head_]; }
+
+        void push_back(std::string value) {
+            if (capacity_ == 0) return;
+            if (size_ == capacity_) {
+                pop_back();
+            }
+            slots_[tail_] = std::move(value);
+            tail_ = (tail_ + 1) % capacity_;
+            ++size_;
+        }
+
+        void pop_front() {
+            if (size_ == 0) return;
+            slots_[head_].clear();
+            head_ = (head_ + 1) % capacity_;
+            --size_;
+            if (size_ == 0) {
+                head_ = tail_;
+            }
+        }
+
+        void pop_back() {
+            if (size_ == 0) return;
+            tail_ = (tail_ + capacity_ - 1) % capacity_;
+            slots_[tail_].clear();
+            --size_;
+            if (size_ == 0) {
+                head_ = tail_;
+            }
+        }
+
+        void clear() {
+            for (std::size_t i = 0; i < size_; ++i) {
+                slots_[(head_ + i) % capacity_].clear();
+            }
+            size_ = 0;
+            tail_ = head_;
+        }
+
+    private:
+        std::vector<std::string> slots_;
+        std::size_t capacity_ = 0;
+        std::size_t head_ = 0;
+        std::size_t tail_ = 0;
+        std::size_t size_ = 0;
+    };
+
     class GmmLruCache {
     public:
-        explicit GmmLruCache(std::size_t capacity) : capacity_(capacity) {}
+        explicit GmmLruCache(std::size_t capacity) : capacity_(capacity) {
+            entries_.reserve(capacity_);
+        }
 
         std::shared_ptr<const gmm_utils::GMM3f> get(const std::string& path,
                                                     bool isoplanar) {
-            const std::string key =
-                std::filesystem::absolute(path).lexically_normal().string();
             std::lock_guard<std::mutex> lk(mutex_);
 
-            auto it = entries_.find(key);
-            if (it != entries_.end()) {
-                lru_.splice(lru_.begin(), lru_, it->second.lru_it);
-                ++hits_;
-                return it->second.model;
+            ++clock_;
+            for (auto& entry : entries_) {
+                if (entry.raw_path == path) {
+                    entry.last_used = clock_;
+                    ++hits_;
+                    return entry.model;
+                }
+            }
+
+            const std::string key =
+                std::filesystem::absolute(path).lexically_normal().string();
+            for (auto& entry : entries_) {
+                if (entry.normalized_path == key) {
+                    entry.raw_path = path;
+                    entry.last_used = clock_;
+                    ++hits_;
+                    return entry.model;
+                }
             }
 
             auto model_ptr = std::make_shared<gmm_utils::GMM3f>();
@@ -176,16 +352,20 @@ private:
             if (isoplanar) {
                 model_ptr->makeCovsIsoplanar();
             }
-            lru_.push_front(key);
-            entries_.emplace(key, Entry{model_ptr, lru_.begin()});
+
+            if (entries_.size() < capacity_) {
+                entries_.push_back(Entry{path, key, model_ptr, clock_});
+            } else if (!entries_.empty()) {
+                auto victim = std::min_element(
+                    entries_.begin(), entries_.end(),
+                    [](const Entry& a, const Entry& b) {
+                        return a.last_used < b.last_used;
+                    });
+                *victim = Entry{path, key, model_ptr, clock_};
+            }
             ++misses_;
 
-            while (entries_.size() > capacity_ && !lru_.empty()) {
-                entries_.erase(lru_.back());
-                lru_.pop_back();
-            }
-
-            ROS_DEBUG_THROTTLE(
+            GMS_DEBUG_THROTTLE(
                 10.0,
                 "[d2d_reg] %s GMM cache size=%zu hits=%zu misses=%zu",
                 isoplanar ? "isoplanar" : "normal",
@@ -195,14 +375,16 @@ private:
 
     private:
         struct Entry {
+            std::string raw_path;
+            std::string normalized_path;
             std::shared_ptr<const gmm_utils::GMM3f> model;
-            std::list<std::string>::iterator lru_it;
+            std::uint64_t last_used = 0;
         };
 
         std::size_t capacity_;
         std::mutex mutex_;
-        std::list<std::string> lru_;
-        std::unordered_map<std::string, Entry> entries_;
+        std::vector<Entry> entries_;
+        std::uint64_t clock_ = 0;
         std::size_t hits_ = 0;
         std::size_t misses_ = 0;
     };
@@ -281,92 +463,125 @@ private:
         }
     }
 
-    static void readDoubleParam(ros::NodeHandle& nh,
-                                ros::NodeHandle& pnh,
-                                const std::string& absolute_key,
+    static void readDoubleParam(const NodeParams& pnh,
+                                const YAML::Node& yaml_root,
+                                std::initializer_list<const char*> yaml_path,
                                 const std::string& private_key,
                                 double& value) {
-        nh.param<double>(absolute_key, value, value);
+        readYamlValue(yaml_root, yaml_path, value);
         pnh.param<double>(private_key, value, value);
     }
 
-    static void readBoolParam(ros::NodeHandle& nh,
-                              ros::NodeHandle& pnh,
-                              const std::string& absolute_key,
+    static void readBoolParam(const NodeParams& pnh,
+                              const YAML::Node& yaml_root,
+                              std::initializer_list<const char*> yaml_path,
                               const std::string& private_key,
                               bool& value) {
-        nh.param<bool>(absolute_key, value, value);
+        readYamlValue(yaml_root, yaml_path, value);
         pnh.param<bool>(private_key, value, value);
     }
 
-    static void readUnsignedParam(ros::NodeHandle& nh,
-                                  ros::NodeHandle& pnh,
-                                  const std::string& absolute_key,
+    static void readUnsignedParam(const NodeParams& pnh,
+                                  const YAML::Node& yaml_root,
+                                  std::initializer_list<const char*> yaml_path,
                                   const std::string& private_key,
                                   unsigned long& value) {
-        int parsed = static_cast<int>(std::min<unsigned long>(
+        int yaml_value = static_cast<int>(std::min<unsigned long>(
             value, static_cast<unsigned long>(std::numeric_limits<int>::max())));
-        nh.param<int>(absolute_key, parsed, parsed);
+        readYamlValue(yaml_root, yaml_path, yaml_value);
+        int parsed = static_cast<int>(std::min<unsigned long>(
+            static_cast<unsigned long>(std::max(1, yaml_value)),
+            static_cast<unsigned long>(std::numeric_limits<int>::max())));
         pnh.param<int>(private_key, parsed, parsed);
         value = static_cast<unsigned long>(std::max(1, parsed));
     }
 
-    static void loadModeOptions(ros::NodeHandle& nh,
-                                ros::NodeHandle& pnh,
+    static void readIntParam(const NodeParams& pnh,
+                             const YAML::Node& yaml_root,
+                             std::initializer_list<const char*> yaml_path,
+                             const std::string& private_key,
+                             int& value) {
+        readYamlValue(yaml_root, yaml_path, value);
+        pnh.param<int>(private_key, value, value);
+    }
+
+    static void loadModeOptions(const YAML::Node& yaml_root,
+                                const NodeParams& pnh,
                                 const std::string& mode,
                                 gmmslam::D2DRegistrationOptions& options) {
-        const std::string absolute_prefix =
-            "/gmmslam/registration/d2d/" + mode + "/";
         const std::string private_prefix = "d2d_" + mode + "_";
 
-        readBoolParam(nh, pnh,
-                      absolute_prefix + "initial_score_fast_path",
+        readBoolParam(pnh, yaml_root,
+                      {"registration", "d2d", mode.c_str(),
+                       "initial_score_fast_path"},
                       private_prefix + "initial_score_fast_path",
                       options.initial_score_fast_path);
-        readDoubleParam(nh, pnh,
-                        absolute_prefix + "initial_score_margin",
+        readDoubleParam(pnh, yaml_root,
+                        {"registration", "d2d", mode.c_str(),
+                         "initial_score_margin"},
                         private_prefix + "initial_score_margin",
                         options.initial_score_margin);
-        readUnsignedParam(nh, pnh,
-                          absolute_prefix + "coarse_max_iterations",
+        readUnsignedParam(pnh, yaml_root,
+                          {"registration", "d2d", mode.c_str(),
+                           "coarse_max_iterations"},
                           private_prefix + "coarse_max_iterations",
                           options.coarse_max_iterations);
-        readBoolParam(nh, pnh,
-                      absolute_prefix + "fine_refine_enable",
+        readBoolParam(pnh, yaml_root,
+                      {"registration", "d2d", mode.c_str(),
+                       "fine_refine_enable"},
                       private_prefix + "fine_refine_enable",
                       options.fine_refine_enable);
-        readDoubleParam(nh, pnh,
-                        absolute_prefix + "fine_min_coarse_score",
+        readDoubleParam(pnh, yaml_root,
+                        {"registration", "d2d", mode.c_str(),
+                         "fine_min_coarse_score"},
                         private_prefix + "fine_min_coarse_score",
                         options.fine_min_coarse_score);
     }
 
-    void loadD2DOptions(ros::NodeHandle& nh, ros::NodeHandle& pnh) {
+    void loadD2DOptions(const YAML::Node& yaml_root, const NodeParams& pnh) {
         gmmslam::D2DRegistrationOptions base;
-        readDoubleParam(nh, pnh,
-                        "/gmmslam/registration/d2d/objective_delta_stop",
+        readDoubleParam(pnh, yaml_root,
+                        {"registration", "d2d", "objective_delta_stop"},
                         "d2d_objective_delta_stop",
                         base.objective_delta_stop);
-        readDoubleParam(nh, pnh,
-                        "/gmmslam/registration/d2d/initial_trust_radius",
+        readDoubleParam(pnh, yaml_root,
+                        {"registration", "d2d", "initial_trust_radius"},
                         "d2d_initial_trust_radius",
                         base.initial_trust_radius);
-        readDoubleParam(nh, pnh,
-                        "/gmmslam/registration/d2d/fine_objective_delta_stop",
+        readDoubleParam(pnh, yaml_root,
+                        {"registration", "d2d", "fine_objective_delta_stop"},
                         "d2d_fine_objective_delta_stop",
                         base.fine_objective_delta_stop);
-        readUnsignedParam(nh, pnh,
-                          "/gmmslam/registration/d2d/fine_max_iterations",
+        readUnsignedParam(pnh, yaml_root,
+                          {"registration", "d2d", "fine_max_iterations"},
                           "d2d_fine_max_iterations",
                           base.fine_max_iterations);
-        readDoubleParam(nh, pnh,
-                        "/gmmslam/registration/d2d/fine_initial_trust_radius",
+        readDoubleParam(pnh, yaml_root,
+                        {"registration", "d2d", "fine_initial_trust_radius"},
                         "d2d_fine_initial_trust_radius",
                         base.fine_initial_trust_radius);
-        readDoubleParam(nh, pnh,
-                        "/gmmslam/registration/d2d/hessian_damping",
+        readDoubleParam(pnh, yaml_root,
+                        {"registration", "d2d", "hessian_damping"},
                         "d2d_hessian_damping",
                         base.hessian_damping);
+        readBoolParam(pnh, yaml_root,
+                      {"registration", "d2d", "openmp_raw_score_enable"},
+                      "d2d_openmp_raw_score_enable",
+                      base.openmp_raw_score_enable);
+        readIntParam(pnh, yaml_root,
+                     {"registration", "d2d", "openmp_min_pairs"},
+                     "d2d_openmp_min_pairs",
+                     base.openmp_min_pairs);
+        readIntParam(pnh, yaml_root,
+                     {"registration", "d2d", "openmp_max_threads"},
+                     "d2d_openmp_max_threads",
+                     base.openmp_max_threads);
+        readBoolParam(pnh, yaml_root,
+                      {"registration", "d2d", "openmp_timing_log_enable"},
+                      "d2d_openmp_timing_log_enable",
+                      base.openmp_timing_log_enable);
+        base.openmp_min_pairs = std::max(0, base.openmp_min_pairs);
+        base.openmp_max_threads = std::max(1, base.openmp_max_threads);
 
         sequential_d2d_options_ = base;
         sequential_d2d_options_.initial_score_fast_path = true;
@@ -382,9 +597,9 @@ private:
 
         submap_d2d_options_ = loop_d2d_options_;
 
-        loadModeOptions(nh, pnh, "sequential", sequential_d2d_options_);
-        loadModeOptions(nh, pnh, "loop", loop_d2d_options_);
-        loadModeOptions(nh, pnh, "submap", submap_d2d_options_);
+        loadModeOptions(yaml_root, pnh, "sequential", sequential_d2d_options_);
+        loadModeOptions(yaml_root, pnh, "loop", loop_d2d_options_);
+        loadModeOptions(yaml_root, pnh, "submap", submap_d2d_options_);
     }
 
     gmmslam::D2DRegistrationOptions optionsForRequest(bool is_loop,
@@ -394,7 +609,7 @@ private:
         return sequential_d2d_options_;
     }
 
-    void requestCallback(const std_msgs::String::ConstSharedPtr& msg) {
+    void requestCallback(const std_msgs::msg::String::ConstSharedPtr& msg) {
         std::lock_guard<std::mutex> lk(queue_mutex_);
         bool is_loop = false;
         bool is_submap = false;
@@ -405,9 +620,9 @@ private:
 
         if (!is_loop && !is_submap && drop_stale_keyframe_age_s_ > 0.0 &&
             std::isfinite(stamp) && stamp > 0.0) {
-            const double age_s = ros::Time::now().toSec() - stamp;
+            const double age_s = node_->now().seconds() - stamp;
             if (std::isfinite(age_s) && age_s > drop_stale_keyframe_age_s_) {
-                ROS_INFO_THROTTLE(
+                GMS_INFO_THROTTLE(
                     2.0,
                     "[d2d_reg] dropping stale keyframe registration at enqueue "
                     "prev=%d curr=%d age=%.2fs > %.2fs",
@@ -419,19 +634,19 @@ private:
         if (queuedTaskCount() >= kMaxQueueSize) {
             if (!sequential_queue_.empty()) {
                 sequential_queue_.pop_back();
-                ROS_WARN_THROTTLE(
+                GMS_WARN_THROTTLE(
                     5.0,
                     "[d2d_reg] task queue full; dropped oldest sequential job "
                     "to admit %s request",
                     requestTag(is_loop, is_submap).c_str());
             } else if (is_loop && !submap_queue_.empty()) {
                 submap_queue_.pop_back();
-                ROS_WARN_THROTTLE(
+                GMS_WARN_THROTTLE(
                     5.0,
                     "[d2d_reg] task queue full; dropped oldest submap job "
                     "to admit loop request");
             } else {
-                ROS_WARN_THROTTLE(
+                GMS_WARN_THROTTLE(
                     5.0,
                     "[d2d_reg] task queue full (%zu), dropping %s request",
                     queuedTaskCount(), requestTag(is_loop, is_submap).c_str());
@@ -447,7 +662,7 @@ private:
             const std::size_t dropped = sequential_queue_.size();
             sequential_queue_.clear();
             if (dropped > 0) {
-                ROS_WARN_THROTTLE(
+                GMS_WARN_THROTTLE(
                     2.0,
                     "[d2d_reg] dropped %zu queued sequential D2D job(s); "
                     "keeping newest prev=%d curr=%d",
@@ -525,14 +740,54 @@ private:
             gmmslam::D2DRegistrationOptions d2d_options =
                 optionsForRequest(is_loop, is_submap);
             d2d_options.initial_score_threshold = active_score_threshold;
-            ROS_INFO("[d2d_reg] %s request start | prev=%d curr=%d",
+            long seed_score_ms = 0;
+            long anisotropic_ms = 0;
+            int seed_score_calls = 0;
+            int k_source_for_timing = -1;
+            int k_target_for_timing = -1;
+            auto elapsedSinceRequestStartMs = [&]() -> long {
+                return static_cast<long>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - request_t0).count());
+            };
+            auto logD2DTiming = [&](const char* outcome) {
+                if (!d2d_options.openmp_timing_log_enable) {
+                    return;
+                }
+                const std::size_t estimated_pairs =
+                    (k_source_for_timing > 0 && k_target_for_timing > 0)
+                        ? static_cast<std::size_t>(k_source_for_timing) *
+                              static_cast<std::size_t>(k_target_for_timing)
+                        : 0U;
+                const bool openmp_used =
+                    d2d_options.openmp_raw_score_enable &&
+                    d2d_options.openmp_max_threads > 1 &&
+                    estimated_pairs >=
+                        static_cast<std::size_t>(
+                            std::max(0, d2d_options.openmp_min_pairs));
+                GMS_INFO("[d2d_reg] %s timing | prev=%d curr=%d outcome=%s "
+                         "K_src=%d K_tgt=%d est_pairs=%zu openmp_used=%s "
+                         "openmp_threads=%d seed_score_calls=%d "
+                         "seed_score_ms=%ld anisotropic_ms=%ld total_ms=%ld",
+                         requestTag(is_loop, is_submap).c_str(),
+                         prev_idx, curr_idx, outcome,
+                         k_source_for_timing, k_target_for_timing,
+                         estimated_pairs,
+                         openmp_used ? "true" : "false",
+                         d2d_options.openmp_max_threads,
+                         seed_score_calls,
+                         seed_score_ms,
+                         anisotropic_ms,
+                         elapsedSinceRequestStartMs());
+            };
+            GMS_INFO("[d2d_reg] %s request start | prev=%d curr=%d",
                      requestTag(is_loop, is_submap).c_str(), prev_idx, curr_idx);
 
             if (!is_loop && !is_submap && drop_stale_keyframe_age_s_ > 0.0 &&
                 std::isfinite(stamp) && stamp > 0.0) {
-                const double age_s = ros::Time::now().toSec() - stamp;
+                const double age_s = node_->now().seconds() - stamp;
                 if (std::isfinite(age_s) && age_s > drop_stale_keyframe_age_s_) {
-                    ROS_INFO_THROTTLE(
+                    GMS_INFO_THROTTLE(
                         2.0,
                         "[d2d_reg] dropping stale keyframe registration "
                         "prev=%d curr=%d age=%.2fs > %.2fs",
@@ -562,12 +817,11 @@ private:
             };
 
             auto fail = [&](const std::string& reason) {
-                const auto elapsed_ms =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - request_t0).count();
+                const auto elapsed_ms = elapsedSinceRequestStartMs();
                 result["failure_reason"] = reason;
                 result["elapsed_ms"] = static_cast<long>(elapsed_ms);
-                ROS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
+                logD2DTiming(reason.c_str());
+                GMS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
                          "reason=%s elapsed_ms=%ld",
                          requestTag(is_loop, is_submap).c_str(),
                          prev_idx, curr_idx, reason.c_str(),
@@ -577,7 +831,7 @@ private:
 
             if (!std::filesystem::exists(source_path) ||
                 !std::filesystem::exists(target_path)) {
-                ROS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
+                GMS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
                          "reason=missing_gmm_file source_exists=%d target_exists=%d",
                          requestTag(is_loop, is_submap).c_str(),
                          prev_idx, curr_idx,
@@ -617,7 +871,7 @@ private:
                 // views and can produce NaNs even with a good pose prior. When
                 // the caller already provides a full SE(3) initialization, use
                 // it directly for anisotropic D2D.
-                ROS_INFO_THROTTLE(
+                GMS_INFO_THROTTLE(
                     2.0,
                     "[d2d_reg] %s skipping isoplanar pre-pass; using provided initial_transform",
                     requestTag(is_loop, is_submap).c_str());
@@ -648,7 +902,7 @@ private:
             }
             if (!has_initial_transform &&
                 (!std::isfinite(iso_result.score) || T_iso.hasNaN())) {
-                ROS_INFO("[d2d_reg] %s isoplanar stage invalid | prev=%d curr=%d "
+                GMS_INFO("[d2d_reg] %s isoplanar stage invalid | prev=%d curr=%d "
                          "score=%.4f; falling back to initial transform",
                          requestTag(is_loop, is_submap).c_str(),
                          prev_idx, curr_idx,
@@ -657,6 +911,8 @@ private:
             }
 
             auto run_anisotropic = [&](const Eigen::Matrix4f& seed) {
+                const auto t0 = std::chrono::steady_clock::now();
+                gmmslam::RegistrationResult result;
                 if (suppress_backend_output_) {
                     std::lock_guard<std::mutex> lk(backend_call_mutex_);
                     ScopedBackendOutputSilencer silence(true);
@@ -664,26 +920,53 @@ private:
                         normal_gmm_cache_.get(source_path, false);
                     const auto target_gmm =
                         normal_gmm_cache_.get(target_path, false);
-                    return gmmslam::anisotropicRegistration(
+                    k_source_for_timing =
+                        static_cast<int>(source_gmm->getNClusters());
+                    k_target_for_timing =
+                        static_cast<int>(target_gmm->getNClusters());
+                    result = gmmslam::anisotropicRegistration(
+                        seed, *source_gmm, *target_gmm, d2d_options);
+                } else {
+                    const auto source_gmm =
+                        normal_gmm_cache_.get(source_path, false);
+                    const auto target_gmm =
+                        normal_gmm_cache_.get(target_path, false);
+                    k_source_for_timing =
+                        static_cast<int>(source_gmm->getNClusters());
+                    k_target_for_timing =
+                        static_cast<int>(target_gmm->getNClusters());
+                    result = gmmslam::anisotropicRegistration(
                         seed, *source_gmm, *target_gmm, d2d_options);
                 }
+                anisotropic_ms += static_cast<long>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count());
+                return result;
+            };
+
+            auto score_anisotropic_seed = [&](const Eigen::Matrix4f& seed) {
+                const auto t0 = std::chrono::steady_clock::now();
                 const auto source_gmm =
                     normal_gmm_cache_.get(source_path, false);
                 const auto target_gmm =
                     normal_gmm_cache_.get(target_path, false);
-                return gmmslam::anisotropicRegistration(
+                k_source_for_timing =
+                    static_cast<int>(source_gmm->getNClusters());
+                k_target_for_timing =
+                    static_cast<int>(target_gmm->getNClusters());
+                const float score = gmmslam::anisotropicInitialScore(
                     seed, *source_gmm, *target_gmm, d2d_options);
+                seed_score_ms += static_cast<long>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count());
+                ++seed_score_calls;
+                return score;
             };
 
-            // Step 2: anisotropic registration. Loop closures try the latest-pose
-            // seed first; if it scores too low, retry once with SOLiD yaw while
-            // keeping the same translation.
-            aniso_result = run_anisotropic(T_iso);
-            Eigen::Matrix4f T_final = aniso_result.transform;
-            float score_final = aniso_result.score;
-
+            // Step 2: anisotropic registration. When SOLiD yaw is available,
+            // choose the better seed by cheap initial score and run full D2D once.
+            Eigen::Matrix4f selected_seed = T_iso;
             if (is_loop && has_initial_transform &&
-                score_final < active_score_threshold &&
                 req.contains("solid_yaw_prior_rad") &&
                 req.at("solid_yaw_prior_rad").is_number()) {
                 const double yaw_rad =
@@ -694,21 +977,24 @@ private:
                         Eigen::AngleAxisf(static_cast<float>(yaw_rad),
                                            Eigen::Vector3f::UnitZ())
                             .toRotationMatrix();
-                    const auto yaw_result = run_anisotropic(T_yaw);
-                    ROS_INFO("[d2d_reg] %s SOLiD yaw retry | prev=%d curr=%d "
-                             "score_latest=%.4f score_yaw=%.4f yaw=%.1fdeg",
+
+                    const float latest_seed_score =
+                        score_anisotropic_seed(T_iso);
+                    const float yaw_seed_score =
+                        score_anisotropic_seed(T_yaw);
+                    GMS_INFO("[d2d_reg] %s SOLiD yaw seed scores | "
+                             "prev=%d curr=%d latest=%.4f yaw=%.4f yaw_deg=%.1f",
                              requestTag(is_loop, is_submap).c_str(),
                              prev_idx, curr_idx,
-                             static_cast<double>(score_final),
-                             static_cast<double>(yaw_result.score),
+                             static_cast<double>(latest_seed_score),
+                             static_cast<double>(yaw_seed_score),
                              yaw_rad * 180.0 / M_PI);
-                    if (std::isfinite(yaw_result.score) &&
-                        (!std::isfinite(score_final) ||
-                         yaw_result.score > score_final)) {
+
+                    if (std::isfinite(yaw_seed_score) &&
+                        (!std::isfinite(latest_seed_score) ||
+                         yaw_seed_score > latest_seed_score)) {
+                        selected_seed = T_yaw;
                         T_init = T_yaw;
-                        aniso_result = yaw_result;
-                        T_final = aniso_result.transform;
-                        score_final = aniso_result.score;
                         result["solid_yaw_retry_used"] = true;
 
                         Eigen::Matrix<float, 4, 4, Eigen::RowMajor> T_row(T_init);
@@ -722,9 +1008,13 @@ private:
                 }
             }
 
+            aniso_result = run_anisotropic(selected_seed);
+            Eigen::Matrix4f T_final = aniso_result.transform;
+            float score_final = aniso_result.score;
+
             if (aniso_result.initial_score_fast_path_used) {
                 const int hits = ++d2d_fast_path_hits_;
-                ROS_DEBUG_THROTTLE(
+                GMS_DEBUG_THROTTLE(
                     5.0,
                     "[d2d_reg] initial-score fast-path hits=%d",
                     hits);
@@ -746,7 +1036,7 @@ private:
                 result["delta_t_m"] = static_cast<double>(delta_t);
                 result["delta_r_deg"] = static_cast<double>(delta_r_deg);
                 result["coarse_score"] = static_cast<double>(aniso_result.coarse_score);
-                ROS_INFO("[d2d_reg] %s dbg | prev=%d curr=%d "
+                GMS_INFO("[d2d_reg] %s dbg | prev=%d curr=%d "
                          "K_src=%d K_tgt=%d "
                          "init_t=%.3fm init_r=%.1fdeg "
                          "delta_t=%.3fm delta_r=%.1fdeg "
@@ -763,7 +1053,7 @@ private:
             }
 
             if (!std::isfinite(score_final) || T_final.hasNaN()) {
-                ROS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
+                GMS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
                          "reason=invalid_anisotropic_result score=%.4f has_nan=%d",
                          requestTag(is_loop, is_submap).c_str(),
                          prev_idx, curr_idx, static_cast<double>(score_final),
@@ -784,7 +1074,7 @@ private:
                     ? loop_prior_gate_rot_deg_
                     : sequential_prior_gate_rot_deg_;
                 if (trans_err > trans_limit_m || rot_err_deg > rot_limit_deg) {
-                    ROS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
+                    GMS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
                              "reason=prior_consistency_gate trans=%.3fm rot=%.2fdeg "
                              "limits=%.3fm/%.2fdeg score=%.4f",
                              requestTag(is_loop, is_submap).c_str(),
@@ -796,7 +1086,7 @@ private:
                 }
             }
             if (score_final < active_score_threshold) {
-                ROS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
+                GMS_INFO("[d2d_reg] %s registration failed | prev=%d curr=%d "
                          "reason=worker_score_threshold score=%.4f < %.4f",
                          requestTag(is_loop, is_submap).c_str(),
                          prev_idx, curr_idx, static_cast<double>(score_final),
@@ -816,12 +1106,11 @@ private:
             result["transform"] = flat_T;
 
             const std::string tag = requestTag(is_loop, is_submap);
-            const auto elapsed_ms =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - request_t0).count();
+            const auto elapsed_ms = elapsedSinceRequestStartMs();
             result["elapsed_ms"] = static_cast<long>(elapsed_ms);
+            logD2DTiming("success");
             if (is_submap) {
-                ROS_INFO("%s[d2d_reg] %s registration success | prev=%d curr=%d "
+                GMS_INFO("%s[d2d_reg] %s registration success | prev=%d curr=%d "
                          "score=%.4f elapsed_ms=%ld%s",
                          d2dSuccessColor(is_loop, is_submap),
                          tag.c_str(), prev_idx, curr_idx,
@@ -829,7 +1118,7 @@ private:
                          static_cast<long>(elapsed_ms),
                          kAnsiReset);
             } else {
-                ROS_INFO_THROTTLE(
+                GMS_INFO_THROTTLE(
                     5.0,
                     "%s[d2d_reg] %s registration success | prev=%d curr=%d "
                     "score=%.4f elapsed_ms=%ld%s",
@@ -840,7 +1129,7 @@ private:
                     kAnsiReset);
             }
         } catch (const std::exception& e) {
-            ROS_WARN_THROTTLE(2.0, "[d2d_reg] registration failed: %s", e.what());
+            GMS_WARN_THROTTLE(2.0, "[d2d_reg] registration failed: %s", e.what());
             if (!result.empty()) {
                 result["failure_reason"] = "exception";
                 result["failure_detail"] = e.what();
@@ -851,13 +1140,15 @@ private:
     }
 
     void publishResult(const json& result) {
-        std_msgs::String msg;
+        std_msgs::msg::String msg;
         msg.data = result.dump();
-        result_pub_.publish(msg);
+        result_pub_->publish(msg);
     }
 
-    ros::Subscriber request_sub_;
-    ros::Publisher result_pub_;
+    rclcpp::Node::SharedPtr node_;
+    rclcpp::CallbackGroup::SharedPtr request_callback_group_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr request_sub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr result_pub_;
     int num_workers_ = 2;
     double score_threshold_ = -1.0e9;
     double loop_score_threshold_ = 1.1;
@@ -877,19 +1168,28 @@ private:
     std::mutex queue_mutex_;
     std::mutex backend_call_mutex_;
     std::condition_variable queue_cv_;
-    std::deque<std::string> loop_queue_;
-    std::deque<std::string> submap_queue_;
-    std::deque<std::string> sequential_queue_;
+    StringRingQueue loop_queue_{kMaxQueueSize};
+    StringRingQueue submap_queue_{kMaxQueueSize};
+    StringRingQueue sequential_queue_{kMaxQueueSize};
     std::vector<std::thread> workers_;
     GmmLruCache normal_gmm_cache_{kGmmCacheCapacity};
     GmmLruCache isoplanar_gmm_cache_{kGmmCacheCapacity};
 };
 
 int main(int argc, char** argv) {
-    ros::init(argc, argv, "d2d_registration_node");
-    ros::NodeHandle nh;
-    ros::NodeHandle pnh("~");
-    D2DRegistrationNode node(nh, pnh);
-    ros::spin();
+    rclcpp::init(argc, argv);
+    auto node = rclcpp::Node::make_shared(
+        "d2d_registration_node",
+        rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
+
+    {
+        D2DRegistrationNode app(node);
+        rclcpp::executors::MultiThreadedExecutor executor;
+        executor.add_node(node);
+        executor.spin();
+        executor.remove_node(node);
+    }
+
+    rclcpp::shutdown();
     return 0;
 }

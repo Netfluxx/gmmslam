@@ -1,16 +1,19 @@
 #include "gmmslam/util/gmm_utils.hpp"
+#include "gmmslam/rclcpp_logging.hpp"
 #include "util/rtree.h"
 #include <Eigen/Cholesky>
 #include <Eigen/Eigenvalues>
 #include <gmm/GMM3.h>
-#include "gmmslam/ros2_compat.hpp"
+#include <rclcpp/rclcpp.hpp>
 #include <algorithm>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <mutex>
+#include <numeric>
 #include <stdexcept>
 #include <vector>
 
@@ -34,43 +37,6 @@ Matrix3d symRegularize(const Matrix3d& C, double reg) {
     return S;
 }
 
-GmmComponent keepLowerUncertainty(const GmmComponent& a,
-                                  const GmmComponent& b) {
-    const double total_weight = a.weight + b.weight;
-    const bool keep_a =
-        (a.pose_uncertainty < b.pose_uncertainty) ||
-        (a.pose_uncertainty == b.pose_uncertainty &&
-         a.source_key_idx <= b.source_key_idx);
-
-    GmmComponent kept = keep_a ? a : b;
-    if (total_weight > 0.0) {
-        kept.weight = total_weight;
-    }
-    return kept;
-}
-
-GmmComponent keepOlderMeasurement(const GmmComponent& a,
-                                  const GmmComponent& b) {
-    const double total_weight = a.weight + b.weight;
-    const bool a_known = a.source_key_idx >= 0;
-    const bool b_known = b.source_key_idx >= 0;
-
-    bool keep_a = true;
-    if (a_known && b_known && a.source_key_idx != b.source_key_idx) {
-        keep_a = a.source_key_idx < b.source_key_idx;
-    } else {
-        keep_a = (a.pose_uncertainty < b.pose_uncertainty) ||
-                 (a.pose_uncertainty == b.pose_uncertainty &&
-                  a.source_key_idx <= b.source_key_idx);
-    }
-
-    GmmComponent kept = keep_a ? a : b;
-    if (total_weight > 0.0) {
-        kept.weight = total_weight;
-    }
-    return kept;
-}
-
 bool sameKnownSourceFrame(const GmmComponent& a, const GmmComponent& b) {
     return a.source_key_idx >= 0 &&
            b.source_key_idx >= 0 &&
@@ -92,7 +58,7 @@ void logFramePruneMerge(const GmmComponent& a,
     (void)i;
     (void)j;
     // Per-pair frame-to-frame prune logs are too noisy for normal runs.
-    // ROS_INFO("[gmm_utils] frame-to-frame prune pass=%d pair=(%zu,%zu) "
+    // GMS_INFO("[gmm_utils] frame-to-frame prune pass=%d pair=(%zu,%zu) "
     //          "D_B=%.4f dist=%.3fm keep_frame=X(%d) drop_newer_frame=X(%d) "
     //          "weights=(%.4f, %.4f)->%.4f",
     //          pass + 1, i, j, d_b, delta.norm(),
@@ -151,6 +117,154 @@ void inflateAabb(double min_b[3], double max_b[3], double margin) {
         min_b[d] -= margin;
         max_b[d] += margin;
     }
+}
+
+struct CandidateEdge {
+    std::size_t a = 0;
+    std::size_t b = 0;
+    double d_b = 0.0;
+};
+
+class UnionFind {
+public:
+    explicit UnionFind(std::size_t n) : parent_(n), rank_(n, 0) {
+        std::iota(parent_.begin(), parent_.end(), 0);
+    }
+
+    std::size_t find(std::size_t x) {
+        if (parent_[x] != x) {
+            parent_[x] = find(parent_[x]);
+        }
+        return parent_[x];
+    }
+
+    void unite(std::size_t a, std::size_t b) {
+        std::size_t ra = find(a);
+        std::size_t rb = find(b);
+        if (ra == rb) {
+            return;
+        }
+        if (rank_[ra] < rank_[rb]) {
+            std::swap(ra, rb);
+        }
+        parent_[rb] = ra;
+        if (rank_[ra] == rank_[rb]) {
+            ++rank_[ra];
+        }
+    }
+
+private:
+    std::vector<std::size_t> parent_;
+    std::vector<int> rank_;
+};
+
+bool betterRepresentative(const GmmComponent& a,
+                          const GmmComponent& b,
+                          bool prefer_older_measurement) {
+    if (prefer_older_measurement) {
+        const bool a_known = a.source_key_idx >= 0;
+        const bool b_known = b.source_key_idx >= 0;
+        if (a_known && b_known && a.source_key_idx != b.source_key_idx) {
+            return a.source_key_idx < b.source_key_idx;
+        }
+    }
+    if (a.pose_uncertainty != b.pose_uncertainty) {
+        return a.pose_uncertainty < b.pose_uncertainty;
+    }
+    return a.source_key_idx <= b.source_key_idx;
+}
+
+std::size_t bestRepresentativeIndex(const std::vector<GmmComponent>& comps,
+                                    const std::vector<std::size_t>& cluster,
+                                    bool prefer_older_measurement) {
+    std::size_t best = cluster.front();
+    for (std::size_t idx : cluster) {
+        if (betterRepresentative(comps[idx], comps[best],
+                                 prefer_older_measurement)) {
+            best = idx;
+        }
+    }
+    return best;
+}
+
+bool hasClearlyBestUncertainty(const std::vector<GmmComponent>& comps,
+                               const std::vector<std::size_t>& cluster,
+                               std::size_t best) {
+    const double best_u = comps[best].pose_uncertainty;
+    if (!std::isfinite(best_u)) {
+        return false;
+    }
+    constexpr double kUncertaintyTieEps = 1.0e-6;
+    for (std::size_t idx : cluster) {
+        if (idx == best) {
+            continue;
+        }
+        const double u = comps[idx].pose_uncertainty;
+        if (!std::isfinite(u)) {
+            continue;
+        }
+        if (u <= best_u + kUncertaintyTieEps) {
+            return false;
+        }
+    }
+    return true;
+}
+
+GmmComponent representativeWithClusterWeight(
+        const std::vector<GmmComponent>& comps,
+        const std::vector<std::size_t>& cluster,
+        std::size_t best) {
+    GmmComponent out = comps[best];
+    double weight_sum = 0.0;
+    for (std::size_t idx : cluster) {
+        weight_sum += comps[idx].weight;
+    }
+    if (weight_sum > 0.0) {
+        out.weight = weight_sum;
+    }
+    return out;
+}
+
+GmmComponent momentMatchCluster(const std::vector<GmmComponent>& comps,
+                                const std::vector<std::size_t>& cluster,
+                                std::size_t best) {
+    double weight_sum = 0.0;
+    for (std::size_t idx : cluster) {
+        weight_sum += std::max(0.0, comps[idx].weight);
+    }
+    if (weight_sum <= 0.0) {
+        return representativeWithClusterWeight(comps, cluster, best);
+    }
+
+    Vector3d mean = Vector3d::Zero();
+    for (std::size_t idx : cluster) {
+        mean += std::max(0.0, comps[idx].weight) * comps[idx].mean;
+    }
+    mean /= weight_sum;
+
+    Matrix3d covariance = Matrix3d::Zero();
+    for (std::size_t idx : cluster) {
+        const double w = std::max(0.0, comps[idx].weight);
+        const Vector3d d = comps[idx].mean - mean;
+        covariance += w * (comps[idx].covariance + d * d.transpose());
+    }
+    covariance /= weight_sum;
+
+    GmmComponent out = comps[best];
+    out.mean = mean;
+    out.covariance = 0.5 * (covariance + covariance.transpose());
+    out.weight = weight_sum;
+    return out;
+}
+
+bool aabbOverlap(const double amin[3], const double amax[3],
+                 const double bmin[3], const double bmax[3]) {
+    for (int d = 0; d < 3; ++d) {
+        if (amax[d] < bmin[d] || bmax[d] < amin[d]) {
+            return false;
+        }
+    }
+    return true;
 }
 
 } // namespace
@@ -325,186 +439,194 @@ GmmModel mergeGmmsConcatenate(
     return merged;
 }
 
-GmmModel pruneSimilarComponentsImpl(const GmmModel& in, const MapConfig& map_cfg,
-                                    bool only_between_source_frames,
-                                    bool prefer_older_measurement,
-                                    const char* log_label) {
+PruneResult pruneSimilarComponentsImpl(const GmmModel& in,
+                                       const MapConfig& map_cfg,
+                                       bool only_between_source_frames,
+                                       bool prefer_older_measurement,
+                                       const char* log_label) {
+    PruneResult result;
     if (!map_cfg.prune_enable || in.components.size() < 2) {
-        return in;
+        result.model = in;
+        return result;
     }
 
     const int components_before = static_cast<int>(in.components.size());
-    std::vector<GmmComponent> comps = in.components;
+    const std::vector<GmmComponent>& comps = in.components;
     const double radius_sq = map_cfg.prune_search_radius_m *
                               map_cfg.prune_search_radius_m;
-    const int max_passes = std::max(1, map_cfg.prune_max_passes);
     const double margin_m = std::max(0.0, map_cfg.prune_search_radius_m);
     const double chi_sq = std::max(1e-3, map_cfg.prune_rtree_chi_sq);
-    std::size_t total_merges = 0;
-    int passes_run = 0;
+    const std::size_t n = comps.size();
 
-    for (int pass = 0; pass < max_passes; ++pass) {
-        const std::size_t n = comps.size();
-        std::vector<bool> absorbed(n, false);
-        std::vector<GmmComponent> kept;
-        kept.reserve(n);
-        std::size_t merges_this_pass = 0;
-
+    std::vector<CandidateEdge> edges;
+    edges.reserve(n);
+    if (map_cfg.prune_use_rtree) {
         using ComponentRTree = RTree<int, double, 3>;
         ComponentRTree tree;
-        if (map_cfg.prune_use_rtree) {
-            for (std::size_t k = 0; k < n; ++k) {
-                double mn[3], mx[3];
-                componentToWorldAabb(comps[k], chi_sq, mn, mx);
-                inflateAabb(mn, mx, margin_m);
-                tree.Insert(mn, mx, static_cast<int>(k));
-            }
+        std::vector<std::array<double, 3>> mins(n), maxs(n);
+        for (std::size_t k = 0; k < n; ++k) {
+            componentToWorldAabb(comps[k], chi_sq, mins[k].data(), maxs[k].data());
+            inflateAabb(mins[k].data(), maxs[k].data(), margin_m);
+            tree.Insert(mins[k].data(), maxs[k].data(), static_cast<int>(k));
         }
 
         for (std::size_t i = 0; i < n; ++i) {
-            if (absorbed[i]) {
+            std::vector<int> candidates;
+            candidates.reserve(32);
+            tree.Search(mins[i].data(), maxs[i].data(), [&](int j) {
+                const std::size_t sj = static_cast<std::size_t>(j);
+                if (sj > i) {
+                    candidates.push_back(j);
+                }
+                return true;
+            });
+            std::sort(candidates.begin(), candidates.end());
+            candidates.erase(std::unique(candidates.begin(), candidates.end()),
+                             candidates.end());
+
+            for (int j_raw : candidates) {
+                const std::size_t j = static_cast<std::size_t>(j_raw);
+                if (!aabbOverlap(mins[i].data(), maxs[i].data(),
+                                 mins[j].data(), maxs[j].data())) {
+                    continue;
+                }
+                if (only_between_source_frames &&
+                    sameKnownSourceFrame(comps[i], comps[j])) {
+                    continue;
+                }
+                const double d_b = bhattacharyyaDistance(
+                    comps[i].mean, comps[i].covariance,
+                    comps[j].mean, comps[j].covariance,
+                    map_cfg.prune_cov_reg);
+                if (std::isfinite(d_b) && d_b < map_cfg.prune_bhatt_threshold) {
+                    edges.push_back({i, j, d_b});
+                }
+            }
+        }
+    } else {
+        for (std::size_t i = 0; i < n; ++i) {
+            for (std::size_t j = i + 1; j < n; ++j) {
+                if (only_between_source_frames &&
+                    sameKnownSourceFrame(comps[i], comps[j])) {
+                    continue;
+                }
+                const Vector3d delta = comps[i].mean - comps[j].mean;
+                if (delta.squaredNorm() > radius_sq) {
+                    continue;
+                }
+                const double d_b = bhattacharyyaDistance(
+                    comps[i].mean, comps[i].covariance,
+                    comps[j].mean, comps[j].covariance,
+                    map_cfg.prune_cov_reg);
+                if (std::isfinite(d_b) && d_b < map_cfg.prune_bhatt_threshold) {
+                    edges.push_back({i, j, d_b});
+                }
+            }
+        }
+    }
+
+    UnionFind uf(n);
+    for (const auto& edge : edges) {
+        uf.unite(edge.a, edge.b);
+    }
+
+    std::map<std::size_t, std::vector<std::size_t>> clusters_by_root;
+    for (std::size_t i = 0; i < n; ++i) {
+        clusters_by_root[uf.find(i)].push_back(i);
+    }
+
+    std::vector<GmmComponent> out_components;
+    out_components.reserve(n);
+    int cluster_id = 0;
+    int clusters_merged = 0;
+    for (const auto& [root, cluster] : clusters_by_root) {
+        (void)root;
+        if (cluster.size() == 1) {
+            out_components.push_back(comps[cluster.front()]);
+            continue;
+        }
+
+        const std::size_t best =
+            bestRepresentativeIndex(comps, cluster, prefer_older_measurement);
+        const bool keep_rep = prefer_older_measurement ||
+                              hasClearlyBestUncertainty(comps, cluster, best);
+        GmmComponent kept = keep_rep
+            ? representativeWithClusterWeight(comps, cluster, best)
+            : momentMatchCluster(comps, cluster, best);
+        const int kept_output_index = static_cast<int>(out_components.size());
+
+        for (std::size_t idx : cluster) {
+            if (idx == best && keep_rep) {
                 continue;
             }
-            GmmComponent base = comps[i];
+            PruneDebugRecord rec;
+            rec.kept_mean = kept.mean;
+            rec.merged_mean = comps[idx].mean;
+            rec.distance = bhattacharyyaDistance(
+                kept.mean, kept.covariance,
+                comps[idx].mean, comps[idx].covariance,
+                map_cfg.prune_cov_reg);
+            rec.cluster_id = cluster_id;
+            rec.kept_source_key_idx = kept.source_key_idx;
+            rec.merged_source_key_idx = comps[idx].source_key_idx;
+            rec.kept_component_index = kept_output_index;
+            rec.merged_component_index = static_cast<int>(idx);
+            rec.reason = keep_rep ? "keep_representative" : "moment_match";
+            result.debug_records.push_back(std::move(rec));
+        }
 
-            if (map_cfg.prune_use_rtree) {
-                // Re-query the tree after each merge: `base` moves/grows so its
-                // AABB changes; new overlaps can appear that were not in the
-                // first search window.
-                for (;;) {
-                    double bmin[3], bmax[3];
-                    componentToWorldAabb(base, chi_sq, bmin, bmax);
-                    inflateAabb(bmin, bmax, margin_m);
-
-                    std::vector<int> candidates;
-                    candidates.reserve(32);
-                    tree.Search(bmin, bmax, [&](int j) {
-                        const std::size_t sj = static_cast<std::size_t>(j);
-                        if (sj <= i || absorbed[sj]) {
-                            return true;
-                        }
-                        candidates.push_back(j);
-                        return true;
-                    });
-                    std::sort(candidates.begin(), candidates.end());
-
-                    bool merged_one = false;
-                    for (int j : candidates) {
-                        const std::size_t sj = static_cast<std::size_t>(j);
-                        if (absorbed[sj]) {
-                            continue;
-                        }
-                        if (only_between_source_frames &&
-                            sameKnownSourceFrame(base, comps[sj])) {
-                            continue;
-                        }
-                        const double d_b = bhattacharyyaDistance(
-                            base.mean, base.covariance,
-                            comps[sj].mean, comps[sj].covariance,
-                            map_cfg.prune_cov_reg);
-                        if (!std::isfinite(d_b)) {
-                            continue;
-                        }
-                        if (d_b < map_cfg.prune_bhatt_threshold) {
-                            GmmComponent kept = prefer_older_measurement
-                                                ? keepOlderMeasurement(base, comps[sj])
-                                                : keepLowerUncertainty(base, comps[sj]);
-                            if (prefer_older_measurement) {
-                                logFramePruneMerge(base, comps[sj], kept,
-                                                   d_b, pass, i, sj);
-                            }
-                            base = std::move(kept);
-                            absorbed[sj] = true;
-                            ++merges_this_pass;
-                            merged_one = true;
-                            break;
-                        }
-                    }
-                    if (!merged_one) {
-                        break;
-                    }
-                }
-            } else {
-                for (std::size_t j = i + 1; j < n; ++j) {
-                    if (absorbed[j]) {
-                        continue;
-                    }
-                    if (only_between_source_frames &&
-                        sameKnownSourceFrame(base, comps[j])) {
-                        continue;
-                    }
-                    const Vector3d delta = base.mean - comps[j].mean;
-                    if (delta.squaredNorm() > radius_sq) {
-                        continue;
-                    }
-
-                    const double d_b = bhattacharyyaDistance(
-                        base.mean, base.covariance,
-                        comps[j].mean, comps[j].covariance,
-                        map_cfg.prune_cov_reg);
-                    if (!std::isfinite(d_b)) {
-                        continue;
-                    }
-                    if (d_b < map_cfg.prune_bhatt_threshold) {
-                        GmmComponent kept = prefer_older_measurement
-                                            ? keepOlderMeasurement(base, comps[j])
-                                            : keepLowerUncertainty(base, comps[j]);
-                        if (prefer_older_measurement) {
-                            logFramePruneMerge(base, comps[j], kept,
-                                               d_b, pass, i, j);
-                        }
-                        base = std::move(kept);
-                        absorbed[j] = true;
-                        ++merges_this_pass;
-                    }
+        if (prefer_older_measurement && cluster.size() > 1) {
+            for (std::size_t idx : cluster) {
+                if (idx != best) {
+                    logFramePruneMerge(comps[best], comps[idx], kept,
+                                       result.debug_records.empty()
+                                           ? 0.0
+                                           : result.debug_records.back().distance,
+                                       0, best, idx);
                 }
             }
-
-            kept.push_back(std::move(base));
         }
 
-        comps.swap(kept);
-        passes_run = pass + 1;
-        total_merges += merges_this_pass;
-        if (merges_this_pass > 0) {
-            ROS_INFO("[gmm_utils] prune pass %d/%d: merged %zu pair(s), "
-                     "%zu -> %zu component(s)",
-                     pass + 1, max_passes, merges_this_pass, n, comps.size());
-        }
-        if (merges_this_pass == 0) {
-            break;
-        }
+        out_components.push_back(std::move(kept));
+        ++cluster_id;
+        ++clusters_merged;
     }
 
     double weight_sum = 0.0;
-    for (const auto& c : comps) {
+    for (const auto& c : out_components) {
         weight_sum += c.weight;
     }
     if (weight_sum > 0.0) {
-        for (auto& c : comps) {
+        for (auto& c : out_components) {
             c.weight /= weight_sum;
         }
     }
 
-    GmmModel out;
-    out.components = std::move(comps);
-    const int components_after = out.numComponents();
+    result.model.components = std::move(out_components);
+    result.clusters_merged = clusters_merged;
+    result.components_removed = components_before - result.model.numComponents();
+    const int components_after = result.model.numComponents();
     const int removed = components_before - components_after;
-    ROS_INFO("[gmm_utils] %s prune summary: %d -> %d component(s) "
-             "(%d removed), %zu merge(s) in %d pass(es), "
+    GMS_INFO("[gmm_utils] %s prune summary: %d -> %d component(s) "
+             "(%d removed), %d cluster(s), %zu edge(s), "
              "D_B < %.4f, rtree=%s, chi_sq=%.2f, margin_m=%.3f, "
              "between_frames=%s, prefer_older=%s",
              log_label, components_before, components_after, removed,
-             total_merges, passes_run,
+             clusters_merged, edges.size(),
              map_cfg.prune_bhatt_threshold,
              map_cfg.prune_use_rtree ? "on" : "off",
              chi_sq, margin_m,
              only_between_source_frames ? "true" : "false",
              prefer_older_measurement ? "true" : "false");
-    return out;
+    return result;
 }
 
 GmmModel pruneSimilarComponents(const GmmModel& in, const MapConfig& map_cfg) {
+    return pruneSimilarComponentsDetailed(in, map_cfg).model;
+}
+
+PruneResult pruneSimilarComponentsDetailed(const GmmModel& in,
+                                           const MapConfig& map_cfg) {
     return pruneSimilarComponentsImpl(
         in, map_cfg,
         false, false,
@@ -513,10 +635,17 @@ GmmModel pruneSimilarComponents(const GmmModel& in, const MapConfig& map_cfg) {
 
 GmmModel pruneNewerFrameComponents(const GmmModel& in,
                                    const MapConfig& map_cfg) {
+    return pruneNewerFrameComponentsDetailed(in, map_cfg).model;
+}
+
+PruneResult pruneNewerFrameComponentsDetailed(const GmmModel& in,
+                                              const MapConfig& map_cfg) {
     if (!map_cfg.prune_frame_to_frame_enable) {
-        ROS_INFO("[gmm_utils] frame-to-frame GMM prune disabled; keeping %d component(s)",
+        GMS_INFO("[gmm_utils] frame-to-frame GMM prune disabled; keeping %d component(s)",
                  in.numComponents());
-        return in;
+        PruneResult result;
+        result.model = in;
+        return result;
     }
     return pruneSimilarComponentsImpl(
         in, map_cfg,

@@ -29,6 +29,10 @@ struct D2DRegistrationOptions {
     double initial_score_margin = 0.05;
     double initial_score_threshold = -std::numeric_limits<double>::infinity();
     double hessian_damping = 1e-3;
+    bool openmp_raw_score_enable = true;
+    int openmp_min_pairs = 4096;
+    int openmp_max_threads = 2;
+    bool openmp_timing_log_enable = true;
 };
 
 RegistrationResult isoplanarRegistration(
@@ -44,6 +48,12 @@ RegistrationResult isoplanarRegistration(
     const D2DRegistrationOptions& options = D2DRegistrationOptions{});
 
 RegistrationResult anisotropicRegistration(
+    const Eigen::Matrix4f& T_init,
+    const gmm_utils::GMM3f& source_gmm,
+    const gmm_utils::GMM3f& target_gmm,
+    const D2DRegistrationOptions& options = D2DRegistrationOptions{});
+
+float anisotropicInitialScore(
     const Eigen::Matrix4f& T_init,
     const gmm_utils::GMM3f& source_gmm,
     const gmm_utils::GMM3f& target_gmm,

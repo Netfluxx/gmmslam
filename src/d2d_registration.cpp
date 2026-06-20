@@ -1,14 +1,20 @@
 #include "gmmslam/d2d_registration.hpp"
 
 #include <dlib/optimization.h>
+#include <Eigen/Cholesky>
 #include <Eigen/Geometry>
 #include <Eigen/LU>
+#include <Eigen/StdVector>
 #include <gmm/GMM3.h>
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <limits>
 #include <vector>
+
+#ifdef _OPENMP
+#include <omp.h>
+#endif
 
 namespace gmmslam {
 
@@ -25,15 +31,194 @@ constexpr float kPi32 = 1.0f / (2.0f * static_cast<float>(M_PI) *
 
 using ColumnVector = dlib::matrix<float, 0, 1>;
 
-struct CachedComponent {
-    Eigen::Vector3f mean = Eigen::Vector3f::Zero();
-    Eigen::Matrix3f covariance = Eigen::Matrix3f::Identity();
-    float trace = 0.0f;
-    float weight = 0.0f;
-    bool valid = false;
+using Vector3fVector =
+    std::vector<Eigen::Vector3f, Eigen::aligned_allocator<Eigen::Vector3f>>;
+using Matrix3fVector =
+    std::vector<Eigen::Matrix3f, Eigen::aligned_allocator<Eigen::Matrix3f>>;
+
+struct ComponentCache {
+    Vector3fVector means;
+    Matrix3fVector covariances;
+    std::vector<float> traces;
+    std::vector<float> weights;
+    std::vector<int> valid_indices;
+
+    bool empty() const { return valid_indices.empty(); }
+    std::size_t size() const { return means.size(); }
+
+    void reserve(std::size_t n) {
+        means.reserve(n);
+        covariances.reserve(n);
+        traces.reserve(n);
+        weights.reserve(n);
+        valid_indices.reserve(n);
+    }
 };
 
-using ComponentCache = std::vector<CachedComponent>;
+struct TransformedSourceCache {
+    Vector3fVector original_means;
+    Vector3fVector transformed_means;
+    Matrix3fVector inflated_covariances;
+    Matrix3fVector rotated_inflated_covariances;
+    std::vector<float> traces;
+    std::vector<float> weights;
+
+    void clear() {
+        original_means.clear();
+        transformed_means.clear();
+        inflated_covariances.clear();
+        rotated_inflated_covariances.clear();
+        traces.clear();
+        weights.clear();
+    }
+
+    void reserve(std::size_t n) {
+        original_means.reserve(n);
+        transformed_means.reserve(n);
+        inflated_covariances.reserve(n);
+        rotated_inflated_covariances.reserve(n);
+        traces.reserve(n);
+        weights.reserve(n);
+    }
+
+    std::size_t size() const { return original_means.size(); }
+    bool empty() const { return original_means.empty(); }
+};
+
+struct RegistrationScratch {
+    TransformedSourceCache transformed_source;
+    std::vector<int> candidate_targets;
+};
+
+float distanceSqToAabb(const Eigen::Vector3f& p,
+                       const Eigen::Vector3f& bmin,
+                       const Eigen::Vector3f& bmax) {
+    float d2 = 0.0f;
+    for (int i = 0; i < kNumDims; ++i) {
+        if (p(i) < bmin(i)) {
+            const float d = bmin(i) - p(i);
+            d2 += d * d;
+        } else if (p(i) > bmax(i)) {
+            const float d = p(i) - bmax(i);
+            d2 += d * d;
+        }
+    }
+    return d2;
+}
+
+class TargetMeanIndex {
+public:
+    explicit TargetMeanIndex(const ComponentCache& components)
+        : components_(components) {
+        std::vector<int> positions = components_.valid_indices;
+        nodes_.reserve(positions.size());
+        root_ = build(positions, 0, static_cast<int>(positions.size()), 0);
+    }
+
+    void queryPotentialMatches(const Eigen::Vector3f& center,
+                               float source_trace,
+                               std::vector<int>& out) const {
+        query(root_, center, source_trace, out);
+    }
+
+private:
+    static constexpr int kInvalidNode = -1;
+
+    struct Node {
+        int component_pos = -1;
+        int axis = 0;
+        Eigen::Vector3f bounds_min =
+            Eigen::Vector3f::Constant(std::numeric_limits<float>::infinity());
+        Eigen::Vector3f bounds_max =
+            Eigen::Vector3f::Constant(-std::numeric_limits<float>::infinity());
+        float max_trace = 0.0f;
+        int left = kInvalidNode;
+        int right = kInvalidNode;
+    };
+
+    int build(std::vector<int>& positions, int begin, int end, int depth) {
+        if (begin >= end) {
+            return kInvalidNode;
+        }
+
+        const int axis = depth % kNumDims;
+        const int mid = begin + (end - begin) / 2;
+        std::nth_element(
+            positions.begin() + begin,
+            positions.begin() + mid,
+            positions.begin() + end,
+            [&](int a, int b) {
+                const auto& ma = components_.means[static_cast<std::size_t>(a)];
+                const auto& mb = components_.means[static_cast<std::size_t>(b)];
+                if (ma(axis) == mb(axis)) {
+                    return a < b;
+                }
+                return ma(axis) < mb(axis);
+            });
+
+        const int node_idx = static_cast<int>(nodes_.size());
+        nodes_.emplace_back();
+        nodes_[static_cast<std::size_t>(node_idx)].component_pos =
+            positions[static_cast<std::size_t>(mid)];
+        nodes_[static_cast<std::size_t>(node_idx)].axis = axis;
+
+        const auto& mean =
+            components_.means[static_cast<std::size_t>(
+                nodes_[static_cast<std::size_t>(node_idx)].component_pos)];
+        nodes_[static_cast<std::size_t>(node_idx)].bounds_min = mean;
+        nodes_[static_cast<std::size_t>(node_idx)].bounds_max = mean;
+        nodes_[static_cast<std::size_t>(node_idx)].max_trace =
+            components_.traces[static_cast<std::size_t>(
+                nodes_[static_cast<std::size_t>(node_idx)].component_pos)];
+
+        nodes_[static_cast<std::size_t>(node_idx)].left =
+            build(positions, begin, mid, depth + 1);
+        nodes_[static_cast<std::size_t>(node_idx)].right =
+            build(positions, mid + 1, end, depth + 1);
+        includeChildBounds(
+            node_idx, nodes_[static_cast<std::size_t>(node_idx)].left);
+        includeChildBounds(
+            node_idx, nodes_[static_cast<std::size_t>(node_idx)].right);
+        return node_idx;
+    }
+
+    void includeChildBounds(int node_idx, int child_idx) {
+        if (node_idx == kInvalidNode || child_idx == kInvalidNode) {
+            return;
+        }
+        Node& node = nodes_[static_cast<std::size_t>(node_idx)];
+        const Node& child = nodes_[static_cast<std::size_t>(child_idx)];
+        node.bounds_min = node.bounds_min.cwiseMin(child.bounds_min);
+        node.bounds_max = node.bounds_max.cwiseMax(child.bounds_max);
+        node.max_trace = std::max(node.max_trace, child.max_trace);
+    }
+
+    void query(int node_idx,
+               const Eigen::Vector3f& center,
+               float source_trace,
+               std::vector<int>& out) const {
+        if (node_idx == kInvalidNode) {
+            return;
+        }
+
+        const Node& node = nodes_[static_cast<std::size_t>(node_idx)];
+        const float max_gate_radius2 = kGateRadiusMultiplierSq *
+            std::max(node.max_trace + source_trace,
+                     std::numeric_limits<float>::epsilon());
+        if (distanceSqToAabb(center, node.bounds_min, node.bounds_max) >
+            max_gate_radius2) {
+            return;
+        }
+
+        out.push_back(node.component_pos);
+        query(node.left, center, source_trace, out);
+        query(node.right, center, source_trace, out);
+    }
+
+    const ComponentCache& components_;
+    std::vector<Node, Eigen::aligned_allocator<Node>> nodes_;
+    int root_ = kInvalidNode;
+};
 
 Eigen::Transform<float, 3, Eigen::Affine, Eigen::ColMajor>
 toAffine(const Eigen::Matrix4f& T) {
@@ -75,15 +260,21 @@ ComponentCache buildComponentCache(const gmm_utils::GMM3f& gmm) {
     const auto& covs = gmm.getCovs();
     const auto& means = gmm.getMeans();
     for (std::uint32_t k = 0; k < n; ++k) {
-        CachedComponent c;
-        c.mean = means.col(k);
-        c.covariance = covarianceFromColumn(covs, k);
-        c.trace = c.covariance.trace();
-        c.weight = weights(k);
-        c.valid = c.mean.allFinite() && c.covariance.allFinite() &&
-                  std::isfinite(c.trace) && std::isfinite(c.weight) &&
-                  c.weight > 0.0f;
-        cache.push_back(c);
+        const Eigen::Vector3f mean = means.col(k);
+        const Eigen::Matrix3f covariance = covarianceFromColumn(covs, k);
+        const float trace = covariance.trace();
+        const float weight = weights(k);
+        const bool valid =
+            mean.allFinite() && covariance.allFinite() &&
+            std::isfinite(trace) && std::isfinite(weight) && weight > 0.0f;
+
+        cache.means.emplace_back(mean);
+        cache.covariances.emplace_back(covariance);
+        cache.traces.emplace_back(trace);
+        cache.weights.emplace_back(weight);
+        if (valid) {
+            cache.valid_indices.emplace_back(static_cast<int>(k));
+        }
     }
     return cache;
 }
@@ -91,6 +282,40 @@ ComponentCache buildComponentCache(const gmm_utils::GMM3f& gmm) {
 bool inverseAndDeterminant(const Eigen::Matrix3f& S,
                            Eigen::Matrix3f& S_inv,
                            float& det) {
+    auto tryLlt = [&](Eigen::Matrix3f M, float jitter) {
+        if (jitter > 0.0f) {
+            M.diagonal().array() += jitter;
+        }
+
+        Eigen::LLT<Eigen::Matrix3f> llt(M);
+        if (llt.info() != Eigen::Success) {
+            return false;
+        }
+
+        const auto L = llt.matrixL();
+        const float d0 = L(0, 0);
+        const float d1 = L(1, 1);
+        const float d2 = L(2, 2);
+        const float det_candidate = (d0 * d1 * d2) * (d0 * d1 * d2);
+        if (!std::isfinite(det_candidate) || det_candidate <= 0.0f) {
+            return false;
+        }
+
+        const Eigen::Matrix3f inv_candidate =
+            llt.solve(Eigen::Matrix3f::Identity());
+        if (!inv_candidate.allFinite()) {
+            return false;
+        }
+
+        det = det_candidate;
+        S_inv = inv_candidate;
+        return true;
+    };
+
+    if (tryLlt(S, 0.0f) || tryLlt(S, 1e-9f)) {
+        return true;
+    }
+
     Eigen::Matrix3d Sd = S.cast<double>();
     Eigen::Matrix3d invd;
     double detd = 0.0;
@@ -127,6 +352,7 @@ public:
                          float initial_inflation = kInitialInflation)
         : source_cache_(buildComponentCache(source_gmm)),
           target_cache_(buildComponentCache(target_gmm)),
+          target_index_(target_cache_),
           translation_prior_(translation_prior),
           rotation_prior_u_(rotation_prior_u),
           options_(options),
@@ -134,19 +360,30 @@ public:
           inflation_factor_(initial_inflation) {
         const Eigen::Matrix3f R = Eigen::Matrix3f::Identity();
         const Eigen::Vector3f t = Eigen::Vector3f::Zero();
-        Et_ = rawScore(R, t, target_cache_, target_cache_, 1.0f,
-                       inflation_factor_);
+        Et_ = rawScore(R, t, target_cache_, target_index_, target_cache_,
+                       1.0f, inflation_factor_, options_, scratch_);
         if (!std::isfinite(Et_) || Et_ <= std::numeric_limits<float>::min()) {
             Et_ = 1.0f;
         }
     }
+
+    GmmRegistrationModel(const GmmRegistrationModel& other)
+        : source_cache_(other.source_cache_),
+          target_cache_(other.target_cache_),
+          target_index_(target_cache_),
+          Et_(other.Et_),
+          translation_prior_(other.translation_prior_),
+          rotation_prior_u_(other.rotation_prior_u_),
+          options_(other.options_),
+          initial_inflation_(other.initial_inflation_),
+          inflation_factor_(other.inflation_factor_) {}
 
     float operator()(const column_vector& x) const {
         const Eigen::Vector3f t(x(0), x(1), x(2));
         const Eigen::Vector3f u(x(3), x(4), x(5));
         const float d2d_score =
             rawScore(rotationFromAxisAngleVector(u), t,
-                     target_cache_, source_cache_, Et_, inflation_factor_);
+                     source_cache_, Et_, inflation_factor_);
 
         const Eigen::Vector3f trans_delta = t - translation_prior_;
         const Eigen::Vector3f rot_delta = u - rotation_prior_u_;
@@ -185,7 +422,6 @@ public:
         Eigen::Matrix<float, 6, 6> unused_full_hess =
             Eigen::Matrix<float, 6, 6>::Zero();
         corrGradHess(R, t,
-                     target_cache_,
                      source_cache_,
                      Et_,
                      dRdu, d2Rdu2,
@@ -204,77 +440,225 @@ public:
     }
 
 private:
-    static float rawScore(const Eigen::Matrix3f& R,
-                          const Eigen::Vector3f& t,
-                          const ComponentCache& target_gmm,
-                          const ComponentCache& source_gmm,
-                          float normalizer,
-                          float inflation_factor) {
-        if (target_gmm.empty() || source_gmm.empty() || normalizer == 0.0f) {
+    static void buildTransformedSourceCache(
+        const Eigen::Matrix3f& R,
+        const ComponentCache& source_gmm,
+        const Eigen::Matrix3f& Minf,
+        TransformedSourceCache& transformed) {
+        transformed.clear();
+        transformed.reserve(source_gmm.valid_indices.size());
+        for (const int source_pos : source_gmm.valid_indices) {
+            const auto i = static_cast<std::size_t>(source_pos);
+            const Eigen::Vector3f& mean = source_gmm.means[i];
+            const Eigen::Matrix3f inflated_covariance =
+                source_gmm.covariances[i] + Minf;
+            const Eigen::Vector3f transformed_mean = R * mean;
+            const Eigen::Matrix3f rotated_inflated_covariance =
+                R * inflated_covariance;
+
+            if (!transformed_mean.allFinite() ||
+                !inflated_covariance.allFinite() ||
+                !rotated_inflated_covariance.allFinite()) {
+                continue;
+            }
+
+            transformed.original_means.emplace_back(mean);
+            transformed.transformed_means.emplace_back(transformed_mean);
+            transformed.inflated_covariances.emplace_back(inflated_covariance);
+            transformed.rotated_inflated_covariances.emplace_back(
+                rotated_inflated_covariance);
+            transformed.traces.emplace_back(source_gmm.traces[i]);
+            transformed.weights.emplace_back(source_gmm.weights[i]);
+        }
+    }
+
+    static float scorePairContribution(
+            const Eigen::Matrix3f& R,
+            const Eigen::Matrix3f& Minf,
+            const Eigen::Vector3f& t,
+            const TransformedSourceCache& transformed,
+            std::size_t si,
+            const ComponentCache& target_gmm,
+            std::size_t ti,
+            float normalizer) {
+        const Eigen::Matrix3f& L = target_gmm.covariances[ti];
+        const Eigen::Vector3f& mu = target_gmm.means[ti];
+        const float w = target_gmm.weights[ti] * transformed.weights[si];
+        if (!std::isfinite(w) || w <= 0.0f) {
             return 0.0f;
         }
 
+        const Eigen::Vector3f y =
+            mu - transformed.transformed_means[si] - t;
+
+        const float radius2 = std::max(
+            target_gmm.traces[ti] + transformed.traces[si],
+            std::numeric_limits<float>::epsilon());
+        if (y.squaredNorm() > kGateRadiusMultiplierSq * radius2) {
+            return 0.0f;
+        }
+
+        const Eigen::Matrix3f S =
+            L + Minf +
+            transformed.rotated_inflated_covariances[si] * R.transpose();
+        Eigen::Matrix3f S_inv;
+        float det = 0.0f;
+        if (!inverseAndDeterminant(S, S_inv, det)) {
+            return 0.0f;
+        }
+
+        const Eigen::Vector3f Sy = S_inv * y;
+        const float exponent = -0.5f * y.dot(Sy);
+        if (!std::isfinite(exponent)) {
+            return 0.0f;
+        }
+
+        const float contribution =
+            w * kPi32 * (1.0f / std::sqrt(det)) *
+            std::exp(exponent) / normalizer;
+        return std::isfinite(contribution) ? contribution : 0.0f;
+    }
+
+    static float rawScoreSerial(const Eigen::Matrix3f& R,
+                                const Eigen::Vector3f& t,
+                                const TargetMeanIndex& target_index,
+                                const ComponentCache& target_gmm,
+                                float normalizer,
+                                float inflation_factor,
+                                RegistrationScratch& scratch) {
         const Eigen::Matrix3f Minf =
             Eigen::Matrix3f::Identity() * inflation_factor;
+        scratch.candidate_targets.reserve(target_gmm.size());
         float score = 0.0f;
 
-        for (const auto& cm : target_gmm) {
-            if (!cm.valid) {
-                continue;
-            }
-            const Eigen::Matrix3f& L = cm.covariance;
-            const Eigen::Vector3f& mu = cm.mean;
-            for (const auto& ck : source_gmm) {
-                if (!ck.valid) {
-                    continue;
-                }
-                const Eigen::Matrix3f& Om = ck.covariance;
-                const Eigen::Vector3f& nu = ck.mean;
-                const float w = cm.weight * ck.weight;
-                if (!std::isfinite(w) || w <= 0.0f) {
-                    continue;
-                }
-
-                const Eigen::Vector3f Rnu = R * nu;
-                const Eigen::Vector3f y = mu - Rnu - t;
-
-                const float radius2 = std::max(
-                    cm.trace + ck.trace,
-                    std::numeric_limits<float>::epsilon());
-                if (y.squaredNorm() > kGateRadiusMultiplierSq * radius2) {
-                    continue;
-                }
-
-                const Eigen::Matrix3f ROm = R * (Om + Minf);
-                const Eigen::Matrix3f S = L + Minf + ROm * R.transpose();
-                Eigen::Matrix3f S_inv;
-                float det = 0.0f;
-                if (!inverseAndDeterminant(S, S_inv, det)) {
-                    continue;
-                }
-
-                const Eigen::Vector3f Sy = S_inv * y;
-                const float exponent = -0.5f * y.dot(Sy);
-                if (!std::isfinite(exponent)) {
-                    continue;
-                }
-
-                const float contribution =
-                    w * kPi32 * (1.0f / std::sqrt(det)) *
-                    std::exp(exponent) / normalizer;
-                if (std::isfinite(contribution)) {
-                    score += contribution;
-                }
+        const auto& transformed = scratch.transformed_source;
+        for (std::size_t si = 0; si < transformed.size(); ++si) {
+            scratch.candidate_targets.clear();
+            target_index.queryPotentialMatches(
+                transformed.transformed_means[si] + t,
+                transformed.traces[si],
+                scratch.candidate_targets);
+            for (const int target_pos : scratch.candidate_targets) {
+                const auto ti = static_cast<std::size_t>(target_pos);
+                score += scorePairContribution(
+                    R, Minf, t, transformed, si, target_gmm, ti, normalizer);
             }
         }
 
         return score;
     }
 
+    static int openmpThreadCount(const D2DRegistrationOptions& options) {
+        const int requested = std::max(1, options.openmp_max_threads);
+#ifdef _OPENMP
+        return std::max(1, std::min(requested, omp_get_max_threads()));
+#else
+        (void)requested;
+        return 1;
+#endif
+    }
+
+    static bool shouldUseOpenmpRawScore(const ComponentCache& source_gmm,
+                                        const ComponentCache& target_gmm,
+                                        const D2DRegistrationOptions& options) {
+        if (!options.openmp_raw_score_enable ||
+            openmpThreadCount(options) <= 1) {
+            return false;
+        }
+        const std::size_t min_pairs =
+            static_cast<std::size_t>(std::max(0, options.openmp_min_pairs));
+        const std::size_t estimated_pairs =
+            source_gmm.size() * target_gmm.size();
+        return estimated_pairs >= min_pairs;
+    }
+
+    static float rawScoreParallel(const Eigen::Matrix3f& R,
+                                  const Eigen::Vector3f& t,
+                                  const TargetMeanIndex& target_index,
+                                  const ComponentCache& target_gmm,
+                                  float normalizer,
+                                  float inflation_factor,
+                                  const TransformedSourceCache& transformed,
+                                  int num_threads) {
+#ifdef _OPENMP
+        const Eigen::Matrix3f Minf =
+            Eigen::Matrix3f::Identity() * inflation_factor;
+        float score = 0.0f;
+        const int n_source = static_cast<int>(transformed.size());
+
+#pragma omp parallel num_threads(num_threads) reduction(+:score)
+        {
+            std::vector<int> candidate_targets;
+            candidate_targets.reserve(target_gmm.size());
+
+#pragma omp for schedule(dynamic, 4)
+            for (int si_raw = 0; si_raw < n_source; ++si_raw) {
+                const auto si = static_cast<std::size_t>(si_raw);
+                candidate_targets.clear();
+                target_index.queryPotentialMatches(
+                    transformed.transformed_means[si] + t,
+                    transformed.traces[si],
+                    candidate_targets);
+                for (const int target_pos : candidate_targets) {
+                    const auto ti = static_cast<std::size_t>(target_pos);
+                    score += scorePairContribution(
+                        R, Minf, t, transformed, si, target_gmm, ti,
+                        normalizer);
+                }
+            }
+        }
+        return score;
+#else
+        (void)R;
+        (void)t;
+        (void)target_index;
+        (void)target_gmm;
+        (void)normalizer;
+        (void)inflation_factor;
+        (void)transformed;
+        (void)num_threads;
+        return 0.0f;
+#endif
+    }
+
+    static float rawScore(const Eigen::Matrix3f& R,
+                          const Eigen::Vector3f& t,
+                          const ComponentCache& source_gmm,
+                          const TargetMeanIndex& target_index,
+                          const ComponentCache& target_gmm,
+                          float normalizer,
+                          float inflation_factor,
+                          const D2DRegistrationOptions& options,
+                          RegistrationScratch& scratch) {
+        if (target_gmm.empty() || source_gmm.empty() || normalizer == 0.0f) {
+            return 0.0f;
+        }
+
+        const Eigen::Matrix3f Minf =
+            Eigen::Matrix3f::Identity() * inflation_factor;
+        buildTransformedSourceCache(R, source_gmm, Minf,
+                                    scratch.transformed_source);
+        if (shouldUseOpenmpRawScore(source_gmm, target_gmm, options)) {
+            return rawScoreParallel(
+                R, t, target_index, target_gmm, normalizer, inflation_factor,
+                scratch.transformed_source, openmpThreadCount(options));
+        }
+        return rawScoreSerial(R, t, target_index, target_gmm, normalizer,
+                              inflation_factor, scratch);
+    }
+
+    float rawScore(const Eigen::Matrix3f& R,
+                   const Eigen::Vector3f& t,
+                   const ComponentCache& source_gmm,
+                   float normalizer,
+                   float inflation_factor) const {
+        return rawScore(R, t, source_gmm, target_index_, target_cache_,
+                        normalizer, inflation_factor, options_, scratch_);
+    }
+
     void corrGradHess(
         const Eigen::Matrix3f& R,
         const Eigen::Vector3f& t,
-        const ComponentCache& target_gmm,
         const ComponentCache& source_gmm,
         float normalizer,
         const std::vector<Eigen::Matrix3f>& dRdu,
@@ -286,7 +670,7 @@ private:
         score = 0.0f;
         J.setZero();
         H.setZero();
-        if (target_gmm.empty() || source_gmm.empty() || normalizer == 0.0f) {
+        if (target_cache_.empty() || source_gmm.empty() || normalizer == 0.0f) {
             return;
         }
 
@@ -300,34 +684,41 @@ private:
             Eigen::Matrix<float, 9, 3>::Zero();
         const Eigen::Matrix3f Minf =
             Eigen::Matrix3f::Identity() * inflation_factor_;
+        buildTransformedSourceCache(R, source_gmm, Minf,
+                                    scratch_.transformed_source);
+        scratch_.candidate_targets.reserve(target_cache_.size());
 
-        for (const auto& cm : target_gmm) {
-            if (!cm.valid) {
-                continue;
-            }
-            const Eigen::Matrix3f& L = cm.covariance;
-            const Eigen::Vector3f& mu = cm.mean;
-            for (const auto& ck : source_gmm) {
-                if (!ck.valid) {
-                    continue;
-                }
-                const Eigen::Matrix3f& Om = ck.covariance;
-                const Eigen::Vector3f& nu = ck.mean;
-                const float w = cm.weight * ck.weight;
+        const auto& transformed = scratch_.transformed_source;
+        for (std::size_t si = 0; si < transformed.size(); ++si) {
+            scratch_.candidate_targets.clear();
+            target_index_.queryPotentialMatches(
+                transformed.transformed_means[si] + t,
+                transformed.traces[si],
+                scratch_.candidate_targets);
+            for (const int target_pos : scratch_.candidate_targets) {
+                const auto ti = static_cast<std::size_t>(target_pos);
+                const Eigen::Matrix3f& L = target_cache_.covariances[ti];
+                const Eigen::Vector3f& mu = target_cache_.means[ti];
+                const Eigen::Matrix3f& OmInflated =
+                    transformed.inflated_covariances[si];
+                const Eigen::Vector3f& nu = transformed.original_means[si];
+                const float w = target_cache_.weights[ti] *
+                                transformed.weights[si];
                 if (!std::isfinite(w) || w <= 0.0f) {
                     continue;
                 }
 
-                const Eigen::Vector3f Rnu = R * nu;
-                const Eigen::Vector3f y = mu - Rnu - t;
+                const Eigen::Vector3f y =
+                    mu - transformed.transformed_means[si] - t;
                 const float radius2 = std::max(
-                    cm.trace + ck.trace,
+                    target_cache_.traces[ti] + transformed.traces[si],
                     std::numeric_limits<float>::epsilon());
                 if (y.squaredNorm() > kGateRadiusMultiplierSq * radius2) {
                     continue;
                 }
 
-                const Eigen::Matrix3f ROm = R * (Om + Minf);
+                const Eigen::Matrix3f& ROm =
+                    transformed.rotated_inflated_covariances[si];
                 const Eigen::Matrix3f S = L + Minf + ROm * R.transpose();
                 Eigen::Matrix3f S_inv;
                 float det = 0.0f;
@@ -383,7 +774,7 @@ private:
                     Htr.template block<3, 1>(0, 3 + ix).noalias() +=
                         fmk * (da_hqa * Sy - S_ZaSy_Anu);
 
-                    const Eigen::Matrix3f OmAt = (Om + Minf) * A.transpose();
+                    const Eigen::Matrix3f OmAt = OmInflated * A.transpose();
                     const Eigen::Matrix3f SROmTZa = SROm.transpose() * Za;
                     const Eigen::Matrix3f Dba = (-OmAt + SROmTZa) * S_inv;
 
@@ -904,12 +1295,14 @@ private:
 
     ComponentCache source_cache_;
     ComponentCache target_cache_;
+    TargetMeanIndex target_index_;
     float Et_ = 1.0f;
     const Eigen::Vector3f translation_prior_;
     const Eigen::Vector3f rotation_prior_u_;
     const D2DRegistrationOptions options_;
     const float initial_inflation_;
     mutable float inflation_factor_;
+    mutable RegistrationScratch scratch_;
 };
 
 float runD2DRegistration(
@@ -980,6 +1373,24 @@ float runD2DRegistration(
     return score;
 }
 
+float evaluateInitialScore(
+    const gmm_utils::GMM3f& source_gmm,
+    const gmm_utils::GMM3f& target_gmm,
+    const Eigen::Transform<float, 3, Eigen::Affine, Eigen::ColMajor>& Tinit,
+    const D2DRegistrationOptions& options) {
+    ColumnVector x(6);
+    const Eigen::Vector3f t = Tinit.translation();
+    const Eigen::AngleAxisf aa(Tinit.rotation());
+    Eigen::Vector3f u = Eigen::Vector3f::Zero();
+    if (std::isfinite(aa.angle()) && aa.axis().allFinite()) {
+        u = aa.axis() * aa.angle();
+    }
+    x = t(0), t(1), t(2), u(0), u(1), u(2);
+
+    const GmmRegistrationModel model(source_gmm, target_gmm, t, u, options);
+    return model(x);
+}
+
 } // namespace
 
 RegistrationResult isoplanarRegistration(
@@ -1032,6 +1443,15 @@ RegistrationResult anisotropicRegistration(
     result.success = std::isfinite(score) && !result.transform.hasNaN();
     result.initial_score_fast_path_used = fast_path_used;
     return result;
+}
+
+float anisotropicInitialScore(
+    const Eigen::Matrix4f& T_init,
+    const gmm_utils::GMM3f& source_gmm,
+    const gmm_utils::GMM3f& target_gmm,
+    const D2DRegistrationOptions& options) {
+    return evaluateInitialScore(source_gmm, target_gmm, toAffine(T_init),
+                                options);
 }
 
 RegistrationResult isoplanarRegistration(

@@ -26,8 +26,8 @@ import matplotlib.pyplot as plt
 # =====================================================================
 #  CONFIG  --  edit freely
 # =====================================================================
-INPUT_LOG  = "solid_yaw_60fov.log"          # path to the log file
-OUTPUT_PNG = "solid_yaw_60fov.png"          # where to save the figure
+INPUT_LOG  = "solid_descriptor_benchmark.log"  # path to the log file
+OUTPUT_PNG = "solid_descriptor_benchmark.png"  # where to save the figure
 
 TITLE   = "SOLiD descriptor robustness to yaw rotation (60 deg FOV)"
 XLABEL  = "Yaw rotation relative to reference [deg]"

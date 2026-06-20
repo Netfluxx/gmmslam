@@ -6,30 +6,30 @@
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
-#include <geometry_msgs/Pose.h>
-#include <geometry_msgs/PoseStamped.h>
-#include <geometry_msgs/TransformStamped.h>
-#include "gmmslam/ros2_compat.hpp"
-#include <sensor_msgs/PointCloud2.h>
+#include <geometry_msgs/msg/pose.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <geometry_msgs/msg/transform_stamped.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
 
 #include "gmmslam/types.hpp"
 
 namespace gmmslam {
 
-double stampToSec(const ros::Time& stamp);
+double stampToSec(const rclcpp::Time& stamp);
 
-geometry_msgs::TransformStamped poseToTransformStamped(
+geometry_msgs::msg::TransformStamped poseToTransformStamped(
     const Matrix4d& T,
-    const ros::Time& stamp,
+    const rclcpp::Time& stamp,
     const std::string& parent_frame,
     const std::string& child_frame);
 
-geometry_msgs::PoseStamped poseToPoseStamped(
+geometry_msgs::msg::PoseStamped poseToPoseStamped(
     const Matrix4d& T,
-    const ros::Time& stamp,
+    const rclcpp::Time& stamp,
     const std::string& frame_id);
 
-Eigen::MatrixXf pc2ToEigen(const sensor_msgs::PointCloud2& msg);
+Eigen::MatrixXf pc2ToEigen(const sensor_msgs::msg::PointCloud2& msg);
 
 struct PreprocessedCloud {
     std::shared_ptr<const Eigen::MatrixXf> points;
@@ -38,7 +38,7 @@ struct PreprocessedCloud {
 };
 
 PreprocessedCloud preprocessPointCloud2(
-    const sensor_msgs::PointCloud2& msg,
+    const sensor_msgs::msg::PointCloud2& msg,
     double min_range,
     double max_range,
     double voxel_size,
@@ -52,7 +52,7 @@ PreprocessedCloud preprocessPointCloud2(
     double horizontal_fov_deg = 120.0);
 
 std::optional<OrganizedDepthImage> pc2ToOrganizedDepth(
-    const sensor_msgs::PointCloud2& msg,
+    const sensor_msgs::msg::PointCloud2& msg,
     double min_range,
     double max_range,
     bool estimate_intrinsics = false,
@@ -62,9 +62,9 @@ std::optional<OrganizedDepthImage> pc2ToOrganizedDepth(
     double cy = -1.0,
     double horizontal_fov_deg = 120.0);
 
-sensor_msgs::PointCloud2 eigenToPc2Rgb(
+sensor_msgs::msg::PointCloud2 eigenToPc2Rgb(
     const Eigen::MatrixXf& pts,
-    const ros::Time& stamp,
+    const rclcpp::Time& stamp,
     const std::string& frame_id,
     uint8_t r,
     uint8_t g,
@@ -77,7 +77,7 @@ Eigen::MatrixXf preprocess(
     double voxel_size,
     int target_points);
 
-Matrix4d poseMsgToMatrix(const geometry_msgs::Pose& pose_msg);
+Matrix4d poseMsgToMatrix(const geometry_msgs::msg::Pose& pose_msg);
 
 Eigen::MatrixXd makePcld4d(const Eigen::MatrixXf& pts);
 

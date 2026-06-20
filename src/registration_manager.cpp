@@ -1,4 +1,5 @@
 #include "gmmslam/registration_manager.hpp"
+#include "gmmslam/rclcpp_logging.hpp"
 #include "gmmslam/fixed_lag_backend.hpp"
 #include "gmmslam/gmmap_fitting.hpp"
 #include "gmmslam/global_pose_graph.hpp"
@@ -24,11 +25,11 @@
 #include <thread>
 #include <vector>
 
-#include "gmmslam/ros2_compat.hpp"
-#include <std_msgs/String.h>
-#include <geometry_msgs/Point.h>
-#include <visualization_msgs/Marker.h>
-#include <visualization_msgs/MarkerArray.h>
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <geometry_msgs/msg/point.hpp>
+#include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include <sstream>
 
@@ -87,14 +88,14 @@ namespace gmmslam {
 RegistrationManager::RegistrationManager(
     FixedLagBackend& smoother,
     GlobalPoseGraph* global_graph,
-    ros::Publisher reg_request_pub,
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr reg_request_pub,
     const RegistrationConfig& reg_cfg,
     const LoopClosureConfig& lc_cfg,
     const SolidConfig& solid_cfg,
     const SogmmConfig& sogmm_cfg,
     const VisualizationConfig& vis_cfg,
     const std::string& gmm_dir,
-    ros::Publisher loop_closure_markers_pub,
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr loop_closure_markers_pub,
     std::string map_frame,
     std::string benchmark_log_dir)
     : smoother_(smoother),
@@ -143,21 +144,21 @@ RegistrationManager::RegistrationManager(
 {
     std::filesystem::create_directories(gmm_dir_);
     initBenchmarkLogs(benchmark_log_dir);
-    if (!loop_closure_markers_pub_.getTopic().empty()) {
-        visualization_msgs::MarkerArray clear_arr;
-        visualization_msgs::Marker clear;
+    if (loop_closure_markers_pub_) {
+        visualization_msgs::msg::MarkerArray clear_arr;
+        visualization_msgs::msg::Marker clear;
         clear.header.frame_id = map_frame_;
-        clear.header.stamp = ros::Time::now();
-        clear.action = visualization_msgs::Marker::DELETEALL;
+        clear.header.stamp = gmmslam::now();
+        clear.action = visualization_msgs::msg::Marker::DELETEALL;
         clear_arr.markers.push_back(std::move(clear));
-        loop_closure_markers_pub_.publish(clear_arr);
+        loop_closure_markers_pub_->publish(clear_arr);
     }
-    ROS_INFO("[registration] GMM fitting backend requested: %s%s",
+    GMS_INFO("[registration] GMM fitting backend requested: %s%s",
              sogmm_cfg_.backend.c_str(),
              gmmapFittingAvailable() ? " (GMMap adapter built)"
                                      : " (GMMap adapter not built)");
     if (solid_cfg_.enable) {
-        ROS_INFO("[registration] SOLiD enabled: dim=%d (range=%d + angle=%d) "
+        GMS_INFO("[registration] SOLiD enabled: dim=%d (range=%d + angle=%d) "
                  "height=%d range=[%.2f, %.2f] fov=[%.1f, %.1f] deg "
                  "cos_gate=%.2f yaw_prior=%s",
                  solid_cfg_.num_range + solid_cfg_.num_angle,
@@ -168,7 +169,7 @@ RegistrationManager::RegistrationManager(
                  solid_cfg_.cos_similarity_threshold,
                  solid_cfg_.provide_yaw_prior ? "on" : "off");
     } else {
-        ROS_INFO("[registration] SOLiD disabled — loop search is radius-only");
+        GMS_INFO("[registration] SOLiD disabled — loop search is radius-only");
     }
 }
 
@@ -188,7 +189,7 @@ void RegistrationManager::initBenchmarkLogs(const std::string& log_dir)
                                          std::ios::out);
         if (!benchmark_gmm_fits_csv_ || !benchmark_d2d_timings_csv_ ||
             !benchmark_registration_csv_) {
-            ROS_WARN("[benchmark] failed to open one or more registration benchmark CSVs in %s",
+            GMS_WARN("[benchmark] failed to open one or more registration benchmark CSVs in %s",
                      log_dir.c_str());
             return;
         }
@@ -208,7 +209,7 @@ void RegistrationManager::initBenchmarkLogs(const std::string& log_dir)
             << "n_source,n_target,coarse_score\n";
         benchmark_logs_enabled_ = true;
     } catch (const std::exception& e) {
-        ROS_WARN("[benchmark] failed to initialize registration log in %s: %s",
+        GMS_WARN("[benchmark] failed to initialize registration log in %s: %s",
                  log_dir.c_str(), e.what());
     }
 }
@@ -361,17 +362,17 @@ void RegistrationManager::submitKeyframeDescriptor(int frame_idx,
                                                     const Eigen::MatrixXf& pts)
 {
     if (!solid_cfg_.enable) return;
-    ROS_INFO("[registration][DBG] submitKeyframeDescriptor X(%d) pts=%ld",
+    GMS_INFO("[registration][DBG] submitKeyframeDescriptor X(%d) pts=%ld",
              frame_idx, static_cast<long>(pts.rows()));
     SolidDescriptor desc = place_index_.compute(pts);
     if (desc.empty()) {
-        ROS_WARN("[registration][DBG] SOLiD: descriptor empty for X(%d) "
+        GMS_WARN("[registration][DBG] SOLiD: descriptor empty for X(%d) "
                  "(points=%d after FOV/range filter)",
                  frame_idx, desc.point_count);
         return;
     }
     place_index_.insert(frame_idx, std::move(desc));
-    ROS_INFO("[registration][DBG] SOLiD index now size=%zu",
+    GMS_INFO("[registration][DBG] SOLiD index now size=%zu",
              place_index_.size());
 }
 
@@ -379,7 +380,7 @@ void RegistrationManager::submitKeyframeDescriptor(int frame_idx,
 // enqueueFit — backpressure: drop oldest if queue full
 // ---------------------------------------------------------------------------
 
-bool RegistrationManager::enqueueFit(int frame_idx, const ros::Time& stamp,
+bool RegistrationManager::enqueueFit(int frame_idx, const rclcpp::Time& stamp,
                                       std::shared_ptr<const Eigen::MatrixXf> pts,
                                       std::optional<OrganizedDepthImage> organized_depth,
                                       double capture_t_sec,
@@ -387,32 +388,32 @@ bool RegistrationManager::enqueueFit(int frame_idx, const ros::Time& stamp,
 {
     if (!pts) {
         ++dropped_fit_frames;
-        ROS_WARN("[registration][DBG] enqueueFit X(%d) dropped null cloud",
+        GMS_WARN("[registration][DBG] enqueueFit X(%d) dropped null cloud",
                  frame_idx);
         return false;
     }
     const std::size_t qsize_before = fit_queue_.size();
-    ROS_INFO("[registration][DBG] enqueueFit ENTER X(%d) pts=%ld "
+    GMS_INFO("[registration][DBG] enqueueFit ENTER X(%d) pts=%ld "
              "queue_depth=%zu",
              frame_idx, static_cast<long>(pts->rows()), qsize_before);
     FitJob job{frame_idx, stamp, pts, organized_depth,
                capture_t_sec, capture_pose};
 
     if (fit_queue_.tryPush(std::move(job))) {
-        ROS_INFO("[registration][DBG] enqueueFit OK X(%d) queue_depth_after=%zu",
+        GMS_INFO("[registration][DBG] enqueueFit OK X(%d) queue_depth_after=%zu",
                  frame_idx, fit_queue_.size());
         return true;
     }
 
     ++dropped_fit_frames;
-    ROS_WARN("[registration][DBG] enqueueFit FULL X(%d) queue_depth=%zu -> "
+    GMS_WARN("[registration][DBG] enqueueFit FULL X(%d) queue_depth=%zu -> "
              "dropping oldest and retrying",
              frame_idx, fit_queue_.size());
     fit_queue_.tryPop();
     FitJob retry{frame_idx, stamp, pts, organized_depth,
                  capture_t_sec, capture_pose};
     const bool ok = fit_queue_.tryPush(std::move(retry));
-    ROS_WARN("[registration][DBG] enqueueFit retry X(%d) ok=%d "
+    GMS_WARN("[registration][DBG] enqueueFit retry X(%d) ok=%d "
              "queue_depth_after=%zu",
              frame_idx, ok ? 1 : 0, fit_queue_.size());
     return ok;
@@ -424,7 +425,7 @@ bool RegistrationManager::enqueueFit(int frame_idx, const ros::Time& stamp,
 
 void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
 {
-    ROS_INFO("[registration][DBG] fitWorkerLoop STARTED tid=%zu",
+    GMS_INFO("[registration][DBG] fitWorkerLoop STARTED tid=%zu",
              static_cast<std::size_t>(
                  std::hash<std::thread::id>{}(std::this_thread::get_id())));
     while (!shutdown.load(std::memory_order_relaxed)) {
@@ -440,7 +441,7 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
             awaiting_fits_.insert(fid);
         }
         const std::size_t qsize_after_pop = fit_queue_.size();
-        ROS_INFO("[registration][DBG] fit START X(%d) pts=%ld "
+        GMS_INFO("[registration][DBG] fit START X(%d) pts=%ld "
                  "queue_depth_after_pop=%zu",
                  fid, static_cast<long>(job.points ? job.points->rows() : 0),
                  qsize_after_pop);
@@ -468,16 +469,16 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
             const auto t1 = std::chrono::steady_clock::now();
             const double dt_ms =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
-            ROS_INFO("[registration][DBG] fit DONE  X(%d) backend=%s pts=%ld K=%d "
+            GMS_INFO("[registration][DBG] fit DONE  X(%d) backend=%s pts=%ld K=%d "
                      "elapsed_ms=%.1f",
                      fid, backend_used.c_str(), static_cast<long>(job.points->rows()),
                      model.numComponents(), dt_ms);
-            ROS_INFO("[timing][gmm_fit] X(%d) backend=%s pts=%ld K=%d "
+            GMS_INFO("[timing][gmm_fit] X(%d) backend=%s pts=%ld K=%d "
                      "elapsed_ms=%.3f",
                      fid, backend_used.c_str(), static_cast<long>(job.points->rows()),
                      model.numComponents(), dt_ms);
             if (model.numComponents() > 0) {
-                logGmmFitTiming(job.stamp.toSec(), fid, backend_used,
+                logGmmFitTiming(job.stamp.seconds(), fid, backend_used,
                                 static_cast<int>(job.points->rows()),
                                 model.numComponents(), qsize_after_pop,
                                 dt_ms, true, "fit_ok");
@@ -485,12 +486,12 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
                           job.capture_t_sec, job.capture_pose);
                 finish_ok = true;
             } else {
-                ROS_WARN(
+                GMS_WARN(
                     "[registration][DBG] GMM fit returned EMPTY model "
                     "for frame %d pts=%ld elapsed_ms=%.1f",
                     fid, static_cast<long>(job.points->rows()),
                     dt_ms);
-                logGmmFitTiming(job.stamp.toSec(), fid, backend_used,
+                logGmmFitTiming(job.stamp.seconds(), fid, backend_used,
                                 static_cast<int>(job.points->rows()),
                                 0, qsize_after_pop, dt_ms, false,
                                 "empty_model");
@@ -499,12 +500,12 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
             const auto t1 = std::chrono::steady_clock::now();
             const double dt_ms =
                 std::chrono::duration<double, std::milli>(t1 - t0).count();
-            ROS_ERROR(
+            GMS_ERROR(
                 "[registration][DBG] fit THROW X(%d) pts=%ld elapsed_ms=%.1f "
                 "what=%s",
                 fid, static_cast<long>(job.points ? job.points->rows() : 0), dt_ms,
                 e.what());
-            logGmmFitTiming(job.stamp.toSec(), fid, "unknown",
+            logGmmFitTiming(job.stamp.seconds(), fid, "unknown",
                             static_cast<int>(job.points ? job.points->rows() : 0), 0,
                             qsize_after_pop, dt_ms, false,
                             std::string("exception:") + e.what());
@@ -514,7 +515,7 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
             awaiting_fits_.erase(fid);
         }
     }
-    ROS_WARN("[registration][DBG] fitWorkerLoop EXITING (shutdown)");
+    GMS_WARN("[registration][DBG] fitWorkerLoop EXITING (shutdown)");
 }
 
 // ---------------------------------------------------------------------------
@@ -522,11 +523,11 @@ void RegistrationManager::fitWorkerLoop(const std::atomic<bool>& shutdown)
 // ---------------------------------------------------------------------------
 
 void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
-                                     const ros::Time& stamp,
+                                     const rclcpp::Time& stamp,
                                      double capture_t_sec,
                                      const Matrix4d& capture_pose)
 {
-    ROS_INFO("[registration][DBG] finishFit ENTER X(%d) K=%d",
+    GMS_INFO("[registration][DBG] finishFit ENTER X(%d) K=%d",
              frame_idx, model.numComponents());
     {
         std::lock_guard<std::mutex> lk(lock);
@@ -535,7 +536,7 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
         has_latest_gmm = true;
 
         LocalGmmEntry entry;
-        entry.stamp_sec = stamp.toSec();
+        entry.stamp_sec = stamp.seconds();
         entry.model = model;
         entry.capture_t_sec = capture_t_sec;
         entry.capture_pose = capture_pose;
@@ -553,7 +554,7 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
         }
     }
 
-    ROS_INFO("[registration] frame %4d | local GMM: %3d components",
+    GMS_INFO("[registration] frame %4d | local GMM: %3d components",
              frame_idx, model.numComponents());
 
     // Save .gmm file
@@ -563,7 +564,7 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
     try {
         saveGmmToFile(model, gmm_path);
     } catch (const std::exception& e) {
-        ROS_ERROR("[registration] failed to save GMM: %s", e.what());
+        GMS_ERROR("[registration] failed to save GMM: %s", e.what());
         {
             std::lock_guard<std::mutex> lk(lock);
             awaiting_fits_.erase(frame_idx);
@@ -571,7 +572,7 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
         return;
     }
 
-    const double fit_t_sec = ros::Time::now().toSec();
+    const double fit_t_sec = gmmslam::now().seconds();
 
     // Retrieve the best available pose from the smoother.
     // When compensate_fit_latency is on, the smoother may have a more
@@ -629,7 +630,7 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
     }
 
     if (skip_sequential_d2d && prev_idx >= 0) {
-        ROS_WARN_THROTTLE(
+        GMS_WARN_THROTTLE(
             2.0,
             "[registration] skip sequential D2D X(%d)->X(%d): "
             "intermediate odom indices still fitting (async ordering)",
@@ -642,7 +643,7 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
             const int odom_gap = frame_idx - prev_idx;
             if (max_sequential_odom_gap_ > 0 &&
                 odom_gap > max_sequential_odom_gap_) {
-                ROS_WARN("[registration] skip sequential D2D long hop "
+                GMS_WARN("[registration] skip sequential D2D long hop "
                          "X(%d)->X(%d) (odom_gap=%d > max_sequential_odom_gap=%d): "
                          "not a frame-to-frame constraint",
                          prev_idx, frame_idx, odom_gap,
@@ -654,7 +655,7 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
                 nlohmann::json payload;
                 payload["prev_idx"]         = prev_idx;
                 payload["curr_idx"]         = frame_idx;
-                payload["stamp"]            = stamp.toSec();
+                payload["stamp"]            = stamp.seconds();
                 payload["source_path"]      = gmm_path;
                 payload["target_path"]      = prev_path;
                 payload["is_loop_closure"]  = false;
@@ -678,10 +679,10 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
                     }
                 }
 
-                std_msgs::String msg;
+                std_msgs::msg::String msg;
                 msg.data = payload.dump();
-                reg_pub_.publish(msg);
-                ROS_INFO("[registration][D2D] dispatched sequential request X(%d)->X(%d) "
+                reg_pub_->publish(msg);
+                GMS_INFO("[registration][D2D] dispatched sequential request X(%d)->X(%d) "
                          "source=%s target=%s init=%s",
                          prev_idx, frame_idx,
                          gmm_path.c_str(), prev_path.c_str(),
@@ -718,7 +719,7 @@ void RegistrationManager::finishFit(const GmmModel& model, int frame_idx,
 // ---------------------------------------------------------------------------
 
 void RegistrationManager::enqueueLoopClosureRequests(
-    int curr_idx, const ros::Time& stamp,
+    int curr_idx, const rclcpp::Time& stamp,
     const std::string& source_path, int sequential_prev_idx)
 {
     if (!enable_loop_closure_) return;
@@ -736,7 +737,7 @@ void RegistrationManager::enqueueLoopClosureRequests(
         std::lock_guard<std::mutex> lk(smoother_.graph_lock);
         auto it = smoother_.pose_by_idx.find(curr_idx);
         if (it == smoother_.pose_by_idx.end()) {
-            ROS_WARN_THROTTLE(5.0,
+            GMS_WARN_THROTTLE(5.0,
                 "[registration] loop search: no pose for X(%d)", curr_idx);
             return;
         }
@@ -769,6 +770,7 @@ void RegistrationManager::enqueueLoopClosureRequests(
         std::string path;
     };
     std::vector<Candidate> near;
+    std::map<int, Candidate> near_by_idx;
 
     for (const auto& [idx, target_path] : gmm_snapshot) {
         if (idx >= curr_idx) continue;
@@ -790,12 +792,13 @@ void RegistrationManager::enqueueLoopClosureRequests(
         if (pending_snapshot.count(edge) || added_snapshot.count(edge)) continue;
 
         near.push_back({d, idx, target_path});
+        near_by_idx.emplace(idx, near.back());
     }
 
     // ------------------------------------------------------------------
-    // Candidate selection: SOLiD-only (spatial gate already applied above).
-    // Among the radius-gated hits, pick the single best SOLiD cosine match
-    // and dispatch D2D only if it clears the configured threshold.
+    // Candidate selection: spatial gate first, exact KD-tree SOLiD ranking
+    // second. The rescue path reuses the same descriptor index but bypasses
+    // the radius when loop closures have been silent for long enough.
     // ------------------------------------------------------------------
     SolidDescriptor q_desc;
     const bool have_q_desc =
@@ -807,6 +810,7 @@ void RegistrationManager::enqueueLoopClosureRequests(
         double distance;
         double cos_sim;
         std::string path;
+        bool   solid_rescue = false;
         bool   has_yaw = false;
         double yaw_rad = 0.0;
         double yaw_overlap = 0.0;
@@ -814,7 +818,7 @@ void RegistrationManager::enqueueLoopClosureRequests(
     std::vector<Ranked> selected;
 
     if (!have_q_desc) {
-        ROS_INFO_THROTTLE(10.0,
+        GMS_INFO_THROTTLE(10.0,
             "[registration] loop search @key %d: no SOLiD query descriptor, "
             "skipping (radius=%zu, gmm_cached=%zu)",
             curr_idx, near.size(), gmm_snapshot.size());
@@ -826,10 +830,21 @@ void RegistrationManager::enqueueLoopClosureRequests(
     Ranked best{-1, 0.0, -1.0, {}};
     Ranked best_rejected{-1, 0.0, -1.0, {}};
     std::vector<Ranked> accepted;
-    for (const auto& cand : near) {
+
+    const auto radius_scores = place_index_.topK(
+        q_desc,
+        static_cast<int>(near.size()),
+        [&](int idx) {
+            return near_by_idx.find(idx) != near_by_idx.end();
+        });
+
+    for (const auto& [idx, cs] : radius_scores) {
+        auto cand_it = near_by_idx.find(idx);
+        if (cand_it == near_by_idx.end()) continue;
+        const auto& cand = cand_it->second;
+
         SolidDescriptor c_desc;
         if (!place_index_.get(cand.idx, c_desc)) continue;
-        const double cs = place_index_.rangeCosine(q_desc, c_desc);
         Ranked ranked{cand.idx, cand.distance, cs, cand.path};
         if (solid_cfg_.provide_yaw_prior) {
             const auto yaw = place_index_.yawEstimate(q_desc, c_desc);
@@ -853,24 +868,6 @@ void RegistrationManager::enqueueLoopClosureRequests(
         accepted.push_back(ranked);
     }
 
-    if (accepted.empty()) {
-        if (best_rejected.idx >= 0) {
-            ROS_INFO_THROTTLE(10.0,
-                "[registration] loop search @key %d: 0 accepted candidates "
-                "(radius=%zu, scored=%d, dropped_by_SOLiD=%d, "
-                "best_rejected=X(%d) cos=%.3f dist=%.2fm < threshold %.3f)",
-                curr_idx, near.size(), scored, dropped_by_gate,
-                best_rejected.idx, best_rejected.cos_sim, best_rejected.distance,
-                solid_cfg_.cos_similarity_threshold);
-        } else {
-        ROS_INFO_THROTTLE(10.0,
-            "[registration] loop search @key %d: 0 accepted candidates "
-            "(radius=%zu, scored=%d, dropped_by_SOLiD=%d)",
-            curr_idx, near.size(), scored, dropped_by_gate);
-        }
-        return;
-    }
-
     std::sort(accepted.begin(), accepted.end(),
               [](const Ranked& a, const Ranked& b) {
                   if (a.cos_sim == b.cos_sim) {
@@ -885,24 +882,116 @@ void RegistrationManager::enqueueLoopClosureRequests(
                     accepted.begin(),
                     accepted.begin() + n_to_select);
 
-    // ------------------------------------------------------------------
-    // Previous implementation: fused α·radius + β·cos ranking, optional
-    // full-index rescue path bypassing the radius, and greedy spatial +
-    // yaw diversity selection of up to `max_candidates`. Kept here for
-    // reference while we evaluate SOLiD-only gating.
-    // ------------------------------------------------------------------
-    /*
-    const double R_inv = loop_closure_search_radius_m_ > 1e-6
-                         ? (1.0 / loop_closure_search_radius_m_) : 1.0;
-    // ... fused scoring, rescue, greedy diversity ...
-    */
+    int rescue_scored = 0;
+    int rescue_selected = 0;
+    const int rescue_every = std::max(1, solid_cfg_.rescue_every_n_kf);
+    const int rescue_silence = std::max(0, solid_cfg_.rescue_trigger_silence_kf);
+    const int rescue_top_k = std::max(0, solid_cfg_.rescue_top_k);
+    const bool should_rescue =
+        solid_cfg_.rescue_enable &&
+        rescue_top_k > 0 &&
+        static_cast<int>(selected.size()) < loop_closure_max_candidates_ &&
+        (curr_idx - last_loop_accepted_idx_) >= rescue_silence &&
+        (curr_idx - last_rescue_idx_) >= rescue_every;
+
+    if (should_rescue) {
+        last_rescue_idx_ = curr_idx;
+
+        std::set<int> selected_indices;
+        for (const auto& cand : selected) {
+            selected_indices.insert(cand.idx);
+        }
+
+        const auto rescue_scores = place_index_.topK(
+            q_desc,
+            rescue_top_k,
+            [&](int idx) {
+                if (idx >= curr_idx) return false;
+                if (curr_idx - idx < loop_closure_min_keyframe_gap_) return false;
+                if (sequential_prev_idx >= 0 && idx == sequential_prev_idx) return false;
+                if (selected_indices.count(idx)) return false;
+                if (gmm_snapshot.find(idx) == gmm_snapshot.end()) return false;
+
+                auto t_it = time_snapshot.find(idx);
+                if (t_it == time_snapshot.end()) return false;
+                if ((t_curr - t_it->second) > loop_closure_max_age_s_) return false;
+
+                const auto edge = std::make_pair(std::min(idx, curr_idx),
+                                                 std::max(idx, curr_idx));
+                return !pending_snapshot.count(edge) &&
+                       !added_snapshot.count(edge);
+            });
+
+        for (const auto& [idx, cs] : rescue_scores) {
+            ++rescue_scored;
+            if (cs < solid_cfg_.rescue_cos_threshold) {
+                continue;
+            }
+
+            auto path_it = gmm_snapshot.find(idx);
+            if (path_it == gmm_snapshot.end()) continue;
+
+            double distance = -1.0;
+            auto pos_it = position_snapshot.find(idx);
+            if (pos_it != position_snapshot.end()) {
+                distance = (pos_it->second - curr_pos).norm();
+            }
+
+            Ranked ranked{idx, distance, cs, path_it->second};
+            ranked.solid_rescue = true;
+
+            SolidDescriptor c_desc;
+            if (solid_cfg_.provide_yaw_prior &&
+                place_index_.get(idx, c_desc)) {
+                const auto yaw = place_index_.yawEstimate(q_desc, c_desc);
+                if (yaw.valid) {
+                    ranked.has_yaw = true;
+                    ranked.yaw_rad = yaw.yaw_rad;
+                    ranked.yaw_overlap = yaw.overlap;
+                }
+            }
+
+            if (cs > best.cos_sim) {
+                best = ranked;
+            }
+            selected.push_back(std::move(ranked));
+            selected_indices.insert(idx);
+            ++rescue_selected;
+
+            if (static_cast<int>(selected.size()) >= loop_closure_max_candidates_) {
+                break;
+            }
+        }
+    }
+
+    if (selected.empty()) {
+        if (best_rejected.idx >= 0) {
+            GMS_INFO_THROTTLE(10.0,
+                "[registration] loop search @key %d: 0 accepted candidates "
+                "(radius=%zu, scored=%d, dropped_by_SOLiD=%d, "
+                "best_rejected=X(%d) cos=%.3f dist=%.2fm < threshold %.3f, "
+                "rescue_scored=%d)",
+                curr_idx, near.size(), scored, dropped_by_gate,
+                best_rejected.idx, best_rejected.cos_sim, best_rejected.distance,
+                solid_cfg_.cos_similarity_threshold, rescue_scored);
+        } else {
+            GMS_INFO_THROTTLE(10.0,
+                "[registration] loop search @key %d: 0 accepted candidates "
+                "(radius=%zu, scored=%d, dropped_by_SOLiD=%d, "
+                "rescue_scored=%d)",
+                curr_idx, near.size(), scored, dropped_by_gate,
+                rescue_scored);
+        }
+        return;
+    }
 
     const int n_selected = static_cast<int>(selected.size());
-    ROS_INFO("[registration] loop search @key %d: radius=%zu scored=%d "
+    GMS_INFO("[registration] loop search @key %d: radius=%zu scored=%d "
              "dropped_by_SOLiD=%d, best=X(%d) dist=%.2fm cos=%.3f "
-             "dispatching %d",
+             "rescue_scored=%d rescue_selected=%d dispatching %d",
              curr_idx, near.size(), scored, dropped_by_gate,
-             best.idx, best.distance, best.cos_sim, n_selected);
+             best.idx, best.distance, best.cos_sim,
+             rescue_scored, rescue_selected, n_selected);
 
     for (int i = 0; i < n_selected; ++i) {
         const auto& cand = selected[static_cast<std::size_t>(i)];
@@ -910,14 +999,14 @@ void RegistrationManager::enqueueLoopClosureRequests(
         nlohmann::json payload;
         payload["prev_idx"]        = cand.idx;
         payload["curr_idx"]        = curr_idx;
-        payload["stamp"]           = stamp.toSec();
+        payload["stamp"]           = stamp.seconds();
         payload["source_path"]     = source_path;
         payload["target_path"]     = cand.path;
         payload["is_loop_closure"] = true;
         if (!std::isnan(cand.cos_sim)) {
             payload["solid_cos_sim"] = cand.cos_sim;
         }
-        if (cand.distance < 0.0) {
+        if (cand.solid_rescue) {
             payload["solid_rescue"] = true;
         }
         if (cand.has_yaw) {
@@ -943,15 +1032,16 @@ void RegistrationManager::enqueueLoopClosureRequests(
             }
         }
 
-        std_msgs::String msg;
+        std_msgs::msg::String msg;
         msg.data = payload.dump();
-        reg_pub_.publish(msg);
+        reg_pub_->publish(msg);
 
-        ROS_INFO("[registration] dispatched loop D2D X(%d)->X(%d): "
-                 "dist=%.2fm solid_cos=%.3f init=%s solid_yaw=%s",
+        GMS_INFO("[registration] dispatched loop D2D X(%d)->X(%d): "
+                 "dist=%.2fm solid_cos=%.3f init=%s solid_yaw=%s%s",
                  cand.idx, curr_idx, cand.distance, cand.cos_sim,
                  payload.contains("initial_transform") ? "latest_pose" : "none",
-                 cand.has_yaw ? "yes" : "no");
+                 cand.has_yaw ? "yes" : "no",
+                 cand.solid_rescue ? " rescue" : "");
 
         {
             std::lock_guard<std::mutex> lk(lock);
@@ -966,20 +1056,20 @@ void RegistrationManager::enqueueLoopClosureRequests(
 // resultCallback — ROS subscriber callback
 // ---------------------------------------------------------------------------
 
-void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr& msg)
+void RegistrationManager::resultCallback(const std_msgs::msg::String::ConstSharedPtr& msg)
 {
     nlohmann::json data;
     try {
         data = nlohmann::json::parse(msg->data);
     } catch (const std::exception& e) {
-        ROS_WARN_THROTTLE(2.0, "[registration] JSON parse error: %s", e.what());
+        GMS_WARN_THROTTLE(2.0, "[registration] JSON parse error: %s", e.what());
         return;
     }
 
     double result_stamp_sec =
-        jsonNumber<double>(data, "stamp", ros::Time::now().toSec());
+        jsonNumber<double>(data, "stamp", gmmslam::now().seconds());
     if (!std::isfinite(result_stamp_sec)) {
-        result_stamp_sec = ros::Time::now().toSec();
+        result_stamp_sec = gmmslam::now().seconds();
     }
 
     // Submap-level registration results
@@ -992,7 +1082,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr&
     const int prev_idx = jsonNumber<int>(data, "prev_idx", -1);
     const int curr_idx = jsonNumber<int>(data, "curr_idx", -1);
     if (prev_idx < 0 || curr_idx < 0) {
-        ROS_WARN_THROTTLE(2.0,
+        GMS_WARN_THROTTLE(2.0,
             "[registration] result missing prev_idx/curr_idx, discarding");
         return;
     }
@@ -1034,7 +1124,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr&
             data.value("failure_reason", std::string("unknown_worker_failure"));
         const std::string detail =
             data.value("failure_detail", std::string());
-        ROS_INFO("[registration] %s D2D failed X(%d)->X(%d): "
+        GMS_INFO("[registration] %s D2D failed X(%d)->X(%d): "
                  "reason=%s score=%.4f elapsed_ms=%ld%s%s",
                  kind.c_str(),
                  prev_idx, curr_idx, reason.c_str(), score, elapsed_ms,
@@ -1051,7 +1141,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr&
 
     if (is_loop) {
         if ((curr_idx - prev_idx) < loop_closure_min_keyframe_gap_) {
-            ROS_INFO("[registration] rejected loop result X(%d)->X(%d): "
+            GMS_INFO("[registration] rejected loop result X(%d)->X(%d): "
                      "gap %d < min_keyframe_gap %d",
                      prev_idx, curr_idx, curr_idx - prev_idx,
                      loop_closure_min_keyframe_gap_);
@@ -1059,7 +1149,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr&
             return;
         }
         if (score < loop_closure_detect_score_threshold_) {
-            ROS_INFO("[registration] rejected loop result X(%d)->X(%d): "
+            GMS_INFO("[registration] rejected loop result X(%d)->X(%d): "
                      "score=%.4f < detect_score_threshold %.4f",
                      prev_idx, curr_idx, score,
                      loop_closure_detect_score_threshold_);
@@ -1068,14 +1158,14 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr&
         }
     } else {
         if (score < registration_score_threshold_) {
-            ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
+            GMS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
                      "score=%.4f < registration_score_threshold %.4f",
                      prev_idx, curr_idx, score, registration_score_threshold_);
             log_result_event("rejected", "registration_score_threshold");
             return;
         }
         if ((curr_idx % registration_factor_every_n_frames_) != 0) {
-            ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
+            GMS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
                      "curr_idx %% factor_every_n_frames = %d %% %d != 0",
                      prev_idx, curr_idx, curr_idx,
                      registration_factor_every_n_frames_);
@@ -1085,7 +1175,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr&
     }
 
     if (prev_idx >= curr_idx) {
-        ROS_INFO("[registration] rejected %s D2D result X(%d)->X(%d): "
+        GMS_INFO("[registration] rejected %s D2D result X(%d)->X(%d): "
                  "prev_idx >= curr_idx",
                  kind.c_str(), prev_idx, curr_idx);
         log_result_event("rejected", "prev_idx_ge_curr_idx");
@@ -1096,7 +1186,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr&
     // fails the SE(3) sanity check below).
     auto t_it = data.find("transform");
     if (t_it == data.end() || !t_it->is_array() || t_it->size() != 16) {
-        ROS_INFO("[registration] rejected %s D2D result X(%d)->X(%d): "
+        GMS_INFO("[registration] rejected %s D2D result X(%d)->X(%d): "
                  "missing/invalid transform array",
                  kind.c_str(), prev_idx, curr_idx);
         log_result_event("rejected", "missing_invalid_transform");
@@ -1113,7 +1203,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr&
     }
 
     if (!isSaneRigidTransform(T)) {
-        ROS_WARN_THROTTLE(2.0,
+        GMS_WARN_THROTTLE(2.0,
             "[registration] rejected D2D result X(%d)->X(%d): invalid SE(3) transform",
             prev_idx, curr_idx);
         log_result_event("rejected", "invalid_se3_transform");
@@ -1124,7 +1214,7 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr&
     const bool use_super = is_loop && (score >= loop_closure_detect_score_threshold_);
 
     if (is_loop) {
-        ROS_INFO("[registration] loop detected: X(%d)->X(%d) score=%.4f (super_noise=%s)",
+        GMS_INFO("[registration] loop detected: X(%d)->X(%d) score=%.4f (super_noise=%s)",
                  prev_idx, curr_idx, score, use_super ? "true" : "false");
         if (curr_idx > last_loop_accepted_idx_) {
             last_loop_accepted_idx_ = curr_idx;
@@ -1148,7 +1238,8 @@ void RegistrationManager::resultCallback(const std_msgs::String::ConstSharedPtr&
             std::ostringstream oss;
             oss << "seq D2D X(" << prev_idx << ")->X(" << curr_idx << ")";
             publishD2DRegistrationMarker("sequential", oss.str(), p_prev, p_curr,
-                                         score, ros::Time(result_stamp_sec),
+                                         score,
+                                         gmmslam::timeFromSeconds(result_stamp_sec),
                                          0.95f, 0.95f, 0.15f);
         }
     }
@@ -1218,12 +1309,12 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
         data.value("failure_detail", std::string());
 
     if (sid_prev < 0 || sid_curr < 0) {
-        ROS_WARN_THROTTLE(2.0,
+        GMS_WARN_THROTTLE(2.0,
             "[registration] submap result missing prev_idx/curr_idx, discarding");
         return;
     }
 
-    ROS_INFO("[registration] submap result S(%d)<->S(%d) success=%s score=%.4f%s%s%s%s",
+    GMS_INFO("[registration] submap result S(%d)<->S(%d) success=%s score=%.4f%s%s%s%s",
              sid_prev, sid_curr, success ? "true" : "false", score,
              success ? "" : " reason=",
              success ? "" : failure_reason.c_str(),
@@ -1243,7 +1334,7 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
                             ? failure_reason
                             : failure_reason + ":" + failure_detail));
 
-    const ros::Time stamp_msg = ros::Time(result_stamp_sec);
+    const rclcpp::Time stamp_msg = gmmslam::timeFromSeconds(result_stamp_sec);
     if (global_graph_ != nullptr) {
         global_graph_->acknowledgeSubmapOverlapAttempt(sid_prev, sid_curr, stamp_msg);
     }
@@ -1258,7 +1349,7 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
 
     auto t_it = data.find("transform");
     if (t_it == data.end() || !t_it->is_array() || t_it->size() != 16) {
-        ROS_WARN("[registration] submap result S(%d)<->S(%d) missing/invalid transform",
+        GMS_WARN("[registration] submap result S(%d)<->S(%d) missing/invalid transform",
                  sid_prev, sid_curr);
         if (global_graph_ != nullptr) {
             const int sid_new = std::max(sid_prev, sid_curr);
@@ -1277,7 +1368,7 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
     }
 
     if (!T.allFinite()) {
-        ROS_WARN("[registration] submap result S(%d)<->S(%d) has NaN/Inf transform, "
+        GMS_WARN("[registration] submap result S(%d)<->S(%d) has NaN/Inf transform, "
                  "discarding", sid_prev, sid_curr);
         if (global_graph_ != nullptr) {
             const int sid_new = std::max(sid_prev, sid_curr);
@@ -1318,7 +1409,7 @@ void RegistrationManager::handleSubmapResult(const nlohmann::json& data,
 // drainResults
 // ---------------------------------------------------------------------------
 
-void RegistrationManager::drainResults(const ros::Time& stamp)
+void RegistrationManager::drainResults(const rclcpp::Time& stamp)
 {
     bool staged_any = false;
     while (true) {
@@ -1326,8 +1417,8 @@ void RegistrationManager::drainResults(const ros::Time& stamp)
         if (!maybe) break;
 
         const ResultItem& r = *maybe;
-        ros::Time factor_stamp = (std::isfinite(r.stamp_sec))
-            ? ros::Time(r.stamp_sec)
+        rclcpp::Time factor_stamp = (std::isfinite(r.stamp_sec))
+            ? gmmslam::timeFromSeconds(r.stamp_sec)
             : stamp;
 
         try {
@@ -1342,7 +1433,7 @@ void RegistrationManager::drainResults(const ros::Time& stamp)
                                     r.delta_r_deg);
             staged_any = true;
         } catch (const std::exception& e) {
-            ROS_WARN_THROTTLE(2.0, "[registration] drain error: %s", e.what());
+            GMS_WARN_THROTTLE(2.0, "[registration] drain error: %s", e.what());
             break;
         }
     }
@@ -1359,7 +1450,7 @@ void RegistrationManager::drainResults(const ros::Time& stamp)
 void RegistrationManager::stageRegistrationFactor(
     int prev_idx, int curr_idx, const Matrix4d& T_prev_to_curr,
     double score, bool force_loop, bool use_super,
-    bool is_loop_candidate, const ros::Time& stamp,
+    bool is_loop_candidate, const rclcpp::Time& stamp,
     bool has_solid_cos_sim, double solid_cos_sim, bool solid_rescue,
     bool has_initial_transform, const Matrix4d& initial_transform,
     double delta_t_m, double delta_r_deg)
@@ -1374,7 +1465,7 @@ void RegistrationManager::stageRegistrationFactor(
         std::lock_guard<std::mutex> gk(smoother_.graph_lock);
         latest_key_snapshot = smoother_.latest_key_idx;
         if (prev_idx < 0 || curr_idx > latest_key_snapshot) {
-            ROS_INFO("[registration] rejected %s D2D X(%d)->X(%d): "
+            GMS_INFO("[registration] rejected %s D2D X(%d)->X(%d): "
                      "invalid/latest key state (latest X(%d))",
                      is_loop_candidate ? "loop" : "sequential",
                      prev_idx, curr_idx, latest_key_snapshot);
@@ -1382,7 +1473,7 @@ void RegistrationManager::stageRegistrationFactor(
         }
         const auto t_curr_it = smoother_.key_t_sec.find(curr_idx);
         if (t_curr_it == smoother_.key_t_sec.end()) {
-            ROS_INFO("[registration] rejected %s D2D X(%d)->X(%d): "
+            GMS_INFO("[registration] rejected %s D2D X(%d)->X(%d): "
                      "missing timestamp for curr key",
                      is_loop_candidate ? "loop" : "sequential",
                      prev_idx, curr_idx);
@@ -1407,7 +1498,7 @@ void RegistrationManager::stageRegistrationFactor(
 
     if ((t_latest_snapshot - t_curr_snapshot) > smoother_.fixed_lag_s * 1.1) {
         if (is_loop_candidate) {
-            ROS_INFO("[registration] loop X(%d)->X(%d) is outside fixed-lag "
+            GMS_INFO("[registration] loop X(%d)->X(%d) is outside fixed-lag "
                      "window; considering global-graph forwarding "
                      "(latest_t - curr_t = %.2fs, lag = %.2fs)",
                      prev_idx, curr_idx, t_latest_snapshot - t_curr_snapshot,
@@ -1420,11 +1511,11 @@ void RegistrationManager::stageRegistrationFactor(
                     pose_snap = smoother_.pose_by_idx;
                 }
                 if (has_solid_cos_sim) {
-                    ROS_INFO("[registration] forwarding late loop X(%d)->X(%d) "
+                    GMS_INFO("[registration] forwarding late loop X(%d)->X(%d) "
                              "to global graph: score=%.4f solid_cos=%.3f",
                              prev_idx, curr_idx, score, solid_cos_sim);
                 } else {
-                    ROS_INFO("[registration] forwarding late loop X(%d)->X(%d) "
+                    GMS_INFO("[registration] forwarding late loop X(%d)->X(%d) "
                              "to global graph: score=%.4f",
                              prev_idx, curr_idx, score);
                 }
@@ -1432,7 +1523,7 @@ void RegistrationManager::stageRegistrationFactor(
                                              T_prev_to_curr, stamp,
                                              pose_snap, score);
             } else if (global_graph_ != nullptr) {
-                ROS_INFO("[registration] not forwarding late loop X(%d)->X(%d) "
+                GMS_INFO("[registration] not forwarding late loop X(%d)->X(%d) "
                          "to global graph: score %.4f < detect threshold %.4f",
                          prev_idx, curr_idx, score,
                          loop_closure_detect_score_threshold_);
@@ -1450,7 +1541,7 @@ void RegistrationManager::stageRegistrationFactor(
             const auto curr_pose_it = smoother_.pose_by_idx.find(curr_idx);
             if (prev_pose_it == smoother_.pose_by_idx.end() ||
                 curr_pose_it == smoother_.pose_by_idx.end()) {
-                ROS_WARN("[registration] rejected loop X(%d)->X(%d): "
+                GMS_WARN("[registration] rejected loop X(%d)->X(%d): "
                          "missing pose history for consistency check",
                          prev_idx, curr_idx);
                 return;
@@ -1468,13 +1559,13 @@ void RegistrationManager::stageRegistrationFactor(
              trans_err > loop_closure_consistency_gate_trans_m_) ||
             (loop_closure_consistency_gate_rot_deg_ > 0.0 &&
              rot_err_deg > loop_closure_consistency_gate_rot_deg_)) {
-            ROS_WARN("[registration] rejected loop X(%d)->X(%d): "
+            GMS_WARN("[registration] rejected loop X(%d)->X(%d): "
                      "D2D/pose consistency error trans=%.3fm rot=%.2fdeg "
                      "(limits %.3fm %.2fdeg)",
                      prev_idx, curr_idx, trans_err, rot_err_deg,
                      loop_closure_consistency_gate_trans_m_,
                      loop_closure_consistency_gate_rot_deg_);
-            logRegistrationEvent(stamp.toSec(), "rejected", "loop",
+            logRegistrationEvent(stamp.seconds(), "rejected", "loop",
                                  prev_idx, curr_idx, score, -1,
                                  "loop_pose_consistency_gate",
                                  std::numeric_limits<double>::quiet_NaN(),
@@ -1507,10 +1598,10 @@ void RegistrationManager::stageRegistrationFactor(
                 gtsam::BetweenFactor<gtsam::Pose3>(
                     X(prev_idx), X(curr_idx), rel_pose, noise).clone());
 
-            ROS_INFO("[registration] staged loop between X(%d)->X(%d) "
+            GMS_INFO("[registration] staged loop between X(%d)->X(%d) "
                      "score=%.4f sigma_t=%.4f sigma_r=%.4f",
                      prev_idx, curr_idx, score, sigma_t, sigma_r);
-            logRegistrationEvent(stamp.toSec(), "staged", "loop",
+            logRegistrationEvent(stamp.seconds(), "staged", "loop",
                                  prev_idx, curr_idx, score, -1,
                                  "between_factor",
                                  std::numeric_limits<double>::quiet_NaN(),
@@ -1544,11 +1635,11 @@ void RegistrationManager::stageRegistrationFactor(
                     smoother_.stageFactor(
                         gtsam::PriorFactor<gtsam::Pose3>(
                             X(curr_idx), prior_pose, noise).clone());
-                    ROS_INFO("[registration] staged loop prior X(%d) from LC "
+                    GMS_INFO("[registration] staged loop prior X(%d) from LC "
                              "X(%d)->X(%d) score=%.4f sigma_t=%.4f sigma_r=%.4f "
                              "(prev outside lag window)",
                              curr_idx, prev_idx, curr_idx, score, sigma_t, sigma_r);
-                    logRegistrationEvent(stamp.toSec(), "staged", "loop",
+                    logRegistrationEvent(stamp.seconds(), "staged", "loop",
                                          prev_idx, curr_idx, score, -1,
                                          "prior_factor_from_loop",
                                          std::numeric_limits<double>::quiet_NaN(),
@@ -1559,10 +1650,10 @@ void RegistrationManager::stageRegistrationFactor(
                                          std::numeric_limits<double>::quiet_NaN(),
                                          sigma_t, sigma_r);
                 } else {
-                    ROS_WARN("[registration] loop X(%d)->X(%d): composed T_w_curr_pred "
+                    GMS_WARN("[registration] loop X(%d)->X(%d): composed T_w_curr_pred "
                              "is not valid SE(3); forwarding to global graph only",
                              prev_idx, curr_idx);
-                    logRegistrationEvent(stamp.toSec(), "staged", "loop",
+                    logRegistrationEvent(stamp.seconds(), "staged", "loop",
                                          prev_idx, curr_idx, score, -1,
                                          "forwarded_global_graph_only",
                                          std::numeric_limits<double>::quiet_NaN(),
@@ -1574,11 +1665,11 @@ void RegistrationManager::stageRegistrationFactor(
                                          sigma_t, sigma_r);
                 }
             } else {
-                ROS_INFO("[registration] loop X(%d)->X(%d) not staged: prev outside lag "
+                GMS_INFO("[registration] loop X(%d)->X(%d) not staged: prev outside lag "
                          "and not in pose history; forwarding to global graph only "
                          "score=%.4f",
                          prev_idx, curr_idx, score);
-                logRegistrationEvent(stamp.toSec(), "staged", "loop",
+                logRegistrationEvent(stamp.seconds(), "staged", "loop",
                                      prev_idx, curr_idx, score, -1,
                                      "forwarded_global_graph_only",
                                      std::numeric_limits<double>::quiet_NaN(),
@@ -1613,13 +1704,13 @@ void RegistrationManager::stageRegistrationFactor(
     } else {
         // Sequential → BetweenFactor
         if (!have_prev_t) {
-            ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
+            GMS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
                      "missing timestamp for prev key",
                      prev_idx, curr_idx);
             return;
         }
         if ((t_latest_snapshot - t_prev_snapshot) > smoother_.fixed_lag_s * 1.1) {
-            ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
+            GMS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
                      "prev key outside fixed-lag window "
                      "(latest_t - prev_t = %.2fs, lag = %.2fs)",
                      prev_idx, curr_idx,
@@ -1638,7 +1729,7 @@ void RegistrationManager::stageRegistrationFactor(
                 const auto curr_pose_it = smoother_.pose_by_idx.find(curr_idx);
                 if (prev_pose_it == smoother_.pose_by_idx.end() ||
                     curr_pose_it == smoother_.pose_by_idx.end()) {
-                    ROS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
+                    GMS_INFO("[registration] rejected sequential D2D X(%d)->X(%d): "
                              "missing pose history for consistency check",
                              prev_idx, curr_idx);
                     return;
@@ -1656,12 +1747,12 @@ void RegistrationManager::stageRegistrationFactor(
         const double rot_limit_deg =
             std::max(20.0, 4.0 * seq_sigma_r_max_ * 180.0 / M_PI);
         if (trans_err > trans_limit_m || rot_err_deg > rot_limit_deg) {
-            ROS_WARN("[registration] rejected sequential D2D X(%d)->X(%d): "
+            GMS_WARN("[registration] rejected sequential D2D X(%d)->X(%d): "
                      "D2D/prior consistency error trans=%.3fm rot=%.2fdeg "
                      "(limits %.3fm %.2fdeg, score=%.4f)",
                      prev_idx, curr_idx, trans_err, rot_err_deg,
                      trans_limit_m, rot_limit_deg, score);
-            logRegistrationEvent(stamp.toSec(), "rejected", "sequential",
+            logRegistrationEvent(stamp.seconds(), "rejected", "sequential",
                                  prev_idx, curr_idx, score, -1,
                                  "sequential_prior_consistency_gate",
                                  std::numeric_limits<double>::quiet_NaN(),
@@ -1683,10 +1774,10 @@ void RegistrationManager::stageRegistrationFactor(
             gtsam::BetweenFactor<gtsam::Pose3>(
                 X(prev_idx), X(curr_idx), rel_pose, noise).clone());
 
-        ROS_INFO("[registration] staged between factor X(%d)->X(%d) "
+        GMS_INFO("[registration] staged between factor X(%d)->X(%d) "
                  "score=%.4f sigma_t=%.4f sigma_r=%.4f",
                  prev_idx, curr_idx, score, sigma_t, sigma_r);
-        logRegistrationEvent(stamp.toSec(), "staged", "sequential",
+        logRegistrationEvent(stamp.seconds(), "staged", "sequential",
                              prev_idx, curr_idx, score, -1,
                              "between_factor",
                              std::numeric_limits<double>::quiet_NaN(),
@@ -1705,31 +1796,31 @@ void RegistrationManager::publishD2DRegistrationMarker(
     const Vector3d& p_prev,
     const Vector3d& p_curr,
     double score,
-    const ros::Time& stamp,
+    const rclcpp::Time& stamp,
     float r, float g, float b)
 {
-    if (loop_closure_markers_pub_.getTopic().empty()) {
+    if (!loop_closure_markers_pub_) {
         return;
     }
 
     const int uid = loop_viz_uid_.fetch_add(2, std::memory_order_relaxed);
 
-    visualization_msgs::Marker line;
+    visualization_msgs::msg::Marker line;
     line.header.frame_id = map_frame_;
     line.header.stamp = stamp;
     line.ns = "gmmslam_d2d_" + kind + "_edges";
     line.id = uid;
-    line.type = visualization_msgs::Marker::LINE_LIST;
-    line.action = visualization_msgs::Marker::ADD;
+    line.type = visualization_msgs::msg::Marker::LINE_LIST;
+    line.action = visualization_msgs::msg::Marker::ADD;
     line.pose.orientation.w = 1.0;
     line.scale.x = (kind == "loop") ? 0.08 : 0.04;
-    line.lifetime = ros::Duration(0.0);
+    line.lifetime = rclcpp::Duration::from_seconds(0.0);
     line.color.r = r;
     line.color.g = g;
     line.color.b = b;
     line.color.a = 1.0f;
 
-    geometry_msgs::Point a, c;
+    geometry_msgs::msg::Point a, c;
     a.x = p_prev.x();
     a.y = p_prev.y();
     a.z = p_prev.z();
@@ -1743,24 +1834,24 @@ void RegistrationManager::publishD2DRegistrationMarker(
         kind == "submap" ? d2d_submap_overlap_text_enable_
                          : d2d_frame_to_frame_text_enable_;
 
-    visualization_msgs::MarkerArray arr;
+    visualization_msgs::msg::MarkerArray arr;
     {
         std::lock_guard<std::mutex> lk(loop_viz_mutex_);
         loop_closure_marker_history_.markers.push_back(std::move(line));
         if (show_text) {
-            visualization_msgs::Marker txt;
+            visualization_msgs::msg::Marker txt;
             txt.header.frame_id = map_frame_;
             txt.header.stamp = stamp;
             txt.ns = "gmmslam_d2d_" + kind + "_labels";
             txt.id = uid + 1;
-            txt.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-            txt.action = visualization_msgs::Marker::ADD;
+            txt.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+            txt.action = visualization_msgs::msg::Marker::ADD;
             txt.pose.orientation.w = 1.0;
             txt.pose.position.x = 0.5 * (p_prev.x() + p_curr.x());
             txt.pose.position.y = 0.5 * (p_prev.y() + p_curr.y());
             txt.pose.position.z = 0.5 * (p_prev.z() + p_curr.z()) + 0.35;
             txt.scale.z = 0.28;
-            txt.lifetime = ros::Duration(0.0);
+            txt.lifetime = rclcpp::Duration::from_seconds(0.0);
             if (kind == "submap") {
                 txt.color.r = 1.0f;
                 txt.color.g = 0.45f;
@@ -1780,14 +1871,14 @@ void RegistrationManager::publishD2DRegistrationMarker(
         arr = loop_closure_marker_history_;
     }
 
-    loop_closure_markers_pub_.publish(arr);
+    loop_closure_markers_pub_->publish(arr);
 }
 
 void RegistrationManager::publishLoopClosureMarkers(
-    int prev_idx, int curr_idx, double score, const ros::Time& stamp,
+    int prev_idx, int curr_idx, double score, const rclcpp::Time& stamp,
     bool has_solid_cos, double solid_cos_sim, bool solid_rescue)
 {
-    if (loop_closure_markers_pub_.getTopic().empty()) {
+    if (!loop_closure_markers_pub_) {
         return;
     }
 
@@ -1798,7 +1889,7 @@ void RegistrationManager::publishLoopClosureMarkers(
         auto it2 = smoother_.pose_by_idx.find(curr_idx);
         if (it1 == smoother_.pose_by_idx.end() ||
             it2 == smoother_.pose_by_idx.end()) {
-            ROS_DEBUG("[registration] loop_closure viz: missing pose "
+            GMS_DEBUG("[registration] loop_closure viz: missing pose "
                       "X(%d) or X(%d)", prev_idx, curr_idx);
             return;
         }
@@ -1809,19 +1900,19 @@ void RegistrationManager::publishLoopClosureMarkers(
     const int uid =
         loop_viz_uid_.fetch_add(2, std::memory_order_relaxed);
 
-    visualization_msgs::MarkerArray arr;
+    visualization_msgs::msg::MarkerArray arr;
     arr.markers.reserve(d2d_loop_closure_text_enable_ ? 2 : 1);
 
-    visualization_msgs::Marker line;
+    visualization_msgs::msg::Marker line;
     line.header.frame_id = map_frame_;
     line.header.stamp = stamp;
     line.ns = "gmmslam_loop_edges";
     line.id = uid;
-    line.type = visualization_msgs::Marker::LINE_LIST;
-    line.action = visualization_msgs::Marker::ADD;
+    line.type = visualization_msgs::msg::Marker::LINE_LIST;
+    line.action = visualization_msgs::msg::Marker::ADD;
     line.pose.orientation.w = 1.0;
     line.scale.x = 0.08;
-    line.lifetime = ros::Duration(0.0);
+    line.lifetime = rclcpp::Duration::from_seconds(0.0);
     if (solid_rescue) {
         line.color.r = 1.0f;
         line.color.g = 0.55f;
@@ -1832,7 +1923,7 @@ void RegistrationManager::publishLoopClosureMarkers(
         line.color.b = 0.25f;
     }
     line.color.a = 1.0f;
-    geometry_msgs::Point a, b;
+    geometry_msgs::msg::Point a, b;
     a.x = p_prev.x();
     a.y = p_prev.y();
     a.z = p_prev.z();
@@ -1846,19 +1937,19 @@ void RegistrationManager::publishLoopClosureMarkers(
         std::lock_guard<std::mutex> lk(loop_viz_mutex_);
         loop_closure_marker_history_.markers.push_back(std::move(line));
         if (d2d_loop_closure_text_enable_) {
-            visualization_msgs::Marker txt;
+            visualization_msgs::msg::Marker txt;
             txt.header.frame_id = map_frame_;
             txt.header.stamp = stamp;
             txt.ns = "gmmslam_loop_labels";
             txt.id = uid + 1;
-            txt.type = visualization_msgs::Marker::TEXT_VIEW_FACING;
-            txt.action = visualization_msgs::Marker::ADD;
+            txt.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+            txt.action = visualization_msgs::msg::Marker::ADD;
             txt.pose.orientation.w = 1.0;
             txt.pose.position.x = 0.5 * (p_prev.x() + p_curr.x());
             txt.pose.position.y = 0.5 * (p_prev.y() + p_curr.y());
             txt.pose.position.z = 0.5 * (p_prev.z() + p_curr.z()) + 0.35;
             txt.scale.z = 0.35;
-            txt.lifetime = ros::Duration(0.0);
+            txt.lifetime = rclcpp::Duration::from_seconds(0.0);
             txt.color.r = 1.0f;
             txt.color.g = 0.0f;
             txt.color.b = 0.0f;
@@ -1879,7 +1970,7 @@ void RegistrationManager::publishLoopClosureMarkers(
         arr = loop_closure_marker_history_;
     }
 
-    loop_closure_markers_pub_.publish(arr);
+    loop_closure_markers_pub_->publish(arr);
 }
 
 } // namespace gmmslam

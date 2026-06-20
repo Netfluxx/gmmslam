@@ -1,5 +1,5 @@
 # =============================================================================
-# GMM-SLAM C++ node – full parameter set
+# GMM-SLAM parameter list
 # =============================================================================
 
 DEBUG_PRINTS: true  # false suppresses verbose INFO/DEBUG logs; WARN/ERROR stay visible
@@ -15,7 +15,7 @@ ros:
   odom_frame:   "world"
   map_frame:    "map"
   base_frame:   "m500_1_base_link"
-  odometry_input: "/gmmslam_node/noisy_gt_pose"  # PoseStamped
+  odometry_input: "/gmmslam_node/ext_odom_pose"  # PoseStamped
   restart_state_path: ""  # latest odom pose for respawn recovery (empty disables)
   registration_request_topic: "/gmmslam_node/registration/request"
   registration_result_topic:  "/gmmslam_node/registration/result"
@@ -99,7 +99,7 @@ gmmap:
 smoother:
   fixed_lag_s:       7.0     # [s] smoothing window
   smoother_stride:   1       # optimise every N frames
-  enable_external_odometry_factor: true  # add odometry_input relative BetweenFactor; false leaves frame-to-frame D2D as the local motion factor (not recommended)
+  enable_external_odometry_factor: false  # add odometry_input relative BetweenFactor; false leaves frame-to-frame D2D as the local motion factor
   odom_noise_sigma_t: 0.05   # [m] translation odometry noise
   odom_noise_sigma_r: 0.05 # [rad] rotation odometry noise
   lost_scale:        100.0    # multiplier on odom noise when tracking is lost
@@ -162,13 +162,17 @@ registration:
     fine_max_iterations: 4
     fine_initial_trust_radius: 0.25
     hessian_damping: 1.0e-3
+    openmp_raw_score_enable: true
+    openmp_min_pairs: 4096
+    openmp_max_threads: 2
+    openmp_timing_log_enable: true
 
 # ---------------------------------------------------------------------------
 # Loop-closure detection
 # ---------------------------------------------------------------------------
 loop_closure:
   enable:                     true  # keep loop D2D off until sequential D2D is stable
-  search_radius_m:            15.0   # [m] spatial search radius
+  search_radius_m:            5.0   # [m] spatial search radius
   min_keyframe_gap:           180    # skip local matches (~10 submaps at 10 keyframes/submap)
   max_candidates:             2     # max loop D2D requests dispatched per search
   request_every_n_keyframes:  1     # only run loop search when curr_idx % this == 0
@@ -317,6 +321,11 @@ visualization:
   output_pose_lpf_cutoff_hz:  5.0    # [Hz] first-order low-pass published on odom_lpf (<=0 disables)
   map_cloud_publish_hz:     0.5     # accumulated raw map PointCloud2 rate
   map_cloud_max_chunks:     3000    # max smoother frames kept (oldest dropped)
+  global_map_cloud_enable: true      # publish corrected GMM-derived global map cloud
+  global_map_cloud_publish_hz: 0.25  # corrected global map cloud rate
+  global_map_cloud_voxel_size_m: 0.10 # viz-only voxel downsample for corrected global cloud
+  prune_debug_markers_enable: true   # show pruned/merged GMM component links in RViz
+  prune_debug_max_markers: 2000      # cap debug markers to keep RViz responsive
 
 # ---------------------------------------------------------------------------
 # Map representation
@@ -328,12 +337,12 @@ visualization:
 # ---------------------------------------------------------------------------
 map:
   prune_enable:           true
-  prune_frame_to_frame_enable: false  # keep older source frame, drop duplicate components from newer measurements
+  prune_frame_to_frame_enable: true   # keep older source frame, drop duplicate components from newer measurements
   prune_bhatt_threshold:  3.0    # merge if D_B < this (lower = more conservative)
   prune_search_radius_m:  1.0    # AABB margin for inflation (m) on each axis
   prune_use_rtree:        true   # index components by 3D AABB; else mean-radius prefilter only
   prune_rtree_chi_sq:     9.21   # 3-DOF chi-squared for ellipsoid -> AABB (larger = looser boxes)
-  prune_max_passes:       40      # greedy passes over the component list
+  prune_max_passes:       40      # retained for compatibility; union-find pruning is single-pass
   prune_cov_reg:          1.0e-6 # regularization added before any covariance inversion for stability
 
 # ---------------------------------------------------------------------------

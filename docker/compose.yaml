@@ -2,29 +2,22 @@ services:
   slam:
     build:
       context: ..
-      dockerfile: docker/Dockerfile
-    container_name: disal_slam
+      dockerfile: docker/Dockerfile.humble
+    container_name: gmmslam_humble
     stdin_open: true
     tty: true
     restart: unless-stopped
     environment:
       - DISPLAY=${DISPLAY}
-      - NVIDIA_VISIBLE_DEVICES=all
-      - NVIDIA_DRIVER_CAPABILITIES=all
+      - DEBIAN_FRONTEND=noninteractive
     volumes:
-      - disal_slam:/root
+      - gmmslam_humble_home:/root
       - /tmp/.X11-unix:/tmp/.X11-unix:rw
-      - ../python:/opt/gmmslam/python:rw
-      - ..:/root/catkin_ws/src/gmmslam:rw
+      - ..:/workspaces/gmmslam:rw
     network_mode: host
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
+    working_dir: /workspaces/gmmslam
+    command: tail -f /dev/null
 
 volumes:
-  disal_slam:
-    name: disal_slam
+  gmmslam_humble_home:
+    name: gmmslam_humble_home

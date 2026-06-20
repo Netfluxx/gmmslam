@@ -17,6 +17,7 @@
  */
 
 #include <algorithm>
+#include "gmmslam/rclcpp_logging.hpp"
 #include <chrono>
 #include <cmath>
 #include <fstream>
@@ -26,17 +27,35 @@
 #include <string>
 #include <vector>
 
-#include "gmmslam/ros2_compat.hpp"
-#include <geometry_msgs/PoseStamped.h>
-#include <nav_msgs/Odometry.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <std_msgs/Float64MultiArray.h>
+#include <rclcpp/rclcpp.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 
 #include "gmmslam/config.hpp"
 #include "gmmslam/ros_helpers.hpp"
 #include "gmmslam/solid.hpp"
 
 namespace {
+
+rclcpp::QoS reliableQos(std::size_t depth) {
+    return rclcpp::QoS(rclcpp::KeepLast(depth)).reliable();
+}
+
+rclcpp::QoS sensorQos(std::size_t depth) {
+    return rclcpp::SensorDataQoS().keep_last(depth);
+}
+
+template <typename T>
+T declareAndGet(rclcpp::Node& node, const std::string& name, const T& value) {
+    if (!node.has_parameter(name)) {
+        node.declare_parameter<T>(name, value);
+    }
+    T out = value;
+    node.get_parameter(name, out);
+    return out;
+}
 
 double yawFromQuatXYZW(double x, double y, double z, double w) {
     const double siny_cosp = 2.0 * (w * z + x * y);
@@ -63,7 +82,7 @@ double cosineSafe(const Eigen::VectorXd& a, const Eigen::VectorXd& b) {
     return std::clamp(a.dot(b) / denom, 0.0, 1.0);
 }
 
-class BenchNode {
+class BenchNode : public rclcpp::Node {
 public:
     struct Sample {
         double t_sec = 0.0;
@@ -77,39 +96,52 @@ public:
         int n_pts = 0;
     };
 
-    BenchNode(ros::NodeHandle nh, ros::NodeHandle pnh)
-        : nh_(std::move(nh)), pnh_(std::move(pnh)) {
+    BenchNode()
+        : rclcpp::Node(
+              "solid_descriptor_benchmark",
+              rclcpp::NodeOptions()
+                  .automatically_declare_parameters_from_overrides(true)) {
         std::string config_path;
-        pnh_.param<std::string>("config_path", config_path, "");
+        config_path = declareAndGet<std::string>(*this, "config_path", "");
+        if (config_path.empty()) {
+            config_path = declareAndGet<std::string>(*this, "config_file", "");
+        }
         if (!config_path.empty()) {
             cfg_ = gmmslam::loadConfig(config_path);
-            ROS_INFO("[solid_bench] Loaded config: %s", config_path.c_str());
+            GMS_INFO("[solid_bench] Loaded config: %s", config_path.c_str());
         }
 
         gmmslam::SolidConfig sc = cfg_.solid;
-        pnh_.param("solid_num_angle", sc.num_angle, sc.num_angle);
-        pnh_.param("solid_num_range", sc.num_range, sc.num_range);
-        pnh_.param("solid_num_height", sc.num_height, sc.num_height);
-        pnh_.param("solid_fov_up_deg", sc.fov_up_deg, sc.fov_up_deg);
-        pnh_.param("solid_fov_down_deg", sc.fov_down_deg, sc.fov_down_deg);
-        pnh_.param("solid_min_distance_m", sc.min_distance_m, sc.min_distance_m);
-        pnh_.param("solid_max_distance_m", sc.max_distance_m, sc.max_distance_m);
+        sc.num_angle = declareAndGet<int>(*this, "solid_num_angle", sc.num_angle);
+        sc.num_range = declareAndGet<int>(*this, "solid_num_range", sc.num_range);
+        sc.num_height =
+            declareAndGet<int>(*this, "solid_num_height", sc.num_height);
+        sc.fov_up_deg =
+            declareAndGet<double>(*this, "solid_fov_up_deg", sc.fov_up_deg);
+        sc.fov_down_deg =
+            declareAndGet<double>(*this, "solid_fov_down_deg", sc.fov_down_deg);
+        sc.min_distance_m = declareAndGet<double>(
+            *this, "solid_min_distance_m", sc.min_distance_m);
+        sc.max_distance_m = declareAndGet<double>(
+            *this, "solid_max_distance_m", sc.max_distance_m);
         cfg_.solid = sc;
         solid_ = std::make_unique<gmmslam::SOLiDModule>(cfg_.solid);
 
-        pnh_.param<std::string>("lidar_topic", lidar_topic_,
-                                std::string("/m500_1/mpa/lidar_pc"));
-        pnh_.param<std::string>("pose_topic", pose_topic_,
-                                std::string("/m500_1/mavros/local_position/pose"));
-        pnh_.param<std::string>("odom_topic", odom_topic_, std::string(""));
+        lidar_topic_ = declareAndGet<std::string>(
+            *this, "lidar_topic", "/m500_1/mpa/lidar_pc");
+        pose_topic_ = declareAndGet<std::string>(
+            *this, "pose_topic", "/m500_1/mavros/local_position/pose");
+        odom_topic_ = declareAndGet<std::string>(*this, "odom_topic", "");
 
         double log_hz = 10.0;
-        pnh_.param("log_hz", log_hz, 10.0);
+        log_hz = declareAndGet<double>(*this, "log_hz", 10.0);
         log_interval_s_ = 1.0 / std::max(0.5, log_hz);
 
-        pnh_.param<std::string>("csv_path", csv_path_, "");
-        pnh_.param<std::string>("reference_mode", reference_mode_, "first");
-        pnh_.param("arc_return_drop_m", arc_return_drop_m_, 0.15);
+        csv_path_ = declareAndGet<std::string>(*this, "csv_path", "");
+        reference_mode_ =
+            declareAndGet<std::string>(*this, "reference_mode", "first");
+        arc_return_drop_m_ =
+            declareAndGet<double>(*this, "arc_return_drop_m", 0.15);
         use_mid_arc_ref_ = (reference_mode_ == "mid_arc");
 
         if (!csv_path_.empty()) {
@@ -119,26 +151,40 @@ public:
                 csv_ << "t_sec,x_m,y_m,z_m,yaw_rad,delta_yaw_deg,solid_score,"
                         "range_cos,angle_cos,polar_cos,solid_ms,n_pts,ref_valid\n";
                 csv_.flush();
-                ROS_INFO("[solid_bench] Writing CSV: %s", csv_path_.c_str());
+                GMS_INFO("[solid_bench] Writing CSV: %s", csv_path_.c_str());
             } else {
-                ROS_WARN("[solid_bench] Could not open csv_path=%s", csv_path_.c_str());
+                GMS_WARN("[solid_bench] Could not open csv_path=%s", csv_path_.c_str());
             }
         }
 
-        cloud_sub_ = nh_.subscribe(lidar_topic_, 5, &BenchNode::onCloud, this);
+        cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
+            lidar_topic_, sensorQos(5),
+            [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+                onCloud(msg);
+            });
 
         if (!odom_topic_.empty()) {
-            odom_sub_ = nh_.subscribe(odom_topic_, 20, &BenchNode::onOdom, this);
-            ROS_INFO("[solid_bench] Subscribing odom: %s", odom_topic_.c_str());
+            odom_sub_ = create_subscription<nav_msgs::msg::Odometry>(
+                odom_topic_, sensorQos(20),
+                [this](nav_msgs::msg::Odometry::ConstSharedPtr msg) {
+                    onOdom(msg);
+                });
+            GMS_INFO("[solid_bench] Subscribing odom: %s", odom_topic_.c_str());
         } else {
-            pose_sub_ = nh_.subscribe(pose_topic_, 20, &BenchNode::onPose, this);
-            ROS_INFO("[solid_bench] Subscribing pose: %s", pose_topic_.c_str());
+            pose_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+                pose_topic_, sensorQos(20),
+                [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
+                    onPose(msg);
+                });
+            GMS_INFO("[solid_bench] Subscribing pose: %s", pose_topic_.c_str());
         }
 
-        metrics_pub_ = pnh_.advertise<std_msgs::Float64MultiArray>("metrics", 50);
-        last_log_wall_ = ros::Time(0);
+        metrics_pub_ =
+            create_publisher<std_msgs::msg::Float64MultiArray>("~/metrics",
+                                                               reliableQos(50));
+        last_log_wall_ = gmmslam::timeFromSeconds(0.0);
 
-        ROS_INFO(
+        GMS_INFO(
             "[solid_bench] lidar=%s preprocess: r=[%.2f,%.2f] voxel=%.3f ref=%s",
             lidar_topic_.c_str(), cfg_.preprocess.min_range,
             cfg_.preprocess.max_range, cfg_.preprocess.voxel_leaf_size,
@@ -146,7 +192,7 @@ public:
     }
 
 private:
-    void onPose(const geometry_msgs::PoseStamped::ConstSharedPtr& msg) {
+    void onPose(const geometry_msgs::msg::PoseStamped::ConstSharedPtr& msg) {
         const auto& q = msg->pose.orientation;
         const double yaw = yawFromQuatXYZW(q.x, q.y, q.z, q.w);
         std::lock_guard<std::mutex> lk(pose_mu_);
@@ -158,7 +204,7 @@ private:
         latest_pose_valid_ = true;
     }
 
-    void onOdom(const nav_msgs::Odometry::ConstSharedPtr& msg) {
+    void onOdom(const nav_msgs::msg::Odometry::ConstSharedPtr& msg) {
         const auto& q = msg->pose.pose.orientation;
         const double yaw = yawFromQuatXYZW(q.x, q.y, q.z, q.w);
         std::lock_guard<std::mutex> lk(pose_mu_);
@@ -170,14 +216,14 @@ private:
         latest_pose_valid_ = true;
     }
 
-    void onCloud(const sensor_msgs::PointCloud2::ConstSharedPtr& msg) {
+    void onCloud(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg) {
         Eigen::MatrixXf pts = gmmslam::pc2ToEigen(*msg);
         pts = gmmslam::preprocess(pts, cfg_.preprocess.min_range,
                                   cfg_.preprocess.max_range,
                                   cfg_.preprocess.voxel_leaf_size,
                                   cfg_.preprocess.target_points);
         if (pts.rows() < cfg_.preprocess.min_points) {
-            ROS_WARN_THROTTLE(2.0, "[solid_bench] Too few points: %ld",
+            GMS_WARN_THROTTLE(2.0, "[solid_bench] Too few points: %ld",
                               static_cast<long>(pts.rows()));
             return;
         }
@@ -189,7 +235,7 @@ private:
             std::chrono::duration<double, std::milli>(t1 - t0).count();
 
         if (desc.empty()) {
-            ROS_WARN_THROTTLE(2.0, "[solid_bench] Empty SOLiD descriptor");
+            GMS_WARN_THROTTLE(2.0, "[solid_bench] Empty SOLiD descriptor");
             return;
         }
 
@@ -204,7 +250,7 @@ private:
             std::lock_guard<std::mutex> lk(pose_mu_);
             if (latest_pose_valid_) {
                 const double dt =
-                    std::abs((msg->header.stamp - latest_pose_stamp_).toSec());
+                    std::abs((msg->header.stamp - latest_pose_stamp_).seconds());
                 if (dt <= 0.2) {
                     x_m = latest_x_m_;
                     y_m = latest_y_m_;
@@ -219,7 +265,7 @@ private:
             return;
         }
 
-        const double t_sec = ros::Time(msg->header.stamp).toSec();
+        const double t_sec = rclcpp::Time(msg->header.stamp).seconds();
 
         if (use_mid_arc_ref_ && !ref_ready_) {
             updateMidArcBuffer(t_sec, x_m, y_m, z_m, yaw_rad, desc, polar_context,
@@ -234,7 +280,7 @@ private:
                 ref_polar_context_ = polar_context;
                 ref_yaw_rad_ = yaw_rad;
                 ref_ready_ = true;
-                ROS_INFO("[solid_bench] Reference descriptor set (first scan, "
+                GMS_INFO("[solid_bench] Reference descriptor set (first scan, "
                          "pts=%ld, dim=%ld)",
                          static_cast<long>(pts.rows()),
                          static_cast<long>(desc.vec.size()));
@@ -308,7 +354,7 @@ private:
             ref_ready_ = true;
         }
 
-        ROS_INFO(
+        GMS_INFO(
             "[solid_bench] Mid-arc reference set (idx=%zu/%zu, p=(%.2f,%.2f), "
             "dim=%ld)",
             mid_idx, forward_buffer_.size(), mid.x_m, mid.y_m,
@@ -320,7 +366,7 @@ private:
                           sample.solid_ms, sample.n_pts, true);
         }
         forward_buffer_.clear();
-        last_log_wall_ = ros::Time(0);
+        last_log_wall_ = gmmslam::timeFromSeconds(0.0);
     }
 
     void publishSample(double t_sec, double x_m, double y_m, double z_m,
@@ -355,19 +401,19 @@ private:
             }
         }
 
-        const ros::Time now = ros::Time::now();
-        if (!force_log && (now - last_log_wall_).toSec() < log_interval_s_) {
+        const rclcpp::Time now = this->now();
+        if (!force_log && (now - last_log_wall_).seconds() < log_interval_s_) {
             return;
         }
         last_log_wall_ = now;
 
-        std_msgs::Float64MultiArray out;
+        std_msgs::msg::Float64MultiArray out;
         out.data = {t_sec, x_m, y_m, z_m, yaw_rad, d_yaw_deg, solid_score,
                     range_cos, angle_cos, polar_cos, ms,
                     static_cast<double>(n_pts), 1.0};
-        metrics_pub_.publish(out);
+        metrics_pub_->publish(out);
 
-        ROS_INFO("[solid_bench] t=%.3f p=(%.2f,%.2f,%.2f) d_yaw=%.1fdeg "
+        GMS_INFO("[solid_bench] t=%.3f p=(%.2f,%.2f,%.2f) d_yaw=%.1fdeg "
                  "solid=%.4f range=%.4f angle=%.4f polar=%.4f SOLiD=%.2fms n=%d",
                  t_sec, x_m, y_m, z_m, d_yaw_deg, solid_score, range_cos,
                  angle_cos, polar_cos, ms, n_pts);
@@ -420,25 +466,23 @@ private:
         return context;
     }
 
-    ros::NodeHandle nh_;
-    ros::NodeHandle pnh_;
     gmmslam::Config cfg_;
     std::unique_ptr<gmmslam::SOLiDModule> solid_;
 
     std::string lidar_topic_;
     std::string pose_topic_;
     std::string odom_topic_;
-    ros::Subscriber cloud_sub_;
-    ros::Subscriber pose_sub_;
-    ros::Subscriber odom_sub_;
-    ros::Publisher metrics_pub_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
+    rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
+    rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr metrics_pub_;
 
     std::mutex pose_mu_;
     std::optional<double> latest_yaw_;
     double latest_x_m_ = 0.0;
     double latest_y_m_ = 0.0;
     double latest_z_m_ = 0.0;
-    ros::Time latest_pose_stamp_;
+    rclcpp::Time latest_pose_stamp_;
     bool latest_pose_valid_ = false;
 
     std::mutex ref_mu_;
@@ -462,16 +506,15 @@ private:
     std::string csv_path_;
 
     double log_interval_s_ = 0.1;
-    ros::Time last_log_wall_;
+    rclcpp::Time last_log_wall_;
 };
 
 } // namespace
 
 int main(int argc, char** argv) {
-    ros::init(argc, argv, "solid_descriptor_benchmark");
-    ros::NodeHandle nh;
-    ros::NodeHandle pnh("~");
-    BenchNode node(nh, pnh);
-    ros::spin();
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<BenchNode>();
+    rclcpp::spin(node);
+    rclcpp::shutdown();
     return 0;
 }

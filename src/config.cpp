@@ -362,6 +362,20 @@ void loadVisualization(const YAML::Node& root, VisualizationConfig& c) {
     c.output_pose_lpf_cutoff_hz = readOr(n, "output_pose_lpf_cutoff_hz", c.output_pose_lpf_cutoff_hz);
     c.map_cloud_publish_hz = readOr(n, "map_cloud_publish_hz", c.map_cloud_publish_hz);
     c.map_cloud_max_chunks = readOr(n, "map_cloud_max_chunks", c.map_cloud_max_chunks);
+    c.global_map_cloud_enable =
+        readOr(n, "global_map_cloud_enable", c.global_map_cloud_enable);
+    c.global_map_cloud_publish_hz =
+        readOr(n, "global_map_cloud_publish_hz",
+               c.global_map_cloud_publish_hz);
+    c.global_map_cloud_voxel_size_m =
+        readOr(n, "global_map_cloud_voxel_size_m",
+               c.global_map_cloud_voxel_size_m);
+    c.prune_debug_markers_enable =
+        readOr(n, "prune_debug_markers_enable",
+               c.prune_debug_markers_enable);
+    c.prune_debug_max_markers =
+        readOr(n, "prune_debug_max_markers",
+               c.prune_debug_max_markers);
 }
 
 void loadMap(const YAML::Node& root, MapConfig& c) {

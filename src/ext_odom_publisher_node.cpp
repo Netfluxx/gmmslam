@@ -1,55 +1,88 @@
-#include "gmmslam/ros2_compat.hpp"
-#include <geometry_msgs/PoseStamped.h>
-#include <nav_msgs/Path.h>
+#include "gmmslam/config.hpp"
+#include "gmmslam/rclcpp_logging.hpp"
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <rcutils/logging.h>
+
 #include <cmath>
+#include <memory>
 #include <random>
+#include <stdexcept>
 #include <string>
 
-class ExtOdomPublisherNode {
+namespace {
+
+rclcpp::QoS reliableQos(std::size_t depth) {
+    return rclcpp::QoS(rclcpp::KeepLast(depth)).reliable();
+}
+
+rclcpp::QoS sensorQos(std::size_t depth) {
+    return rclcpp::SensorDataQoS().keep_last(depth);
+}
+
+template <typename T>
+T declareAndGet(rclcpp::Node& node, const std::string& name, const T& value) {
+    if (!node.has_parameter(name)) {
+        node.declare_parameter<T>(name, value);
+    }
+    T out = value;
+    node.get_parameter(name, out);
+    return out;
+}
+
+void applyDebugPrints(bool enable) {
+    if (!enable) {
+        rcutils_logging_set_logger_level(
+            "gmmslam", RCUTILS_LOG_SEVERITY_WARN);
+    }
+}
+
+class ExtOdomPublisherNode : public rclcpp::Node {
 public:
-    ExtOdomPublisherNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
-        : gt_init_start_time_(ros::Time::now()) {
-        std::string ref_topic, pose_topic, path_topic;
-        pnh.param<std::string>("gt_topic", ref_topic,
-                               "/m500_1/mavros/local_position/pose");
-        pnh.param<std::string>("odom_frame", odom_frame_, "world");
-        pnh.param<std::string>("pose_topic", pose_topic,
-                               "/gmmslam_node/ext_odom_pose");
-        pnh.param<std::string>("path_topic", path_topic,
-                               "/gmmslam_node/ext_odom_path");
-
-        // Private ~params override; fall back to gmmslam namespace (ext_odom: section).
-        ros::NodeHandle nh_gmmslam("/gmmslam");
-        bool debug_prints = true;
-        nh_gmmslam.param("DEBUG_PRINTS", debug_prints, debug_prints);
-        pnh.param("debug_prints", debug_prints, debug_prints);
-        if (!debug_prints) {
-            ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME,
-                                           ros::console::levels::Warn);
-            ros::console::notifyLoggerLevelsChanged();
+    ExtOdomPublisherNode()
+        : rclcpp::Node(
+              "ext_odom_publisher_node",
+              rclcpp::NodeOptions()
+                  .automatically_declare_parameters_from_overrides(true)) {
+        std::string config_path =
+            declareAndGet<std::string>(*this, "config_file", "");
+        gmmslam::Config cfg;
+        if (!config_path.empty()) {
+            cfg = gmmslam::loadConfig(config_path);
         }
 
-        if (!pnh.getParam("ext_odom_init_wait_s", init_wait_s_)) {
-            nh_gmmslam.param("ext_odom/init_wait_s", init_wait_s_, 3.0);
-        }
-        if (!pnh.getParam("noise_sigma_t", noise_sigma_t_)) {
-            nh_gmmslam.param("ext_odom/sigma_t", noise_sigma_t_, 0.01);
-        }
-        if (!pnh.getParam("noise_sigma_r", noise_sigma_r_)) {
-            nh_gmmslam.param("ext_odom/sigma_r", noise_sigma_r_, 0.01);
-        }
-        if (!pnh.getParam("ext_odom_initial_yaw_offset_deg",
-                          initial_yaw_offset_deg_)) {
-            nh_gmmslam.param("ext_odom/initial_yaw_offset_deg",
-                             initial_yaw_offset_deg_, 0.0);
-        }
-        int seed = -1;
-        if (!pnh.getParam("ext_odom_seed", seed)) {
-            nh_gmmslam.param("ext_odom/seed", seed, -1);
-        }
+        std::string ref_topic = declareAndGet<std::string>(
+            *this, "gt_topic", cfg.ros.gt_topic.empty()
+                                    ? "/m500_1/mavros/local_position/pose"
+                                    : cfg.ros.gt_topic);
+        odom_frame_ = declareAndGet<std::string>(
+            *this, "odom_frame", cfg.ros.odom_frame.empty()
+                                      ? "world"
+                                      : cfg.ros.odom_frame);
+        const std::string pose_topic = declareAndGet<std::string>(
+            *this, "pose_topic", "/gmmslam_node/ext_odom_pose");
+        const std::string path_topic = declareAndGet<std::string>(
+            *this, "path_topic", "/gmmslam_node/ext_odom_path");
+
+        init_wait_s_ = declareAndGet<double>(
+            *this, "ext_odom_init_wait_s", cfg.ext_odom.init_wait_s);
+        noise_sigma_t_ = declareAndGet<double>(
+            *this, "noise_sigma_t", cfg.ext_odom.sigma_t);
+        noise_sigma_r_ = declareAndGet<double>(
+            *this, "noise_sigma_r", cfg.ext_odom.sigma_r);
+        initial_yaw_offset_deg_ = declareAndGet<double>(
+            *this, "ext_odom_initial_yaw_offset_deg",
+            cfg.ext_odom.initial_yaw_offset_deg);
+        const int seed =
+            declareAndGet<int>(*this, "ext_odom_seed", cfg.ext_odom.seed);
+
+        const bool debug_prints = declareAndGet<bool>(
+            *this, "debug_prints", cfg.debug_prints);
+        applyDebugPrints(debug_prints);
 
         const double yaw_offset_rad =
             initial_yaw_offset_deg_ * M_PI / 180.0;
@@ -61,23 +94,31 @@ public:
             rng_.seed(static_cast<uint64_t>(seed));
         }
 
+        gt_init_start_time_ = now();
         ext_odom_path_.header.frame_id = odom_frame_;
 
-        pose_pub_ = nh.advertise<geometry_msgs::PoseStamped>(pose_topic, 1);
-        path_pub_ = nh.advertise<nav_msgs::Path>(path_topic, 1);
-        ref_sub_ = nh.subscribe(ref_topic, 1,
-                                &ExtOdomPublisherNode::refCallback, this);
+        pose_pub_ =
+            create_publisher<geometry_msgs::msg::PoseStamped>(pose_topic,
+                                                              reliableQos(1));
+        path_pub_ =
+            create_publisher<nav_msgs::msg::Path>(path_topic, reliableQos(1));
+        ref_sub_ = create_subscription<geometry_msgs::msg::PoseStamped>(
+            ref_topic, sensorQos(1),
+            [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
+                refCallback(msg);
+            });
 
-        ROS_INFO("[ext_odom_pub] ready | ref=%s | pose=%s | path=%s | "
+        GMS_INFO("[ext_odom_pub] ready | ref=%s | pose=%s | path=%s | "
                  "sigma_t=%.4f m sigma_r=%.4f rad yaw_offset=%.2f deg "
                  "init_wait=%.2f s seed=%d",
                  ref_topic.c_str(), pose_topic.c_str(), path_topic.c_str(),
-                 noise_sigma_t_, noise_sigma_r_,
-                 initial_yaw_offset_deg_, init_wait_s_, seed);
+                 noise_sigma_t_, noise_sigma_r_, initial_yaw_offset_deg_,
+                 init_wait_s_, seed);
     }
 
 private:
-    static Eigen::Matrix4d poseMsgToMatrix(const geometry_msgs::Pose& pose) {
+    static Eigen::Matrix4d poseMsgToMatrix(
+        const geometry_msgs::msg::Pose& pose) {
         Eigen::Quaterniond q(pose.orientation.w, pose.orientation.x,
                              pose.orientation.y, pose.orientation.z);
         const double qn = q.norm();
@@ -93,9 +134,9 @@ private:
         return T;
     }
 
-    geometry_msgs::PoseStamped matrixToPoseStamped(
-        const Eigen::Matrix4d& T, const ros::Time& stamp) const {
-        geometry_msgs::PoseStamped ps;
+    geometry_msgs::msg::PoseStamped matrixToPoseStamped(
+        const Eigen::Matrix4d& T, const rclcpp::Time& stamp) const {
+        geometry_msgs::msg::PoseStamped ps;
         ps.header.stamp = stamp;
         ps.header.frame_id = odom_frame_;
         ps.pose.position.x = T(0, 3);
@@ -110,30 +151,30 @@ private:
         return ps;
     }
 
-    bool ensureOriginInitialized(const ros::Time& stamp) {
+    bool ensureOriginInitialized(const rclcpp::Time& stamp) {
         if (origin_initialized_) return true;
         if (!has_ref_pose_) return false;
 
-        const double now_sec = stamp.toSec();
-        const double t0_sec = gt_init_start_time_.toSec();
+        const double now_sec = stamp.seconds();
+        const double t0_sec = gt_init_start_time_.seconds();
         if ((now_sec - t0_sec) < init_wait_s_) return false;
 
         try {
             const Eigen::Matrix4d T0 = poseMsgToMatrix(latest_ref_raw_->pose);
             origin_inv_ = T0.inverse();
             origin_initialized_ = true;
-            ext_odom_path_ = nav_msgs::Path();
+            ext_odom_path_ = nav_msgs::msg::Path();
             ext_odom_path_.header.frame_id = odom_frame_;
-            ROS_INFO("[ext_odom_pub] origin initialized");
+            GMS_INFO("[ext_odom_pub] origin initialized");
             return true;
         } catch (const std::exception& e) {
-            ROS_WARN_THROTTLE(2.0, "[ext_odom_pub] failed to init origin: %s",
+            GMS_WARN_THROTTLE(2.0, "[ext_odom_pub] failed to init origin: %s",
                               e.what());
             return false;
         }
     }
 
-    void refCallback(const geometry_msgs::PoseStamped::ConstSharedPtr& msg) {
+    void refCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
         latest_ref_raw_ = msg;
         has_ref_pose_ = true;
         if (!ensureOriginInitialized(msg->header.stamp)) return;
@@ -142,7 +183,7 @@ private:
         try {
             T_ref = poseMsgToMatrix(msg->pose);
         } catch (...) {
-            ROS_WARN_THROTTLE(2.0, "[ext_odom_pub] invalid reference pose");
+            GMS_WARN_THROTTLE(2.0, "[ext_odom_pub] invalid reference pose");
             return;
         }
         const Eigen::Matrix4d T_odom = origin_inv_ * T_ref;
@@ -169,13 +210,13 @@ private:
         const auto ps = matrixToPoseStamped(T_out, msg->header.stamp);
         ext_odom_path_.header.stamp = msg->header.stamp;
         ext_odom_path_.poses.push_back(ps);
-        pose_pub_.publish(ps);
-        path_pub_.publish(ext_odom_path_);
+        pose_pub_->publish(ps);
+        path_pub_->publish(ext_odom_path_);
     }
 
-    ros::Subscriber ref_sub_;
-    ros::Publisher pose_pub_;
-    ros::Publisher path_pub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr ref_sub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
     std::string odom_frame_;
     double init_wait_s_ = 3.0;
     double noise_sigma_t_ = 0.01;
@@ -185,19 +226,23 @@ private:
     std::mt19937_64 rng_{std::random_device{}()};
     std::normal_distribution<double> normal_dist_{0.0, 1.0};
 
-    geometry_msgs::PoseStamped::ConstSharedPtr latest_ref_raw_;
+    geometry_msgs::msg::PoseStamped::ConstSharedPtr latest_ref_raw_;
     bool has_ref_pose_ = false;
     bool origin_initialized_ = false;
     Eigen::Matrix4d origin_inv_ = Eigen::Matrix4d::Identity();
-    ros::Time gt_init_start_time_;
-    nav_msgs::Path ext_odom_path_;
+    rclcpp::Time gt_init_start_time_;
+    nav_msgs::msg::Path ext_odom_path_;
 };
 
+}  // namespace
+
 int main(int argc, char** argv) {
-    ros::init(argc, argv, "ext_odom_publisher_node");
-    ros::NodeHandle nh;
-    ros::NodeHandle pnh("~");
-    ExtOdomPublisherNode node(nh, pnh);
-    ros::spin();
+    rclcpp::init(argc, argv);
+    auto node = std::make_shared<ExtOdomPublisherNode>();
+    rclcpp::executors::MultiThreadedExecutor executor;
+    executor.add_node(node);
+    executor.spin();
+    executor.remove_node(node);
+    rclcpp::shutdown();
     return 0;
 }

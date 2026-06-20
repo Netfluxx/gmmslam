@@ -22,9 +22,9 @@
 #include <thread>
 #include <vector>
 
-#include "gmmslam/ros2_compat.hpp"
-#include <std_msgs/String.h>
-#include <visualization_msgs/MarkerArray.h>
+#include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 namespace gmmslam {
 
@@ -36,19 +36,19 @@ class RegistrationManager {
 public:
     RegistrationManager(FixedLagBackend& smoother,
                         GlobalPoseGraph* global_graph,
-                        ros::Publisher reg_request_pub,
+                        rclcpp::Publisher<std_msgs::msg::String>::SharedPtr reg_request_pub,
                         const RegistrationConfig& reg_cfg,
                         const LoopClosureConfig& lc_cfg,
                         const SolidConfig& solid_cfg,
                         const SogmmConfig& sogmm_cfg,
                         const VisualizationConfig& vis_cfg,
                         const std::string& gmm_dir,
-                        ros::Publisher loop_closure_markers_pub = {},
+                        rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr loop_closure_markers_pub = {},
                         std::string map_frame = {},
                         std::string benchmark_log_dir = {});
 
     // Enqueue a GMM fit. Returns true if enqueued, false if dropped.
-    bool enqueueFit(int frame_idx, const ros::Time& stamp,
+    bool enqueueFit(int frame_idx, const rclcpp::Time& stamp,
                     std::shared_ptr<const Eigen::MatrixXf> pts,
                     std::optional<OrganizedDepthImage> organized_depth,
                     double capture_t_sec, const Matrix4d& capture_pose);
@@ -63,13 +63,13 @@ public:
     void fitWorkerLoop(const std::atomic<bool>& shutdown);
 
     // ROS result callback
-    void resultCallback(const std_msgs::String::ConstSharedPtr& msg);
+    void resultCallback(const std_msgs::msg::String::ConstSharedPtr& msg);
 
     // Drain result queue and stage factors in the smoother
-    void drainResults(const ros::Time& stamp);
+    void drainResults(const rclcpp::Time& stamp);
 
     using FitCompleteCallback =
-        std::function<void(int frame_idx, const ros::Time& stamp)>;
+        std::function<void(int frame_idx, const rclcpp::Time& stamp)>;
     void setOnFitComplete(FitCompleteCallback cb) {
         on_fit_complete_ = std::move(cb);
     }
@@ -98,7 +98,7 @@ public:
 private:
     struct FitJob {
         int frame_idx;
-        ros::Time stamp;
+        rclcpp::Time stamp;
         std::shared_ptr<const Eigen::MatrixXf> points;
         std::optional<OrganizedDepthImage> organized_depth;
         double capture_t_sec;
@@ -133,10 +133,10 @@ private:
                                 double sigma_t_min, double sigma_t_max,
                                 double sigma_r_min, double sigma_r_max) const;
 
-    void finishFit(const GmmModel& model, int frame_idx, const ros::Time& stamp,
+    void finishFit(const GmmModel& model, int frame_idx, const rclcpp::Time& stamp,
                    double capture_t_sec, const Matrix4d& capture_pose);
 
-    void enqueueLoopClosureRequests(int curr_idx, const ros::Time& stamp,
+    void enqueueLoopClosureRequests(int curr_idx, const rclcpp::Time& stamp,
                                      const std::string& source_path,
                                      int sequential_prev_idx = -1);
 
@@ -145,7 +145,7 @@ private:
                                   double score,
                                   bool force_loop, bool use_super,
                                   bool is_loop_candidate,
-                                  const ros::Time& stamp,
+                                  const rclcpp::Time& stamp,
                                   bool has_solid_cos_sim = false,
                                   double solid_cos_sim = 0.0,
                                   bool solid_rescue = false,
@@ -198,18 +198,18 @@ private:
                                       const Vector3d& p_prev,
                                       const Vector3d& p_curr,
                                       double score,
-                                      const ros::Time& stamp,
+                                      const rclcpp::Time& stamp,
                                       float r, float g, float b);
 
     void publishLoopClosureMarkers(int prev_idx, int curr_idx, double score,
-                                   const ros::Time& stamp, bool has_solid_cos,
+                                   const rclcpp::Time& stamp, bool has_solid_cos,
                                    double solid_cos_sim, bool solid_rescue);
 
     // References to other subsystems
     FixedLagBackend& smoother_;
     GlobalPoseGraph* global_graph_;
-    ros::Publisher reg_pub_;
-    ros::Publisher loop_closure_markers_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr reg_pub_;
+    rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr loop_closure_markers_pub_;
     std::string map_frame_;
     std::mutex benchmark_log_mutex_;
     std::ofstream benchmark_gmm_fits_csv_;
@@ -217,7 +217,7 @@ private:
     std::ofstream benchmark_registration_csv_;
     bool benchmark_logs_enabled_ = false;
     std::mutex loop_viz_mutex_;
-    visualization_msgs::MarkerArray loop_closure_marker_history_;
+    visualization_msgs::msg::MarkerArray loop_closure_marker_history_;
 
     // Config
     SogmmConfig sogmm_cfg_;

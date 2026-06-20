@@ -280,6 +280,12 @@ struct VisualizationConfig {
     double map_cloud_publish_hz = 0.5;
     /// Max smoother-frame scans retained (oldest dropped when exceeded).
     int map_cloud_max_chunks = 3000;
+    /// Corrected global GMM-derived map cloud in the optimized submap frame.
+    bool global_map_cloud_enable = true;
+    double global_map_cloud_publish_hz = 0.25;
+    double global_map_cloud_voxel_size_m = 0.10;
+    bool prune_debug_markers_enable = true;
+    int prune_debug_max_markers = 2000;
 };
 
 // Map-representation knobs. The "map" is the per-submap GMM produced at
@@ -304,7 +310,7 @@ struct MapConfig {
     // Chi-squared threshold (3 dof) for the ellipsoid axis lengths used to
     // build each component's axis-aligned bounding box (larger = looser box).
     double prune_rtree_chi_sq = 9.21; // ~99% mass in 3D if Gaussian
-    // Number of greedy passes over the component list. 1-2 is normally enough.
+    // Legacy cap retained for config compatibility; union-find pruning is single-pass.
     int prune_max_passes = 2;
     // Tikhonov regularization added to covariances before any inversion to
     // keep Cholesky stable on near-singular components.

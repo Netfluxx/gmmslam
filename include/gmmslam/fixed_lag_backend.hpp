@@ -4,7 +4,7 @@
 #include "gmmslam/config.hpp"
 #include "gmmslam/thread_safe_queue.hpp"
 
-#include "gmmslam/ros2_compat.hpp"
+#include <rclcpp/rclcpp.hpp>
 #include <Eigen/Core>
 #include <gtsam/geometry/Pose3.h>
 #include <gtsam/nonlinear/NonlinearFactorGraph.h>
@@ -43,10 +43,10 @@ public:
                     const ImuConfig& imu_cfg,
                     const std::string& benchmark_log_dir = {});
 
-    bool initialize(const Matrix4d& pose, const ros::Time& stamp);
+    bool initialize(const Matrix4d& pose, const rclcpp::Time& stamp);
     bool initialized() const { return initialized_; }
 
-    bool addFrame(int prev_idx, int curr_idx, const ros::Time& stamp,
+    bool addFrame(int prev_idx, int curr_idx, const rclcpp::Time& stamp,
                   const Matrix4d& predicted_pose,
                   const Matrix4d* gt_rel_mat = nullptr,
                   const std::vector<std::tuple<double, Vector3d, Vector3d>>* imu_measurements = nullptr,

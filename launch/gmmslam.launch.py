@@ -1,5 +1,4 @@
 import os
-import yaml
 
 from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
@@ -7,15 +6,6 @@ from launch.actions import DeclareLaunchArgument, OpaqueFunction
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 from launch_ros.parameter_descriptions import ParameterValue
-
-
-def _flatten(prefix, value, out):
-    if isinstance(value, dict):
-        for key, child in value.items():
-            next_prefix = f"{prefix}.{key}" if prefix else str(key)
-            _flatten(next_prefix, child, out)
-    else:
-        out[prefix] = value
 
 
 def _launch_setup(context, *args, **kwargs):
@@ -26,11 +16,6 @@ def _launch_setup(context, *args, **kwargs):
         LaunchConfiguration("publish_sensor_tf").perform(context).lower() == "true"
     )
     use_ext_odom_publisher = LaunchConfiguration("ext_odom_publisher").perform(context).lower() == "true"
-
-    with open(config_file, "r") as f:
-        raw_cfg = yaml.safe_load(f) or {}
-    flat_params = {}
-    _flatten("gmmslam", raw_cfg, flat_params)
 
     lidar_topic = LaunchConfiguration("lidar_topic").perform(context)
     sensor_frame = LaunchConfiguration("sensor_frame").perform(context)
@@ -77,7 +62,7 @@ def _launch_setup(context, *args, **kwargs):
             executable="gmmslam_node",
             name="gmmslam_node",
             output="screen",
-            parameters=[flat_params, common_overrides],
+            parameters=[common_overrides],
         )
     )
     nodes.append(
@@ -87,7 +72,6 @@ def _launch_setup(context, *args, **kwargs):
             name="d2d_registration_node",
             output="screen",
             parameters=[
-                flat_params,
                 {
                     "config_file": config_file,
                     "request_topic": "/gmmslam_node/registration/request",
@@ -117,8 +101,8 @@ def _launch_setup(context, *args, **kwargs):
                 name="ext_odom_publisher_node",
                 output="screen",
                 parameters=[
-                    flat_params,
                     {
+                        "config_file": config_file,
                         "gt_topic": gt_topic,
                         "odom_frame": odom_frame,
                         "pose_topic": odometry_input,

@@ -7,7 +7,6 @@
 
 #include <cstddef>
 #include <functional>
-#include <map>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -17,8 +16,8 @@ namespace gmmslam {
 // Thread-safe in-memory index of SOLiD descriptors keyed by keyframe index.
 // Used as an appearance-based gate on top of the radius loop search and as a
 // rescue index when the smoother's pose drifts past the radius. Descriptors
-// are tiny (~cfg.num_range + cfg.num_angle doubles) so brute-force kNN scales
-// to tens of thousands of frames without any I/O.
+// are searched by exact KD-tree nearest-neighbor lookup over unit-normalized
+// range vectors, which preserves the existing cosine ranking.
 class PlaceRecognitionIndex {
 public:
     explicit PlaceRecognitionIndex(const SolidConfig& cfg);
@@ -64,10 +63,36 @@ public:
         const std::function<bool(int)>& accept = nullptr) const;
 
 private:
+    struct KdEntry {
+        int idx = -1;
+        Eigen::VectorXd unit_range;
+    };
+
+    struct KdNode {
+        int entry_pos = -1;
+        int axis = 0;
+        int left = -1;
+        int right = -1;
+    };
+
+    static Eigen::VectorXd normalizedRangeVector(const SolidDescriptor& desc,
+                                                 int num_range);
+    static double cosineFromUnitDistanceSq(double dist_sq);
+
+    void markKdDirtyLocked();
+    void rebuildKdTreeLocked() const;
+    int buildKdTreeLocked(std::vector<int>& positions,
+                          int begin, int end,
+                          int depth) const;
+
     SolidConfig cfg_;
     SOLiDModule solid_;
     mutable std::mutex mutex_;
-    std::map<int, SolidDescriptor> by_idx_;
+    std::vector<std::pair<int, SolidDescriptor>> by_idx_;
+    mutable std::vector<KdEntry> kd_entries_;
+    mutable std::vector<KdNode> kd_nodes_;
+    mutable int kd_root_ = -1;
+    mutable bool kd_dirty_ = true;
 };
 
 } // namespace gmmslam

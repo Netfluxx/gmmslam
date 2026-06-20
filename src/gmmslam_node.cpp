@@ -1,4 +1,5 @@
 #include "gmmslam/config.hpp"
+#include "gmmslam/rclcpp_logging.hpp"
 #include "gmmslam/types.hpp"
 #include "gmmslam/ros_helpers.hpp"
 #include "gmmslam/fixed_lag_backend.hpp"
@@ -7,18 +8,20 @@
 #include "gmmslam/visualizer.hpp"
 #include "gmmslam/util/gmm_utils.hpp"
 
-#include "gmmslam/ros2_compat.hpp"
+#include <rclcpp/rclcpp.hpp>
 #include <tf2_ros/transform_broadcaster.h>
-#include <geometry_msgs/PoseStamped.h>
-#include <nav_msgs/Odometry.h>
-#include <nav_msgs/Path.h>
-#include <sensor_msgs/PointCloud2.h>
-#include <sensor_msgs/Imu.h>
-#include <std_msgs/String.h>
-#include <visualization_msgs/MarkerArray.h>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <sensor_msgs/msg/point_cloud2.hpp>
+#include <sensor_msgs/msg/imu.hpp>
+#include <std_msgs/msg/string.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include <Eigen/Core>
 #include <Eigen/Geometry>
+#include <rcutils/logging.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -32,6 +35,7 @@
 #include <random>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
@@ -40,11 +44,86 @@ namespace gmmslam {
 
 namespace {
 
+#define GMMSLAM_JOIN_TOKENS_INNER(a, b) a##b
+#define GMMSLAM_JOIN_TOKENS(a, b) GMMSLAM_JOIN_TOKENS_INNER(a, b)
+using TfBroadcaster = GMMSLAM_JOIN_TOKENS(tf2_, ros)::TransformBroadcaster;
+
+class NodeParams {
+public:
+    explicit NodeParams(rclcpp::Node::SharedPtr node) : node_(std::move(node)) {}
+
+    template <typename T>
+    void param(const std::string& key, T& value, const T& default_value) const {
+        value = get<T>(key, default_value);
+    }
+
+    template <typename T>
+    bool getParam(const std::string& key, T& value) const {
+        if (!node_) return false;
+        if (node_->has_parameter(key)) {
+            return node_->get_parameter(key, value);
+        }
+        const std::string dotted = dottedName(key);
+        if (dotted != key && node_->has_parameter(dotted)) {
+            return node_->get_parameter(dotted, value);
+        }
+        return false;
+    }
+
+private:
+    static std::string dottedName(std::string key) {
+        while (!key.empty() && key.front() == '/') {
+            key.erase(key.begin());
+        }
+        for (char& ch : key) {
+            if (ch == '/') ch = '.';
+        }
+        return key;
+    }
+
+    template <typename T>
+    T get(const std::string& key, const T& fallback) const {
+        T value = fallback;
+        if (getParam(key, value)) {
+            return value;
+        }
+        if (node_ && !node_->has_parameter(key)) {
+            node_->declare_parameter<T>(key, fallback);
+        }
+        return value;
+    }
+
+    rclcpp::Node::SharedPtr node_;
+};
+
+rclcpp::QoS reliableQos(std::size_t depth) {
+    return rclcpp::QoS(rclcpp::KeepLast(depth)).reliable();
+}
+
+rclcpp::QoS latchedQos(std::size_t depth) {
+    return reliableQos(depth).transient_local();
+}
+
+rclcpp::QoS sensorQos(std::size_t depth) {
+    return rclcpp::SensorDataQoS().keep_last(depth);
+}
+
+std::string privateTopic(const std::string& name) {
+    return "~/" + name;
+}
+
+template <typename Msg>
+typename rclcpp::Publisher<Msg>::SharedPtr makePublisher(
+    const rclcpp::Node::SharedPtr& node,
+    const std::string& topic,
+    const rclcpp::QoS& qos) {
+    return node->create_publisher<Msg>(topic, qos);
+}
+
 void applyDebugPrints(bool enable) {
     if (!enable) {
-        ros::console::set_logger_level(ROSCONSOLE_DEFAULT_NAME,
-                                       ros::console::levels::Warn);
-        ros::console::notifyLoggerLevelsChanged();
+        rcutils_logging_set_logger_level(
+            "gmmslam", RCUTILS_LOG_SEVERITY_WARN);
     }
 }
 
@@ -52,27 +131,27 @@ void applyDebugPrints(bool enable) {
 
 class GMMSLAMNode {
 public:
-    GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh);
+    explicit GMMSLAMNode(rclcpp::Node::SharedPtr node);
     ~GMMSLAMNode();
 
 private:
-    void pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& msg);
-    void gtCallback(const geometry_msgs::PoseStamped::ConstSharedPtr& msg);
-    void extOdomCallback(const geometry_msgs::PoseStamped::ConstSharedPtr& msg);
-    void imuCallback(const sensor_msgs::Imu::ConstSharedPtr& msg);
+    void pclCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg);
+    void gtCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr& msg);
+    void extOdomCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr& msg);
+    void imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr& msg);
 
-    bool ensureGtOriginInitialized(const ros::Time& stamp);
-    bool shouldAddKeyframe(const ros::Time& stamp, const Matrix4d& current_pose);
-    std::optional<Matrix4d> sampleExtOdomRelativePose(const ros::Time& stamp);
+    bool ensureGtOriginInitialized(const rclcpp::Time& stamp);
+    bool shouldAddKeyframe(const rclcpp::Time& stamp, const Matrix4d& current_pose);
+    std::optional<Matrix4d> sampleExtOdomRelativePose(const rclcpp::Time& stamp);
     std::optional<Matrix4d> lookupExtOdomAt(double t_sec) const;
     std::vector<std::tuple<double, Vector3d, Vector3d>> imuMeasurementsBetween(
         double t_prev, double t_curr) const;
     std::optional<Matrix4d> submapTrajDeltaBetween(
         int prev_key, int curr_key, double prev_t, double curr_t);
     std::optional<std::pair<GmmModel, Matrix4d>> getKeyframeGmm(int key_idx);
-    void logBackpressure(const ros::Time& stamp);
-    std::optional<Matrix4d> currentGtPoseOdomFrame(const ros::Time& stamp) const;
-    void maybeReanchorSmootherFromGt(const ros::Time& stamp, double t_cloud);
+    void logBackpressure(const rclcpp::Time& stamp);
+    std::optional<Matrix4d> currentGtPoseOdomFrame(const rclcpp::Time& stamp) const;
+    void maybeReanchorSmootherFromGt(const rclcpp::Time& stamp, double t_cloud);
     std::optional<Matrix4d> loadRestartPose() const;
     void saveRestartPose(const Matrix4d& pose, double t_sec, int key_idx);
     void initBenchmarkLogs(const std::string& log_dir);
@@ -92,8 +171,16 @@ private:
     std::unique_ptr<RegistrationManager> registration_;
     std::unique_ptr<Visualizer> visualizer_;
 
-    ros::Subscriber lidar_sub_, gt_sub_, ext_odom_sub_, imu_sub_, reg_result_sub_;
-    ros::Publisher gt_path_pub_, gt_pose_pub_;
+    rclcpp::Node::SharedPtr node_;
+    rclcpp::CallbackGroup::SharedPtr sensor_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr result_callback_group_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr gt_sub_;
+    rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr ext_odom_sub_;
+    rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr reg_result_sub_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr gt_path_pub_;
+    rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr gt_pose_pub_;
 
     int frame_count_ = 0;
     int odom_idx_ = 0;
@@ -103,7 +190,7 @@ private:
     double last_keyframe_t_sec_ = 0.0;
     bool first_cloud_seen_ = false;
     int smoother_frame_counter_ = 0;
-    ros::Time last_smoother_stamp_;
+    rclcpp::Time last_smoother_stamp_;
     bool has_last_smoother_stamp_ = false;
     std::optional<Matrix4d> accumulated_gt_rel_;
     std::optional<Matrix4d> last_rel_motion_;
@@ -120,12 +207,12 @@ private:
     std::ofstream benchmark_est_map_tum_;
     std::ofstream benchmark_gt_tum_;
 
-    geometry_msgs::PoseStamped::ConstSharedPtr latest_gt_pose_raw_;
+    geometry_msgs::msg::PoseStamped::ConstSharedPtr latest_gt_pose_raw_;
     std::optional<Matrix4d> gt_origin_inv_;
-    ros::Time gt_init_start_time_;
+    rclcpp::Time gt_init_start_time_;
     std::optional<Matrix4d> last_gt_T_for_factor_;
     double last_gt_T_stamp_sec_ = 0.0;
-    nav_msgs::Path gt_path_;
+    nav_msgs::msg::Path gt_path_;
 
     struct ExtOdomEntry {
         double t_sec;
@@ -133,10 +220,10 @@ private:
     };
     std::deque<ExtOdomEntry> ext_odom_buffer_;
     static constexpr int kExtOdomBufferMax = 200;
-    geometry_msgs::PoseStamped::ConstSharedPtr latest_ext_odom_msg_;
+    geometry_msgs::msg::PoseStamped::ConstSharedPtr latest_ext_odom_msg_;
 
     struct ImuEntry {
-        ros::Time stamp;
+        rclcpp::Time stamp;
         Vector3d acc;
         Vector3d gyro;
     };
@@ -153,15 +240,22 @@ private:
 // Constructor
 // =====================================================================
 
-GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
+GMMSLAMNode::GMMSLAMNode(rclcpp::Node::SharedPtr node)
+    : node_(std::move(node))
 {
+    NodeParams pnh(node_);
+    sensor_callback_group_ = node_->create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+    result_callback_group_ = node_->create_callback_group(
+        rclcpp::CallbackGroupType::MutuallyExclusive);
+
     // --- Load configuration ---
     std::string config_path;
     pnh.param<std::string>("config_file", config_path, "");
     if (!config_path.empty()) {
         cfg_ = loadConfig(config_path);
     } else {
-        // ROS param fallback — mirrors the Python node's rospy.get_param("~xxx", default)
+        // Parameter fallback for running without a YAML config file.
         pnh.param("DEBUG_PRINTS", cfg_.debug_prints, cfg_.debug_prints);
         pnh.param<std::string>("lidar_topic",  cfg_.ros.lidar_topic,  "/m500_1/mpa/depth/points");
         pnh.param<std::string>("gt_topic",     cfg_.ros.gt_topic,     "/m500_1/mavros/local_position/pose");
@@ -447,6 +541,21 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         pnh.param("output_pose_lpf_cutoff_hz",   cfg_.visualization.output_pose_lpf_cutoff_hz, 0.0);
         pnh.param("map_cloud_publish_hz",        cfg_.visualization.map_cloud_publish_hz, 0.5);
         pnh.param("map_cloud_max_chunks",        cfg_.visualization.map_cloud_max_chunks, 3000);
+        pnh.param("global_map_cloud_enable",
+                  cfg_.visualization.global_map_cloud_enable,
+                  cfg_.visualization.global_map_cloud_enable);
+        pnh.param("global_map_cloud_publish_hz",
+                  cfg_.visualization.global_map_cloud_publish_hz,
+                  cfg_.visualization.global_map_cloud_publish_hz);
+        pnh.param("global_map_cloud_voxel_size_m",
+                  cfg_.visualization.global_map_cloud_voxel_size_m,
+                  cfg_.visualization.global_map_cloud_voxel_size_m);
+        pnh.param("prune_debug_markers_enable",
+                  cfg_.visualization.prune_debug_markers_enable,
+                  cfg_.visualization.prune_debug_markers_enable);
+        pnh.param("prune_debug_max_markers",
+                  cfg_.visualization.prune_debug_max_markers,
+                  cfg_.visualization.prune_debug_max_markers);
 
         pnh.param("map_prune_enable",            cfg_.map.prune_enable, cfg_.map.prune_enable);
         pnh.param("map_prune_bhatt_threshold",   cfg_.map.prune_bhatt_threshold, cfg_.map.prune_bhatt_threshold);
@@ -485,15 +594,15 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
 
     restart_pose_ = loadRestartPose();
 
-    ROS_INFO("[gmmslam] lidar_topic   : %s", cfg_.ros.lidar_topic.c_str());
-    ROS_INFO("[gmmslam] odom_frame    : %s", cfg_.ros.odom_frame.c_str());
-    ROS_INFO("[gmmslam] fixed_lag_s   : %.2f", cfg_.smoother.fixed_lag_s);
-    ROS_INFO("[gmmslam] smoother_stride: %d", cfg_.smoother.smoother_stride);
-    ROS_INFO("[gmmslam] ext_odom factor_sigma: t=%.6f r=%.6f (noise: t=%.4f r=%.4f)",
+    GMS_INFO("[gmmslam] lidar_topic   : %s", cfg_.ros.lidar_topic.c_str());
+    GMS_INFO("[gmmslam] odom_frame    : %s", cfg_.ros.odom_frame.c_str());
+    GMS_INFO("[gmmslam] fixed_lag_s   : %.2f", cfg_.smoother.fixed_lag_s);
+    GMS_INFO("[gmmslam] smoother_stride: %d", cfg_.smoother.smoother_stride);
+    GMS_INFO("[gmmslam] ext_odom factor_sigma: t=%.6f r=%.6f (noise: t=%.4f r=%.4f)",
              cfg_.ext_odom.factor_sigma_t, cfg_.ext_odom.factor_sigma_r,
              cfg_.ext_odom.sigma_t, cfg_.ext_odom.sigma_r);
-    ROS_INFO("[gmmslam] async reg     : %s", cfg_.registration.enable_async ? "true" : "false");
-    ROS_INFO("[gmmslam] keyframe (global graph / reg only): %.3f m | %.2f deg",
+    GMS_INFO("[gmmslam] async reg     : %s", cfg_.registration.enable_async ? "true" : "false");
+    GMS_INFO("[gmmslam] keyframe (global graph / reg only): %.3f m | %.2f deg",
              cfg_.keyframe.translation_thresh_m, cfg_.keyframe.rotation_thresh_deg);
 
     // --- RNG ---
@@ -507,22 +616,40 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
     gt_path_.header.frame_id = cfg_.ros.odom_frame;
 
     // --- Publishers ---
-    const auto path_pub         = pnh.advertise<nav_msgs::Path>("path", 1);
-    const auto gg_path_pub      = pnh.advertise<nav_msgs::Path>("global_graph_path", 1);
-    const auto odom_pub         = pnh.advertise<nav_msgs::Odometry>("odom", 1);
-    const auto odom_lpf_pub     = pnh.advertise<nav_msgs::Odometry>("odom_lpf", 1);
-    const auto latest_frame_pub = pnh.advertise<sensor_msgs::PointCloud2>("latest_frame_cloud", 1);
-    const auto map_cloud_pub    = pnh.advertise<sensor_msgs::PointCloud2>("map_cloud", 1, true);
-    gt_path_pub_                = pnh.advertise<nav_msgs::Path>("gt_path", 1);
-    gt_pose_pub_                = pnh.advertise<geometry_msgs::PoseStamped>("gt_pose", 1);
-    const auto gmm_markers_pub  = pnh.advertise<visualization_msgs::MarkerArray>("gmm_markers", 1);
-    const auto gmm_global_pub   = pnh.advertise<visualization_msgs::MarkerArray>("gmm_global_markers", 1, true);
-    const auto gg_markers_pub   = pnh.advertise<visualization_msgs::MarkerArray>("global_graph_markers", 1, true);
-    const auto graph_nodes_pub  = pnh.advertise<visualization_msgs::MarkerArray>("graph_nodes", 1, true);
+    const auto path_pub = makePublisher<nav_msgs::msg::Path>(
+        node_, privateTopic("path"), reliableQos(1));
+    const auto gg_path_pub = makePublisher<nav_msgs::msg::Path>(
+        node_, privateTopic("global_graph_path"), reliableQos(1));
+    const auto odom_pub = makePublisher<nav_msgs::msg::Odometry>(
+        node_, privateTopic("odom"), reliableQos(1));
+    const auto odom_lpf_pub = makePublisher<nav_msgs::msg::Odometry>(
+        node_, privateTopic("odom_lpf"), reliableQos(1));
+    const auto latest_frame_pub = makePublisher<sensor_msgs::msg::PointCloud2>(
+        node_, privateTopic("latest_frame_cloud"), reliableQos(1));
+    const auto map_cloud_pub = makePublisher<sensor_msgs::msg::PointCloud2>(
+        node_, privateTopic("map_cloud"), latchedQos(1));
+    const auto global_map_cloud_pub = makePublisher<sensor_msgs::msg::PointCloud2>(
+        node_, privateTopic("global_map_cloud"), latchedQos(1));
+    gt_path_pub_ = makePublisher<nav_msgs::msg::Path>(
+        node_, privateTopic("gt_path"), reliableQos(1));
+    gt_pose_pub_ = makePublisher<geometry_msgs::msg::PoseStamped>(
+        node_, privateTopic("gt_pose"), reliableQos(1));
+    const auto gmm_markers_pub = makePublisher<visualization_msgs::msg::MarkerArray>(
+        node_, privateTopic("gmm_markers"), reliableQos(1));
+    const auto gmm_global_pub = makePublisher<visualization_msgs::msg::MarkerArray>(
+        node_, privateTopic("gmm_global_markers"), latchedQos(1));
+    const auto gg_markers_pub = makePublisher<visualization_msgs::msg::MarkerArray>(
+        node_, privateTopic("global_graph_markers"), latchedQos(1));
+    const auto graph_nodes_pub = makePublisher<visualization_msgs::msg::MarkerArray>(
+        node_, privateTopic("graph_nodes"), latchedQos(1));
+    const auto prune_debug_markers_pub =
+        makePublisher<visualization_msgs::msg::MarkerArray>(
+            node_, privateTopic("prune_debug_markers"), latchedQos(1));
     const auto loop_closure_markers_pub =
-        pnh.advertise<visualization_msgs::MarkerArray>("loop_closure_markers", 10, true);
-    const auto reg_request_pub  = nh.advertise<std_msgs::String>(
-        cfg_.ros.registration_request_topic, 10);
+        makePublisher<visualization_msgs::msg::MarkerArray>(
+            node_, privateTopic("loop_closure_markers"), latchedQos(10));
+    const auto reg_request_pub = makePublisher<std_msgs::msg::String>(
+        node_, cfg_.ros.registration_request_topic, reliableQos(10));
 
     // --- Subsystems ---
     smoother_ = std::make_unique<FixedLagBackend>(
@@ -571,14 +698,14 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         cfg_.ros.odom_frame,
         benchmark_log_dir_);
     registration_->setOnFitComplete(
-        [this](int /*frame_idx*/, const ros::Time& stamp) {
+        [this](int /*frame_idx*/, const rclcpp::Time& stamp) {
             if (global_graph_ && global_graph_->enable) {
                 global_graph_->processPendingSubmapFinalizations(stamp);
             }
         });
-    ROS_INFO("[gmmslam] D2D registration markers -> %s (MarkerArray, latched; "
+    GMS_INFO("[gmmslam] D2D registration markers -> %s (MarkerArray, latched; "
              "labels: seq/submap/loop closure; frame_id=%s)",
-             (pnh.getNamespace() + "/loop_closure_markers").c_str(),
+             (std::string("/") + node_->get_name() + "/loop_closure_markers").c_str(),
              cfg_.ros.odom_frame.c_str());
 
     Visualizer::Publishers vis_pubs;
@@ -587,10 +714,18 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
     vis_pubs.odom_lpf          = odom_lpf_pub;
     vis_pubs.latest_frame_cloud = latest_frame_pub;
     vis_pubs.map_cloud          = map_cloud_pub;
+    vis_pubs.global_map_cloud   = global_map_cloud_pub;
     vis_pubs.gmm_markers       = gmm_markers_pub;
     vis_pubs.gmm_global_markers = gmm_global_pub;
     vis_pubs.global_graph_markers = gg_markers_pub;
     vis_pubs.graph_nodes       = graph_nodes_pub;
+    vis_pubs.prune_debug_markers = prune_debug_markers_pub;
+    auto tf_broadcaster = std::make_shared<TfBroadcaster>(node_);
+    vis_pubs.send_transform =
+        [tf_broadcaster](
+            const geometry_msgs::msg::TransformStamped& transform) {
+            tf_broadcaster->sendTransform(transform);
+        };
 
     visualizer_ = std::make_unique<Visualizer>(
         *smoother_,
@@ -603,27 +738,47 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
         std::move(vis_pubs));
 
     // --- Subscribers ---
-    lidar_sub_ = nh.subscribe(
-        cfg_.ros.lidar_topic, 1,
-        &GMMSLAMNode::pclCallback, this);
+    rclcpp::SubscriptionOptions sensor_sub_options;
+    sensor_sub_options.callback_group = sensor_callback_group_;
+    rclcpp::SubscriptionOptions result_sub_options;
+    result_sub_options.callback_group = result_callback_group_;
 
-    gt_sub_ = nh.subscribe(
-        cfg_.ros.gt_topic, 1,
-        &GMMSLAMNode::gtCallback, this);
+    lidar_sub_ = node_->create_subscription<sensor_msgs::msg::PointCloud2>(
+        cfg_.ros.lidar_topic, sensorQos(1),
+        [this](sensor_msgs::msg::PointCloud2::ConstSharedPtr msg) {
+            pclCallback(msg);
+        },
+        sensor_sub_options);
 
-    ext_odom_sub_ = nh.subscribe(
-        cfg_.ros.odometry_input, 1,
-        &GMMSLAMNode::extOdomCallback, this);
+    gt_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
+        cfg_.ros.gt_topic, sensorQos(1),
+        [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
+            gtCallback(msg);
+        },
+        sensor_sub_options);
+
+    ext_odom_sub_ = node_->create_subscription<geometry_msgs::msg::PoseStamped>(
+        cfg_.ros.odometry_input, sensorQos(1),
+        [this](geometry_msgs::msg::PoseStamped::ConstSharedPtr msg) {
+            extOdomCallback(msg);
+        },
+        sensor_sub_options);
 
     if (!cfg_.ros.imu_topic.empty()) {
-        imu_sub_ = nh.subscribe(
-            cfg_.ros.imu_topic, 1,
-            &GMMSLAMNode::imuCallback, this);
+        imu_sub_ = node_->create_subscription<sensor_msgs::msg::Imu>(
+            cfg_.ros.imu_topic, sensorQos(1),
+            [this](sensor_msgs::msg::Imu::ConstSharedPtr msg) {
+                imuCallback(msg);
+            },
+            sensor_sub_options);
     }
 
-    reg_result_sub_ = nh.subscribe(
-        cfg_.ros.registration_result_topic, 50,
-        &RegistrationManager::resultCallback, registration_.get());
+    reg_result_sub_ = node_->create_subscription<std_msgs::msg::String>(
+        cfg_.ros.registration_result_topic, reliableQos(50),
+        [this](std_msgs::msg::String::ConstSharedPtr msg) {
+            registration_->resultCallback(msg);
+        },
+        result_sub_options);
 
     // --- Worker threads ---
     worker_threads_.emplace_back(&FixedLagBackend::backendLoop,
@@ -635,7 +790,7 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
             worker_threads_.emplace_back(&RegistrationManager::fitWorkerLoop,
                                          registration_.get(), std::cref(shutdown_));
         }
-    ROS_INFO("[gmmslam] started %d GMMap fit worker thread(s)", n_fit);
+    GMS_INFO("[gmmslam] started %d GMMap fit worker thread(s)", n_fit);
     }
 
     worker_threads_.emplace_back(&Visualizer::visLoop,
@@ -643,17 +798,17 @@ GMMSLAMNode::GMMSLAMNode(ros::NodeHandle& nh, ros::NodeHandle& pnh)
 
     // --- Wait for /clock when using sim time ---
     bool use_sim_time = false;
-    nh.param("/use_sim_time", use_sim_time, false);
+    pnh.param("use_sim_time", use_sim_time, false);
     if (use_sim_time) {
-        ROS_INFO("[gmmslam] use_sim_time=true, waiting for /clock ...");
-        while (!ros::isShuttingDown() && ros::Time::now().isZero()) {
-            ros::Duration(0.1).sleep();
+        GMS_INFO("[gmmslam] use_sim_time=true, waiting for /clock ...");
+        while (rclcpp::ok() && node_->now().nanoseconds() == 0) {
+            rclcpp::sleep_for(std::chrono::milliseconds(100));
         }
-        ROS_INFO("[gmmslam] clock started");
+        GMS_INFO("[gmmslam] clock started");
     }
 
-    gt_init_start_time_ = ros::Time::now();
-    ROS_INFO("[gmmslam] node ready, waiting for point clouds ...");
+    gt_init_start_time_ = node_->now();
+    GMS_INFO("[gmmslam] node ready, waiting for point clouds ...");
 }
 
 // =====================================================================
@@ -674,7 +829,7 @@ GMMSLAMNode::~GMMSLAMNode()
 // GT callback
 // =====================================================================
 
-void GMMSLAMNode::gtCallback(const geometry_msgs::PoseStamped::ConstSharedPtr& msg)
+void GMMSLAMNode::gtCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr& msg)
 {
     latest_gt_pose_raw_ = msg;
     if (!ensureGtOriginInitialized(msg->header.stamp)) {
@@ -687,15 +842,15 @@ void GMMSLAMNode::gtCallback(const geometry_msgs::PoseStamped::ConstSharedPtr& m
 
     gt_path_.header.stamp = ps.header.stamp;
     gt_path_.poses.push_back(ps);
-    gt_pose_pub_.publish(ps);
-    gt_path_pub_.publish(gt_path_);
+    gt_pose_pub_->publish(ps);
+    gt_path_pub_->publish(gt_path_);
 }
 
 // =====================================================================
 // Noisy GT callback
 // =====================================================================
 
-void GMMSLAMNode::extOdomCallback(const geometry_msgs::PoseStamped::ConstSharedPtr& msg)
+void GMMSLAMNode::extOdomCallback(const geometry_msgs::msg::PoseStamped::ConstSharedPtr& msg)
 {
     latest_ext_odom_msg_ = msg;
     const double t = stampToSec(msg->header.stamp);
@@ -711,7 +866,7 @@ void GMMSLAMNode::extOdomCallback(const geometry_msgs::PoseStamped::ConstSharedP
 // IMU callback
 // =====================================================================
 
-void GMMSLAMNode::imuCallback(const sensor_msgs::Imu::ConstSharedPtr& msg)
+void GMMSLAMNode::imuCallback(const sensor_msgs::msg::Imu::ConstSharedPtr& msg)
 {
     const Vector3d acc(msg->linear_acceleration.x,
                        msg->linear_acceleration.y,
@@ -734,24 +889,24 @@ void GMMSLAMNode::imuCallback(const sensor_msgs::Imu::ConstSharedPtr& msg)
 // ensureGtOriginInitialized
 // =====================================================================
 
-bool GMMSLAMNode::ensureGtOriginInitialized(const ros::Time& stamp)
+bool GMMSLAMNode::ensureGtOriginInitialized(const rclcpp::Time& stamp)
 {
     if (gt_origin_inv_.has_value()) {
         return true;
     }
 
-    ros::Time now = ros::Time::now();
-    if (now.isZero()) {
+    rclcpp::Time now = node_->now();
+    if (now.nanoseconds() == 0) {
         now = stamp;
     }
     const double elapsed = stampToSec(now) - stampToSec(gt_init_start_time_);
     if (elapsed < cfg_.ext_odom.init_wait_s) {
-        ROS_WARN_THROTTLE(2.0, "[gmmslam] GT init window (%.2f/%.2fs)",
+        GMS_WARN_THROTTLE(2.0, "[gmmslam] GT init window (%.2f/%.2fs)",
                           elapsed, cfg_.ext_odom.init_wait_s);
         return false;
     }
     if (!latest_gt_pose_raw_) {
-        ROS_WARN_THROTTLE(2.0,
+        GMS_WARN_THROTTLE(2.0,
             "[gmmslam] GT init window elapsed but no GT pose received yet");
         return false;
     }
@@ -759,10 +914,10 @@ bool GMMSLAMNode::ensureGtOriginInitialized(const ros::Time& stamp)
     const Matrix4d T0 = poseMsgToMatrix(latest_gt_pose_raw_->pose);
     gt_origin_inv_ = T0.inverse();
 
-    gt_path_ = nav_msgs::Path();
+    gt_path_ = nav_msgs::msg::Path();
     gt_path_.header.frame_id = cfg_.ros.odom_frame;
 
-    ROS_INFO("[gmmslam] GT origin initialized after %.2fs", elapsed);
+    GMS_INFO("[gmmslam] GT origin initialized after %.2fs", elapsed);
     return true;
 }
 
@@ -770,7 +925,7 @@ bool GMMSLAMNode::ensureGtOriginInitialized(const ros::Time& stamp)
 // shouldAddKeyframe
 // =====================================================================
 
-bool GMMSLAMNode::shouldAddKeyframe(const ros::Time& stamp,
+bool GMMSLAMNode::shouldAddKeyframe(const rclcpp::Time& stamp,
                                     const Matrix4d& current_pose)
 {
     if (keyframe_count_ == 0 || !has_last_keyframe_) {
@@ -829,7 +984,7 @@ std::optional<Matrix4d> GMMSLAMNode::lookupExtOdomAt(double t_sec) const
 // =====================================================================
 
 std::optional<Matrix4d> GMMSLAMNode::currentGtPoseOdomFrame(
-    const ros::Time& stamp) const {
+    const rclcpp::Time& stamp) const {
     const double t_cloud = stampToSec(stamp);
     if (!ext_odom_buffer_.empty()) {
         std::optional<Matrix4d> T_curr = lookupExtOdomAt(t_cloud);
@@ -866,27 +1021,27 @@ std::optional<Matrix4d> GMMSLAMNode::loadRestartPose() const {
     int key_idx = -1;
     Matrix4d T = Matrix4d::Identity();
     if (!(in >> t_sec >> key_idx)) {
-        ROS_WARN("[gmmslam] restart state %s is malformed; ignoring",
+        GMS_WARN("[gmmslam] restart state %s is malformed; ignoring",
                  cfg_.ros.restart_state_path.c_str());
         return std::nullopt;
     }
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 4; ++c) {
             if (!(in >> T(r, c))) {
-                ROS_WARN("[gmmslam] restart state %s has incomplete pose; ignoring",
+                GMS_WARN("[gmmslam] restart state %s has incomplete pose; ignoring",
                          cfg_.ros.restart_state_path.c_str());
                 return std::nullopt;
             }
         }
     }
     if (!T.allFinite()) {
-        ROS_WARN("[gmmslam] restart state %s has non-finite pose; ignoring",
+        GMS_WARN("[gmmslam] restart state %s has non-finite pose; ignoring",
                  cfg_.ros.restart_state_path.c_str());
         return std::nullopt;
     }
 
     const auto p = T.block<3,1>(0,3);
-    ROS_WARN("[gmmslam] loaded restart pose from %s (saved X(%d), t=%.3f): "
+    GMS_WARN("[gmmslam] loaded restart pose from %s (saved X(%d), t=%.3f): "
              "pos=[%.3f, %.3f, %.3f]",
              cfg_.ros.restart_state_path.c_str(), key_idx, t_sec,
              p(0), p(1), p(2));
@@ -935,18 +1090,18 @@ void GMMSLAMNode::saveRestartPose(const Matrix4d& T, double t_sec, int key_idx) 
             std::filesystem::rename(tmp, path, ec);
         }
         if (ec) {
-            ROS_WARN_THROTTLE(5.0,
+            GMS_WARN_THROTTLE(5.0,
                 "[gmmslam] failed to update restart state %s: %s",
                 cfg_.ros.restart_state_path.c_str(), ec.message().c_str());
         }
     } catch (const std::exception& e) {
-        ROS_WARN_THROTTLE(5.0,
+        GMS_WARN_THROTTLE(5.0,
             "[gmmslam] failed to save restart state %s: %s",
             cfg_.ros.restart_state_path.c_str(), e.what());
     }
 }
 
-void GMMSLAMNode::maybeReanchorSmootherFromGt(const ros::Time& stamp,
+void GMMSLAMNode::maybeReanchorSmootherFromGt(const rclcpp::Time& stamp,
                                               double t_cloud) {
     if (!cfg_.global_graph.reanchor_smoother_on_traj_gate_fail || !global_graph_ ||
         !global_graph_->enable) {
@@ -960,7 +1115,7 @@ void GMMSLAMNode::maybeReanchorSmootherFromGt(const ros::Time& stamp,
     }
     const std::optional<Matrix4d> T_gt = currentGtPoseOdomFrame(stamp);
     if (!T_gt.has_value()) {
-        ROS_WARN("[gmmslam] smoother re-anchor requested but GT pose unavailable");
+        GMS_WARN("[gmmslam] smoother re-anchor requested but GT pose unavailable");
         return;
     }
     const int anchor = odom_idx_ - 1;
@@ -968,7 +1123,7 @@ void GMMSLAMNode::maybeReanchorSmootherFromGt(const ros::Time& stamp,
     last_gt_T_for_factor_ = T_gt.value();
     accumulated_gt_rel_.reset();
     last_rel_motion_.reset();
-    ROS_WARN("[gmmslam] Scheduled fixed-lag re-anchor to GT at X(%d) "
+    GMS_WARN("[gmmslam] Scheduled fixed-lag re-anchor to GT at X(%d) "
              "(smoothed trajectory hit submap aux gate — SLAM estimate was reset to GT)",
              anchor);
 }
@@ -977,7 +1132,7 @@ void GMMSLAMNode::maybeReanchorSmootherFromGt(const ros::Time& stamp,
 // sampleExtOdomRelativePose
 // =====================================================================
 
-std::optional<Matrix4d> GMMSLAMNode::sampleExtOdomRelativePose(const ros::Time& stamp)
+std::optional<Matrix4d> GMMSLAMNode::sampleExtOdomRelativePose(const rclcpp::Time& stamp)
 {
     const double t_cloud = stampToSec(stamp);
 
@@ -1007,7 +1162,7 @@ std::optional<Matrix4d> GMMSLAMNode::sampleExtOdomRelativePose(const ros::Time& 
     if (!latest_gt_pose_raw_ || !gt_origin_inv_.has_value()) {
         return std::nullopt;
     }
-    ROS_WARN_THROTTLE(5.0,
+    GMS_WARN_THROTTLE(5.0,
         "[gmmslam] odometry_input unavailable; falling back to internal GT noise");
 
     const Matrix4d T_gt = poseMsgToMatrix(latest_gt_pose_raw_->pose);
@@ -1158,7 +1313,7 @@ GMMSLAMNode::getKeyframeGmm(int key_idx)
 // logBackpressure
 // =====================================================================
 
-void GMMSLAMNode::logBackpressure(const ros::Time& stamp)
+void GMMSLAMNode::logBackpressure(const rclcpp::Time& stamp)
 {
     const double t_sec = stampToSec(stamp);
     if ((t_sec - last_backpressure_log_t_) < 5.0) {
@@ -1169,14 +1324,14 @@ void GMMSLAMNode::logBackpressure(const ros::Time& stamp)
     const int dropped_fits = registration_->dropped_fit_frames.exchange(0);
     const int dropped_results = registration_->dropped_result_msgs.exchange(0);
     if (dropped_fits > 0 || dropped_results > 0) {
-        ROS_WARN("[gmmslam] async reg overloaded: "
+        GMS_WARN("[gmmslam] async reg overloaded: "
                  "dropped fits=%d, dropped results=%d",
                  dropped_fits, dropped_results);
     }
 
     const int deferred = smoother_->deferred_batches.exchange(0);
     if (deferred > 0) {
-        ROS_WARN("[gmmslam] backend overloaded: deferred updates=%d", deferred);
+        GMS_WARN("[gmmslam] backend overloaded: deferred updates=%d", deferred);
     }
 }
 
@@ -1184,22 +1339,22 @@ void GMMSLAMNode::logBackpressure(const ros::Time& stamp)
 // pclCallback — main pipeline
 // =====================================================================
 
-void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& msg)
+void GMMSLAMNode::pclCallback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr& msg)
 {
     try {
         if (!first_cloud_seen_) {
-            ROS_INFO("[gmmslam] first point cloud received, processing started");
+            GMS_INFO("[gmmslam] first point cloud received, processing started");
             first_cloud_seen_ = true;
         }
 
-        const ros::Time stamp = msg->header.stamp;
+        const rclcpp::Time stamp = msg->header.stamp;
         const double t_cloud = stampToSec(stamp);
         const auto callback_t0 = std::chrono::steady_clock::now();
 
         // Monotonicity check
         if (last_cloud_t_sec_processed_ >= 0.0 &&
             t_cloud <= last_cloud_t_sec_processed_) {
-            ROS_WARN_THROTTLE(2.0,
+            GMS_WARN_THROTTLE(2.0,
                 "[gmmslam] non-monotonic cloud stamp "
                 "(%.6f <= %.6f); skipping frame",
                 t_cloud, last_cloud_t_sec_processed_);
@@ -1230,12 +1385,12 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& ms
             cfg_.sogmm.gmmap_horizontal_fov_deg);
         const auto pts = cloud.points;
         if (!pts || pts->rows() == 0) {
-            ROS_WARN_THROTTLE(5.0,
+            GMS_WARN_THROTTLE(5.0,
                 "[gmmslam] received empty point cloud, skipping");
             return;
         }
         if (pts->rows() < cfg_.preprocess.min_points) {
-            ROS_WARN_THROTTLE(5.0,
+            GMS_WARN_THROTTLE(5.0,
                 "[gmmslam] only %d points after filtering, skipping",
                 static_cast<int>(pts->rows()));
             return;
@@ -1295,7 +1450,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& ms
                     stampToSec(last_smoother_stamp_), stampToSec(stamp));
             }
             if (cfg_.imu.enable_preintegration) {
-                ROS_DEBUG("[gmmslam] frame %d: imu samples for preintegration=%zu",
+                GMS_DEBUG("[gmmslam] frame %d: imu samples for preintegration=%zu",
                           frame_count_, imu_measurements.size());
             }
 
@@ -1318,7 +1473,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& ms
             if (imu_prediction.has_value()) {
                 if (!has_external_prediction && !has_restart_prediction) {
                     predicted = imu_prediction->pose;
-                    ROS_INFO_THROTTLE(
+                    GMS_INFO_THROTTLE(
                         2.0,
                         "[gmmslam] X(%d) using IMU propagation for pose prediction "
                         "(samples=%d, no external odometry delta)",
@@ -1329,7 +1484,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& ms
                     const double dt_m = T_err.block<3,1>(0,3).norm();
                     const Eigen::AngleAxisd aa(T_err.block<3,3>(0,0));
                     const double dr_deg = std::abs(aa.angle()) * 180.0 / M_PI;
-                    ROS_DEBUG("[gmmslam] X(%d) external-vs-IMU prediction "
+                    GMS_DEBUG("[gmmslam] X(%d) external-vs-IMU prediction "
                               "delta: %.3fm %.2fdeg (%d imu samples)",
                               curr_odom, dt_m, dr_deg,
                               imu_prediction->sample_count);
@@ -1350,7 +1505,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& ms
             if (curr_odom % 10 == 0) {
                 const auto p = predicted.block<3,1>(0,3);
                 const bool has_odom = gt_rel_opt.has_value();
-                ROS_INFO("[gmmslam] X(%d) pos=[%.3f, %.3f, %.3f] odom=%s",
+                GMS_INFO("[gmmslam] X(%d) pos=[%.3f, %.3f, %.3f] odom=%s",
                          curr_odom, p(0), p(1), p(2),
                          has_odom ? "GT" : "LOST");
             }
@@ -1375,7 +1530,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& ms
                 keyframe_odom_indices_.push_back(curr_odom);
                 ++keyframe_count_;
 
-                ROS_INFO("[gmmslam][DBG] NEW KEYFRAME X(%d) "
+                GMS_INFO("[gmmslam][DBG] NEW KEYFRAME X(%d) "
                          "keyframe_count=%d pts=%ld",
                          curr_odom, keyframe_count_,
                          static_cast<long>(pts->rows()));
@@ -1393,7 +1548,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& ms
                     (keyframe_count_ % cfg_.registration.request_every_n_frames == 0);
                 const bool gate_resume =
                     (curr_odom >= reg_enqueue_resume_frame_);
-                ROS_INFO("[gmmslam][DBG] enqueue gate X(%d) async=%d "
+                GMS_INFO("[gmmslam][DBG] enqueue gate X(%d) async=%d "
                          "kf_count%%%d==0: %d (kf_count=%d) "
                          "resume_frame=%d (curr=%d, pass=%d)",
                          curr_odom, gate_async ? 1 : 0,
@@ -1408,12 +1563,12 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& ms
                     const bool ok = registration_->enqueueFit(
                         curr_odom, stamp, pts, cloud.organized_depth,
                         capture_t, T_curr);
-                    ROS_INFO("[gmmslam][DBG] enqueueFit result X(%d) ok=%d",
+                    GMS_INFO("[gmmslam][DBG] enqueueFit result X(%d) ok=%d",
                              curr_odom, ok ? 1 : 0);
                     if (!ok && cfg_.registration.enqueue_cooldown_frames > 0) {
                         reg_enqueue_resume_frame_ =
                             curr_odom + cfg_.registration.enqueue_cooldown_frames;
-                        ROS_WARN("[gmmslam][DBG] enqueue cooldown: "
+                        GMS_WARN("[gmmslam][DBG] enqueue cooldown: "
                                  "resume_frame set to %d",
                                  reg_enqueue_resume_frame_);
                     }
@@ -1462,7 +1617,7 @@ void GMMSLAMNode::pclCallback(const sensor_msgs::PointCloud2::ConstSharedPtr& ms
         ++frame_count_;
 
     } catch (const std::exception& e) {
-        ROS_ERROR("[gmmslam] exception in cloud callback: %s", e.what());
+        GMS_ERROR("[gmmslam] exception in cloud callback: %s", e.what());
     }
 }
 
@@ -1481,7 +1636,7 @@ void GMMSLAMNode::initBenchmarkLogs(const std::string& log_dir)
 
         if (!benchmark_frames_csv_ || !benchmark_est_tum_ ||
             !benchmark_est_map_tum_ || !benchmark_gt_tum_) {
-            ROS_WARN("[benchmark] failed to open one or more benchmark log files in %s",
+            GMS_WARN("[benchmark] failed to open one or more benchmark log files in %s",
                      log_dir.c_str());
             return;
         }
@@ -1499,12 +1654,12 @@ void GMMSLAMNode::initBenchmarkLogs(const std::string& log_dir)
         benchmark_gt_tum_ << std::fixed << std::setprecision(9);
         benchmark_logs_enabled_ = true;
 
-        ROS_INFO("[benchmark] writing structured metrics to %s", log_dir.c_str());
-        ROS_INFO("[benchmark] evo trajectories: estimated_trajectory.tum (lpf), "
+        GMS_INFO("[benchmark] writing structured metrics to %s", log_dir.c_str());
+        GMS_INFO("[benchmark] evo trajectories: estimated_trajectory.tum (lpf), "
                  "estimated_trajectory_map.tum (unfiltered map frame), "
                  "groundtruth_trajectory.tum");
     } catch (const std::exception& e) {
-        ROS_WARN("[benchmark] failed to initialize benchmark logs in %s: %s",
+        GMS_WARN("[benchmark] failed to initialize benchmark logs in %s: %s",
                  log_dir.c_str(), e.what());
     }
 }
@@ -1583,10 +1738,19 @@ void GMMSLAMNode::logBenchmarkFrame(
 
 int main(int argc, char** argv)
 {
-    ros::init(argc, argv, "gmmslam_node");
-    ros::NodeHandle nh, pnh("~");
+    rclcpp::init(argc, argv);
+    auto node = rclcpp::Node::make_shared(
+        "gmmslam_node",
+        rclcpp::NodeOptions().automatically_declare_parameters_from_overrides(true));
 
-    gmmslam::GMMSLAMNode node(nh, pnh);
-    ros::spin();
+    {
+        gmmslam::GMMSLAMNode app(node);
+        rclcpp::executors::MultiThreadedExecutor executor;
+        executor.add_node(node);
+        executor.spin();
+        executor.remove_node(node);
+    }
+
+    rclcpp::shutdown();
     return 0;
 }

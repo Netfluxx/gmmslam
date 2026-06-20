@@ -1,4 +1,5 @@
 #include "gmmslam/gmmap_fitting.hpp"
+#include "gmmslam/rclcpp_logging.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -12,7 +13,7 @@
 #include <vector>
 
 #include <Eigen/Eigenvalues>
-#include "gmmslam/ros2_compat.hpp"
+#include <rclcpp/rclcpp.hpp>
 
 #ifdef GMMSLAM_HAS_GMMAP
 #include <gmm_map/cluster.h>
@@ -377,7 +378,7 @@ GmmModel fitGmmap(const OrganizedDepthImage& depth,
     const auto t1 = std::chrono::steady_clock::now();
     const double dt_ms =
         std::chrono::duration<double, std::milli>(t1 - t0).count();
-    ROS_INFO("[gmmap] fit depth=%dx%d valid=%d max_depth=%.2f K=%d raw_K=%d "
+    GMS_INFO("[gmmap] fit depth=%dx%d valid=%d max_depth=%.2f K=%d raw_K=%d "
              "cap=%d native_max_range=%.2f far_fill=%d max_gmm_range=%.2f %.1f ms "
              "fx=%.1f fy=%.1f cx=%.1f cy=%.1f",
              static_cast<int>(depth.depth.cols()),

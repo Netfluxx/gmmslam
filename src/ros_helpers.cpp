@@ -11,7 +11,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <sensor_msgs/point_cloud2_iterator.h>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 
 namespace gmmslam {
 
@@ -82,20 +82,20 @@ Eigen::MatrixXf subsampleToMax(const Eigen::MatrixXf& pts, int target) {
 
 } // namespace
 
-double stampToSec(const ros::Time& stamp) {
-    return stamp.toSec();
+double stampToSec(const rclcpp::Time& stamp) {
+    return stamp.seconds();
 }
 
-geometry_msgs::TransformStamped poseToTransformStamped(
+geometry_msgs::msg::TransformStamped poseToTransformStamped(
     const Matrix4d& T,
-    const ros::Time& stamp,
+    const rclcpp::Time& stamp,
     const std::string& parent_frame,
     const std::string& child_frame) {
 
     Eigen::Quaterniond q(T.block<3, 3>(0, 0));
     q.normalize();
 
-    geometry_msgs::TransformStamped ts;
+    geometry_msgs::msg::TransformStamped ts;
     ts.header.stamp = stamp;
     ts.header.frame_id = parent_frame;
     ts.child_frame_id = child_frame;
@@ -109,15 +109,15 @@ geometry_msgs::TransformStamped poseToTransformStamped(
     return ts;
 }
 
-geometry_msgs::PoseStamped poseToPoseStamped(
+geometry_msgs::msg::PoseStamped poseToPoseStamped(
     const Matrix4d& T,
-    const ros::Time& stamp,
+    const rclcpp::Time& stamp,
     const std::string& frame_id) {
 
     Eigen::Quaterniond q(T.block<3, 3>(0, 0));
     q.normalize();
 
-    geometry_msgs::PoseStamped ps;
+    geometry_msgs::msg::PoseStamped ps;
     ps.header.stamp = stamp;
     ps.header.frame_id = frame_id;
     ps.pose.position.x = T(0, 3);
@@ -130,15 +130,15 @@ geometry_msgs::PoseStamped poseToPoseStamped(
     return ps;
 }
 
-Eigen::MatrixXf pc2ToEigen(const sensor_msgs::PointCloud2& msg) {
+Eigen::MatrixXf pc2ToEigen(const sensor_msgs::msg::PointCloud2& msg) {
     const int n_points = static_cast<int>(msg.height * msg.width);
     if (n_points == 0) {
         return Eigen::MatrixXf(0, 3);
     }
 
-    sensor_msgs::PointCloud2ConstIterator<float> it_x(msg, "x");
-    sensor_msgs::PointCloud2ConstIterator<float> it_y(msg, "y");
-    sensor_msgs::PointCloud2ConstIterator<float> it_z(msg, "z");
+    sensor_msgs::msg::PointCloud2ConstIterator<float> it_x(msg, "x");
+    sensor_msgs::msg::PointCloud2ConstIterator<float> it_y(msg, "y");
+    sensor_msgs::msg::PointCloud2ConstIterator<float> it_z(msg, "z");
 
     Eigen::MatrixXf result(n_points, 3);
     int valid_count = 0;
@@ -160,7 +160,7 @@ Eigen::MatrixXf pc2ToEigen(const sensor_msgs::PointCloud2& msg) {
 }
 
 std::optional<OrganizedDepthImage> pc2ToOrganizedDepth(
-    const sensor_msgs::PointCloud2& msg,
+    const sensor_msgs::msg::PointCloud2& msg,
     double min_range,
     double max_range,
     bool estimate_intrinsics,
@@ -179,9 +179,9 @@ std::optional<OrganizedDepthImage> pc2ToOrganizedDepth(
         Eigen::MatrixXf::Zero(static_cast<int>(msg.height),
                               static_cast<int>(msg.width));
 
-    sensor_msgs::PointCloud2ConstIterator<float> it_x(msg, "x");
-    sensor_msgs::PointCloud2ConstIterator<float> it_y(msg, "y");
-    sensor_msgs::PointCloud2ConstIterator<float> it_z(msg, "z");
+    sensor_msgs::msg::PointCloud2ConstIterator<float> it_x(msg, "x");
+    sensor_msgs::msg::PointCloud2ConstIterator<float> it_y(msg, "y");
+    sensor_msgs::msg::PointCloud2ConstIterator<float> it_z(msg, "z");
 
     const double min_r = std::max(0.0, min_range);
     const double max_r = max_range > 0.0 ? max_range
@@ -286,7 +286,7 @@ std::optional<OrganizedDepthImage> pc2ToOrganizedDepth(
 }
 
 PreprocessedCloud preprocessPointCloud2(
-    const sensor_msgs::PointCloud2& msg,
+    const sensor_msgs::msg::PointCloud2& msg,
     double min_range,
     double max_range,
     double voxel_size,
@@ -333,9 +333,9 @@ PreprocessedCloud preprocessPointCloud2(
     Eigen::MatrixXf filtered(n_points, 3);
     int filtered_count = 0;
 
-    sensor_msgs::PointCloud2ConstIterator<float> it_x(msg, "x");
-    sensor_msgs::PointCloud2ConstIterator<float> it_y(msg, "y");
-    sensor_msgs::PointCloud2ConstIterator<float> it_z(msg, "z");
+    sensor_msgs::msg::PointCloud2ConstIterator<float> it_x(msg, "x");
+    sensor_msgs::msg::PointCloud2ConstIterator<float> it_y(msg, "y");
+    sensor_msgs::msg::PointCloud2ConstIterator<float> it_z(msg, "z");
 
     for (uint32_t v = 0; v < msg.height; ++v) {
         for (uint32_t u = 0; u < msg.width; ++u, ++it_x, ++it_y, ++it_z) {
@@ -447,9 +447,9 @@ PreprocessedCloud preprocessPointCloud2(
     return out;
 }
 
-sensor_msgs::PointCloud2 eigenToPc2Rgb(
+sensor_msgs::msg::PointCloud2 eigenToPc2Rgb(
     const Eigen::MatrixXf& pts,
-    const ros::Time& stamp,
+    const rclcpp::Time& stamp,
     const std::string& frame_id,
     uint8_t r,
     uint8_t g,
@@ -464,7 +464,7 @@ sensor_msgs::PointCloud2 eigenToPc2Rgb(
     float rgb_float;
     std::memcpy(&rgb_float, &rgb_uint, sizeof(float));
 
-    sensor_msgs::PointCloud2 cloud;
+    sensor_msgs::msg::PointCloud2 cloud;
     cloud.header.stamp = stamp;
     cloud.header.frame_id = frame_id;
     cloud.height = 1;
@@ -472,18 +472,18 @@ sensor_msgs::PointCloud2 eigenToPc2Rgb(
     cloud.is_bigendian = false;
     cloud.is_dense = true;
 
-    sensor_msgs::PointCloud2Modifier modifier(cloud);
+    sensor_msgs::msg::PointCloud2Modifier modifier(cloud);
     modifier.setPointCloud2Fields(4,
-        "x", 1, sensor_msgs::PointField::FLOAT32,
-        "y", 1, sensor_msgs::PointField::FLOAT32,
-        "z", 1, sensor_msgs::PointField::FLOAT32,
-        "rgb", 1, sensor_msgs::PointField::FLOAT32);
+        "x", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "y", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "z", 1, sensor_msgs::msg::PointField::FLOAT32,
+        "rgb", 1, sensor_msgs::msg::PointField::FLOAT32);
     modifier.resize(n);
 
-    sensor_msgs::PointCloud2Iterator<float> out_x(cloud, "x");
-    sensor_msgs::PointCloud2Iterator<float> out_y(cloud, "y");
-    sensor_msgs::PointCloud2Iterator<float> out_z(cloud, "z");
-    sensor_msgs::PointCloud2Iterator<float> out_rgb(cloud, "rgb");
+    sensor_msgs::msg::PointCloud2Iterator<float> out_x(cloud, "x");
+    sensor_msgs::msg::PointCloud2Iterator<float> out_y(cloud, "y");
+    sensor_msgs::msg::PointCloud2Iterator<float> out_z(cloud, "z");
+    sensor_msgs::msg::PointCloud2Iterator<float> out_rgb(cloud, "rgb");
 
     for (uint32_t i = 0; i < n; ++i, ++out_x, ++out_y, ++out_z, ++out_rgb) {
         *out_x = pts(i, 0);
@@ -524,7 +524,7 @@ Eigen::MatrixXf preprocess(
     return subsampleToMax(result, target_points);
 }
 
-Matrix4d poseMsgToMatrix(const geometry_msgs::Pose& pose_msg) {
+Matrix4d poseMsgToMatrix(const geometry_msgs::msg::Pose& pose_msg) {
     Eigen::Quaterniond q(
         pose_msg.orientation.w,
         pose_msg.orientation.x,

@@ -1,4 +1,5 @@
 #include "gmmslam/fixed_lag_backend.hpp"
+#include "gmmslam/rclcpp_logging.hpp"
 
 #include <gtsam/slam/BetweenFactor.h>
 #include <gtsam/slam/PriorFactor.h>
@@ -8,7 +9,7 @@
 #include <gtsam/navigation/NavState.h>
 #include <gtsam/inference/Symbol.h>
 
-#include "gmmslam/ros2_compat.hpp"
+#include <rclcpp/rclcpp.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -34,7 +35,7 @@ using gtsam::imuBias::ConstantBias;
 static gtsam::Key keyV(int idx) { return Symbol('v', idx); }
 static gtsam::Key keyB(int idx) { return Symbol('b', idx); }
 
-static double stampToSec(const ros::Time& t) { return t.toSec(); }
+static double stampToSec(const rclcpp::Time& t) { return t.seconds(); }
 
 static ConstantBias zeroBias() {
     return ConstantBias(Vector3d::Zero(), Vector3d::Zero());
@@ -114,7 +115,7 @@ FixedLagBackend::FixedLagBackend(const SmootherConfig& smoother_cfg,
     pose_uncertainty_by_idx[0] = 0.0;
     initBenchmarkLogs(benchmark_log_dir);
 
-    ROS_INFO("[smoother] initialized: IncrementalFixedLagSmoother (lag=%.2f s, imu=%s)",
+    GMS_INFO("[smoother] initialized: IncrementalFixedLagSmoother (lag=%.2f s, imu=%s)",
              fixed_lag_s, enable_imu_ ? "on" : "off");
 }
 
@@ -129,7 +130,7 @@ void FixedLagBackend::initBenchmarkLogs(const std::string& log_dir)
         benchmark_smoother_csv_.open(log_dir + "/smoother_optimization.csv",
                                      std::ios::out);
         if (!benchmark_smoother_csv_) {
-            ROS_WARN("[benchmark] failed to open smoother_optimization.csv in %s",
+            GMS_WARN("[benchmark] failed to open smoother_optimization.csv in %s",
                      log_dir.c_str());
             return;
         }
@@ -140,7 +141,7 @@ void FixedLagBackend::initBenchmarkLogs(const std::string& log_dir)
             << "success,note\n";
         benchmark_logs_enabled_ = true;
     } catch (const std::exception& e) {
-        ROS_WARN("[benchmark] failed to initialize smoother timing log in %s: %s",
+        GMS_WARN("[benchmark] failed to initialize smoother timing log in %s: %s",
                  log_dir.c_str(), e.what());
     }
 }
@@ -232,7 +233,7 @@ gtsam::NonlinearFactorGraph FixedLagBackend::filterStaleFactors(
     }
 
     if (n_dropped > 0) {
-        ROS_WARN("[smoother] dropped %d stale factor(s) referencing keys outside the lag window",
+        GMS_WARN("[smoother] dropped %d stale factor(s) referencing keys outside the lag window",
                  n_dropped);
     }
     return clean;
@@ -309,7 +310,7 @@ void FixedLagBackend::rebuildSmootherCore(int anchor_idx, const Matrix4d& anchor
     resetNewData();
     consecutive_failures_ = 0;
 
-    ROS_WARN("[smoother] RESET fixed-lag smoother (%s); re-anchored at X(%d)",
+    GMS_WARN("[smoother] RESET fixed-lag smoother (%s); re-anchored at X(%d)",
              reason, anchor_idx);
 }
 
@@ -362,7 +363,7 @@ void FixedLagBackend::applyScheduledReanchorIfNeeded() {
 // Public API
 // -----------------------------------------------------------------------
 
-bool FixedLagBackend::initialize(const Matrix4d& init_pose, const ros::Time& stamp) {
+bool FixedLagBackend::initialize(const Matrix4d& init_pose, const rclcpp::Time& stamp) {
     if (initialized_) return true;
 
     try {
@@ -409,10 +410,10 @@ bool FixedLagBackend::initialize(const Matrix4d& init_pose, const ros::Time& sta
         }
 
         initialized_ = true;
-        ROS_INFO("[smoother] fixed-lag smoother initialized with prior X(0)");
+        GMS_INFO("[smoother] fixed-lag smoother initialized with prior X(0)");
         return true;
     } catch (const std::exception& e) {
-        ROS_WARN("[smoother] init failed: %s", e.what());
+        GMS_WARN("[smoother] init failed: %s", e.what());
         return false;
     }
 }
@@ -474,7 +475,7 @@ FixedLagBackend::predictWithImu(
 }
 
 bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
-                               const ros::Time& stamp,
+                               const rclcpp::Time& stamp,
                                const Matrix4d& predicted_pose,
                                const Matrix4d* gt_rel_mat,
                                const std::vector<std::tuple<double, Vector3d, Vector3d>>* imu_measurements,
@@ -525,17 +526,17 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
                                             ? odom_noise_lost_
                                             : odom_noise_lost_));
         if (factor_prev_idx != prev_idx) {
-            ROS_WARN_THROTTLE(2.0,
+            GMS_WARN_THROTTLE(2.0,
                 "[smoother] missing predecessor X(%d); linking X(%d)->X(%d) instead",
                 prev_idx, factor_prev_idx, curr_idx);
         }
     } else if (prev_exists) {
-        ROS_INFO_THROTTLE(5.0,
+        GMS_INFO_THROTTLE(5.0,
             "[smoother] external odometry factor disabled; X(%d) waits for D2D/other factors",
             curr_idx);
     } else {
         new_factors_.addPrior(key_curr, pose3FromMatrix(predicted_pose), prior_noise_);
-        ROS_WARN_THROTTLE(2.0,
+        GMS_WARN_THROTTLE(2.0,
             "[smoother] missing predecessor X(%d); re-anchoring X(%d) with prior",
             prev_idx, curr_idx);
     }
@@ -619,12 +620,12 @@ bool FixedLagBackend::addFrame(int prev_idx, int curr_idx,
         if (!has_imu_link) {
             new_factors_.addPrior(kv_curr, vel_wb, vel_prior_noise_);
             new_factors_.addPrior(kb_curr, prev_bias, bias_prior_noise_);
-            ROS_WARN_THROTTLE(2.0,
+            GMS_WARN_THROTTLE(2.0,
                 "[smoother] weakly-anchored V/B at X(%d) (imu_link=%s, samples=%d)",
                 curr_idx, has_imu_link ? "yes" : "no", n_imu);
         }
 
-        ROS_DEBUG("[smoother] IMU preintegration at X(%d): samples=%d", curr_idx, n_imu);
+        GMS_DEBUG("[smoother] IMU preintegration at X(%d): samples=%d", curr_idx, n_imu);
     }
 
     // Drop stale factors
@@ -744,7 +745,7 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
                 // Feeding old variables into IncrementalFixedLagSmoother after
                 // they are near/immediately beyond the lag boundary can trigger
                 // fragile leaf marginalization paths in GTSAM.
-                ROS_WARN_THROTTLE(
+                GMS_WARN_THROTTLE(
                     1.0,
                     "[smoother] dropping stale backend batch X(%d): "
                     "latest_t - batch_t = %.2fs exceeds %.2fs guard",
@@ -796,7 +797,7 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
                 estimate_t1 - estimate_t0).count();
             const double total_ms = std::chrono::duration<double, std::milli>(
                 estimate_t1 - solve_t0).count();
-            ROS_INFO("[timing][smoother] X(%d) factors=%zu values=%zu "
+            GMS_INFO("[timing][smoother] X(%d) factors=%zu values=%zu "
                      "update_ms=%.3f estimate_ms=%.3f total_ms=%.3f",
                      curr_idx, n_factors, n_values,
                      update_ms, estimate_ms, total_ms);
@@ -814,7 +815,7 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
                 std::lock_guard<std::mutex> lk(graph_lock);
                 auto it = pose_by_idx.find(curr_idx);
                 new_pose = (it != pose_by_idx.end()) ? it->second : pose;
-                ROS_WARN_THROTTLE(2.0,
+                GMS_WARN_THROTTLE(2.0,
                     "[smoother] estimate missing X(%d) after update; keeping previous pose",
                     curr_idx);
             }
@@ -898,18 +899,18 @@ void FixedLagBackend::backendLoop(const std::atomic<bool>& shutdown) {
             }
 
             consecutive_failures_ = 0;
-            ROS_DEBUG("[smoother] GTSAM backend solved at X(%d)", curr_idx);
+            GMS_DEBUG("[smoother] GTSAM backend solved at X(%d)", curr_idx);
 
         } catch (const std::exception& e) {
             ++consecutive_failures_;
-            ROS_WARN("[smoother] GTSAM backend failed at X(%d): %s", curr_idx, e.what());
+            GMS_WARN("[smoother] GTSAM backend failed at X(%d): %s", curr_idx, e.what());
 
             if (consecutive_failures_ >= kMaxConsecutiveFailures) {
                 try {
                     rebuildSmoother(curr_idx);
                     consecutive_failures_ = 0;
                 } catch (const std::exception& reset_err) {
-                    ROS_ERROR("[smoother] reset also failed: %s", reset_err.what());
+                    GMS_ERROR("[smoother] reset also failed: %s", reset_err.what());
                 }
             }
         }

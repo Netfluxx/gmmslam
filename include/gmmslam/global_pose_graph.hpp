@@ -2,6 +2,7 @@
 
 #include "gmmslam/types.hpp"
 #include "gmmslam/config.hpp"
+#include "gmmslam/util/gmm_utils.hpp"
 
 #include <Eigen/Core>
 #include <gtsam/geometry/Pose3.h>
@@ -20,8 +21,9 @@
 #include <string>
 #include <vector>
 
-#include "gmmslam/ros2_compat.hpp"
-#include <nav_msgs/Path.h>
+#include <rclcpp/rclcpp.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <std_msgs/msg/string.hpp>
 
 namespace gmmslam {
 
@@ -39,8 +41,8 @@ public:
                     const MapConfig& map_cfg,
                     const std::string& odom_frame,
                     const std::string& gmm_dir,
-                    ros::Publisher path_pub,
-                    ros::Publisher reg_request_pub,
+                    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub,
+                    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr reg_request_pub,
                     GetPoseFn get_pose_fn,
                     GetGmmFn get_gmm_fn = nullptr,
                     GetPoseUncertaintyFn get_pose_uncertainty_fn = nullptr,
@@ -49,12 +51,12 @@ public:
 
     bool shouldCreateSubmap(int key_idx) const;
 
-    void updateWithKeyframe(int key_idx, const ros::Time& stamp,
+    void updateWithKeyframe(int key_idx, const rclcpp::Time& stamp,
                             const Matrix4d& T_curr, double t_sec);
 
     /// Retry merging GMMs for submaps whose rollover happened before async SOGMM
     /// fits finished (typically invoked from RegistrationManager after each fit).
-    void processPendingSubmapFinalizations(const ros::Time& stamp);
+    void processPendingSubmapFinalizations(const rclcpp::Time& stamp);
 
     /// Set when submap traj auxiliary factor fails absurd-motion gates; node
     /// consumes to re-anchor the fixed-lag smoother on GT.
@@ -66,22 +68,22 @@ public:
 
     void handleSubmapRegistrationResult(int sid_prev, int sid_curr,
                                         const Matrix4d& T_rel, double score,
-                                        const ros::Time& stamp);
+                                        const rclcpp::Time& stamp);
 
     /// Called for every overlap D2D outcome (clears pending edge and overlap counter).
     void acknowledgeSubmapOverlapAttempt(int sid_prev, int sid_curr,
-                                         const ros::Time& stamp);
+                                         const rclcpp::Time& stamp);
 
     /// If submap `sid_new` finished its overlap D2D wave, apply deferred internal prune.
-    void maybeApplyDeferredInternalSubmapPrune(int sid_new, const ros::Time& stamp);
+    void maybeApplyDeferredInternalSubmapPrune(int sid_new, const rclcpp::Time& stamp);
 
     void addLoopFactor(int prev_key_idx, int curr_key_idx,
                        const Matrix4d& T_prev_to_curr,
-                       const ros::Time& stamp,
+                       const rclcpp::Time& stamp,
                        const std::map<int, Matrix4d>& pose_by_idx,
                        double score = -1.0);
 
-    void commit(const ros::Time& stamp);
+    void commit(const rclcpp::Time& stamp);
 
     // Public state (protected by lock). Recursive: commit() is nested from
     // updateWithKeyframe / addLoopFactor / handleSubmapRegistrationResult.
@@ -98,6 +100,9 @@ public:
     std::map<int, std::string> submap_gmm_path;
     std::map<int, std::vector<GmmLocalData>> submap_gmm_components;
     std::map<int, Matrix4d> submap_frozen_pose_by_idx;
+    std::map<int, int> submap_prune_generation;
+    std::vector<PruneDebugRecord> prune_debug_records;
+    int prune_debug_generation = 0;
     std::set<std::pair<int,int>> loop_edges_added;
 
     static std::array<double,3> submapColor(int sid);
@@ -140,12 +145,12 @@ private:
                          bool success,
                          const std::string& note);
 
-    void enqueueSubmapFinalization(int sid, const ros::Time& stamp);
+    void enqueueSubmapFinalization(int sid, const rclcpp::Time& stamp);
     /// Returns true if submap is finalized (or already had a merged GMM), false if
     /// still waiting for keyframe GMMs from the async fit worker.
-    bool tryFinalizeSubmap(int sid, const ros::Time& stamp,
-                           const ros::Time& pending_since);
-    void requestOverlapRegistrations(int sid_new, const ros::Time& stamp);
+    bool tryFinalizeSubmap(int sid, const rclcpp::Time& stamp,
+                           const rclcpp::Time& pending_since);
+    void requestOverlapRegistrations(int sid_new, const rclcpp::Time& stamp);
     void addTransitionAuxFactors(int prev_sid, int curr_sid,
                                   const Matrix4d& T_ref_rel,
                                   int prev_anchor_key, int curr_anchor_key,
@@ -155,7 +160,14 @@ private:
     /// Bhattacharyya pruning as submap finalization, then split components
     /// back into each submap's body frame (by source keyframe → submap).
     void pruneSubmapPairGmmsAfterLoop(int sid_a, int sid_b,
-                                      const ros::Time& stamp);
+                                      const rclcpp::Time& stamp);
+    void pruneNearbySubmapsAfterInternalPrune(int sid_new,
+                                              const rclcpp::Time& stamp);
+    bool submapWorldAabb(int sid, double margin,
+                         double min_out[3], double max_out[3]) const;
+    void appendPruneDebugRecords(const std::vector<PruneDebugRecord>& records,
+                                 int sid_a, int sid_b,
+                                 const Matrix4d* T_debug = nullptr);
 
     // Config
     std::string odom_frame_;
@@ -211,7 +223,7 @@ private:
     // Pending registrations
     std::set<std::pair<int,int>> pending_submap_registrations_;
 
-    std::vector<std::pair<int, ros::Time>> pending_submap_finalize_;
+    std::vector<std::pair<int, rclcpp::Time>> pending_submap_finalize_;
 
     Matrix4d map_odom_correction_ = Matrix4d::Identity();
     bool map_odom_valid_ = false;
@@ -235,9 +247,9 @@ private:
     GetSubmapTrajDeltaFn get_traj_delta_;
 
     // Publishers
-    ros::Publisher path_pub_;
-    ros::Publisher reg_request_pub_;
-    nav_msgs::Path path_;
+    rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
+    rclcpp::Publisher<std_msgs::msg::String>::SharedPtr reg_request_pub_;
+    nav_msgs::msg::Path path_;
 };
 
 } // namespace gmmslam
